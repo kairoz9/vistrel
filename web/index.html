@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Vistrel</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="/img/favicon-32.png">
+    <link rel="icon" type="image/png" sizes="64x64" href="/img/favicon-64.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="/img/apple-touch-icon.png">
+    <link rel="stylesheet" href="/src/ui/style.css">
+</head>
+<body>
+    <div id="video-container">
+        <!-- 输入汇聚点：画面、音频与 IME 收集器之外的 DOM 一律视为页面 UI，其事件不进游戏 -->
+        <div id="game-surface">
+            <video id="remoteVideo" autoplay playsinline muted></video>
+            <audio id="remoteAudio" autoplay></audio>
+
+            <!-- IME 收集器：GUI 态文本输入的焦点载体，输入法确认后的文本由 input.js 取走清空 -->
+            <input id="imeCollector" class="ime-collector" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" tabindex="-1" aria-hidden="true">
+        </div>
+
+        <!-- 会话状态与实时指标 -->
+        <div class="hud" id="hud">
+            <div id="overlay" class="hud-panel">
+                <div class="hud-main">
+                    <div class="hud-status" id="hudStatus"></div>
+
+                    <div class="hud-metrics" id="hudMetrics"></div>
+                </div>
+
+                <div class="hud-diag">
+                    <span id="netDiag">等待统计…</span>
+                </div>
+
+                <div id="hudActions" class="hud-actions"></div>
+            </div>
+
+            <button class="hud-toggle" id="hudToggle" type="button" aria-label="收起面板"></button>
+        </div>
+
+        <!-- 三个模态框由 Modal 组件创建（内容取自下方模板） -->
+
+        <template id="settingsBodyTpl">
+            <div class="settings-body">
+                <!-- 档位滑条由 DiscreteSlider 生成（档位表来自 protocol.js） -->
+                <div id="qualityControls"></div>
+
+                <div class="settings-block">
+                    <div class="setting-label-row">
+                        <span class="setting-label">回放缓冲</span>
+                        <button class="replay-switch is-active" id="replayToggle" type="button" title="持续保留最近 60 秒画面与声音，关闭后「回放」不可用"><span class="replay-switch-knob"></span></button>
+                    </div>
+                    <p class="setting-desc">持续保留最近 60 秒画面与声音，点「回放」即保存为 MP4。</p>
+                </div>
+            </div>
+        </template>
+
+        <template id="passwordBodyTpl">
+            <input type="password" id="passwordInput" placeholder="访问密码" autocomplete="off" spellcheck="false">
+            <div id="passwordError"></div>
+        </template>
+
+        <template id="aboutBodyTpl">
+            <p class="modal-desc">游戏画面、声音与键鼠输入经加密 WebRTC 在浏览器与游戏实例之间点对点直连：不经中转服务器，也不存储任何传输内容。</p>
+            <p class="modal-desc">软件编码采用 OpenH264 Video Codec provided by Cisco Systems, Inc.（Cisco 官方预编译库，首次使用时从 Cisco 官方源运行期下载并经完整性校验后加载，可在配置中停用）。</p>
+            <p class="modal-desc about-disclaimer">NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.<br>本页面为第三方作品，未经 Mojang / Microsoft 官方认可，也不与其有任何隶属关系。</p>
+            <p class="modal-desc">本项目基于 <a href="https://github.com/kairoz9/vistrel" target="_blank" rel="noopener">MIT License</a> 开源，第三方组件声明详见仓库 THIRD-PARTY-NOTICES。</p>
+        </template>
+    </div>
+
+    <!-- 原生 ES Module 入口 -->
+    <script type="module" src="/src/main.js"></script>
+</body>
+</html>

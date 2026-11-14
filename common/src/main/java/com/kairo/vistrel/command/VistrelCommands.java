@@ -1,0 +1,306 @@
+package com.kairo.vistrel.command;
+
+import com.kairo.vistrel.VistrelService;
+import com.kairo.vistrel.config.VistrelConfig;
+import com.kairo.vistrel.streaming.EncoderChannel;
+import com.kairo.vistrel.streaming.SessionServer;
+import com.mojang.brigadier.Command;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import com.mojang.brigadier.builder.RequiredArgumentBuilder;
+import net.minecraft.ChatFormatting;
+import net.minecraft.client.Minecraft;
+import net.minecraft.network.chat.ClickEvent;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.HoverEvent;
+import net.minecraft.network.chat.MutableComponent;
+import net.minecraft.network.chat.Style;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * 游戏内服务控制命令树 /vistrel
+ *
+ * <p>Brigadier 命令树用类型参数 {@code <S>} 适配各 loader 的客户端命令源
+ * （Fabric {@code FabricClientCommandSource}、Forge/NeoForge {@code CommandSourceStack}），
+ * 树体本身平台无关，三个 loader 只负责注册。
+ *
+ * <p>启停动作经 {@link VistrelService#submitControl} 派发到控制面串行队列，
+ * 结果经 {@code Minecraft#execute} 回到渲染主线程发聊天消息，不阻塞渲染线程。
+ */
+public final class VistrelCommands {
+    private static final String PREFIX = "§6[Vistrel]§r ";
+
+    private VistrelCommands() {
+    }
+
+    /**
+     * 构建 /vistrel 命令树根节点；由各 loader 客户端命令注册点以自身命令源类型调用
+     *
+     * @param <S> Brigadier 命令源类型（各 loader 的客户端命令源）
+     * @return 命令树根节点，含 start / stop / status / password set 四个子命令
+     */
+    public static <S> LiteralArgumentBuilder<S> tree() {
+        // 密码子树先以显式类型参数落定，S 才能在泛型工厂调用点绑定到本方法的 S
+        RequiredArgumentBuilder<S, String> setPassword = RequiredArgumentBuilder
+            .<S, String>argument("password", StringArgumentType.greedyString())
+            .executes(ctx -> {
+                String raw = StringArgumentType.getString(ctx, "password");
+                String error = validatePassword(raw);
+                if (error != null) {
+                    feedback("§c" + error);
+                    return 0;
+                }
+                submit(() -> feedback(applyPasswordChange(raw)));
+                return Command.SINGLE_SUCCESS;
+            });
+
+        return LiteralArgumentBuilder
+            .<S>literal("vistrel")
+            .then(LiteralArgumentBuilder
+                .<S>literal("start")
+                .executes(ctx -> {
+                    submit(() -> {
+                        VistrelService.start();
+                        if (VistrelService.isRunning()) {
+                            // 启动后直接展示与 /vistrel status 同一套状态块，避免两处样式漂移
+                            feedback(statusMessage());
+                        } else {
+                            feedback("§c服务启动失败，详见日志");
+                        }
+                    });
+                    return Command.SINGLE_SUCCESS;
+                }))
+            .then(LiteralArgumentBuilder
+                .<S>literal("stop")
+                .executes(ctx -> {
+                    submit(() -> {
+                        VistrelService.stop();
+                        feedback(VistrelService.isRunning() ? "§c服务停止失败，详见日志" : "§e服务已停止");
+                    });
+                    return Command.SINGLE_SUCCESS;
+                }))
+            .then(LiteralArgumentBuilder
+                .<S>literal("status")
+                .executes(ctx -> {
+                    feedback(statusMessage());
+                    return Command.SINGLE_SUCCESS;
+                }))
+            .then(LiteralArgumentBuilder
+                .<S>literal("password")
+                .then(LiteralArgumentBuilder.<S>literal("set").then(setPassword))
+            );
+    }
+
+    /**
+     * 密码规则：trim 后非空且长度落在 {@link VistrelConfig} 的允许区间内，其余不设约束；
+     * 返回 {@code null} 表示合法，否则为错误提示
+     *
+     * @param raw 候选密码原文（未 trim）
+     */
+    public static String validatePassword(String raw) {
+        String trimmed = raw == null ? "" : raw.trim();
+        if (trimmed.isEmpty()) {
+            return "密码不能为空";
+        }
+        if (!VistrelConfig.isPasswordLengthValid(trimmed)) {
+            return "密码长度须在 " + VistrelConfig.MIN_PASSWORD_LENGTH + "~" + VistrelConfig.MAX_PASSWORD_LENGTH + " 位";
+        }
+        return null;
+    }
+
+    /**
+     * 应用密码变更：写入配置并即时生效；服务停止时只改配置，下次启动生效。
+     * 前提：{@code raw} 已通过 {@link #validatePassword} 校验，trim 只在这里做一次。
+     * 返回成功文案
+     */
+    static String applyPasswordChange(String raw) {
+        String newPassword = raw.trim();
+        VistrelConfig.update(VistrelConfig.current().withPassword(newPassword));
+        SessionServer server = VistrelService.getServer();
+        if (server != null) {
+            server.setPassword(newPassword);
+        }
+        return "§a密码已更新: §b" + newPassword;
+    }
+
+    /**
+     * 生成当前服务状态行；除 queryEncoderCaps 读一次常驻快照（不等待、不碰设备）外
+     * 全是 Java 内存读取，渲染主线程直接调用不会卡顿
+     *
+     * @return 状态行列表，至少一行
+     */
+    public static List<Component> statusLines() {
+        VistrelConfig config = VistrelConfig.current();
+        EncoderChannel channel = VistrelService.getChannel();
+        boolean running = VistrelService.isRunning();
+        List<Component> lines = new ArrayList<>();
+        lines.add(Component.literal("§6§l▍ §r" + (running ? "§a● §f运行中" : "§c● §f已停止")));
+        if (!running) {
+            lines.add(row("执行命令", Component.literal("§f/vistrel start §8启动服务")));
+            return lines;
+        }
+        lines.add(row("访问地址", link(VistrelService.getAccessUrl())));
+        lines.add(
+                row(
+                        "访问密码",
+                        config.password().isEmpty() ? Component.literal("§e未启用 §8(免认证)") : maskedPassword(config.password()
+                        )
+                )
+        );
+        appendEncoderLines(lines, channel);
+        return lines;
+    }
+
+    /**
+     * 把状态行拼成一条多行消息：行间用换行分隔，各行样式与点击/悬停事件互斥
+     *
+     * @return 多行状态消息组件
+     */
+    public static Component statusMessage() {
+        MutableComponent body = Component.empty();
+        List<Component> lines = statusLines();
+        for (int i = 0; i < lines.size(); i++) {
+            if (i > 0) {
+                body.append(Component.literal("\n"));
+            }
+            body.append(lines.get(i));
+        }
+        return body;
+    }
+
+    /**
+     * 状态行布局：统一两字标签 + 灰点分隔，各行的值起始列因此对齐
+     */
+    private static Component row(String label, Component value) {
+        return Component.literal("§7" + label + ": ").append(value);
+    }
+
+    /**
+     * 可点击地址
+     */
+    private static Component link(String url) {
+        return Component
+            .literal(url)
+            .withStyle(Style.EMPTY
+                .withColor(ChatFormatting.AQUA)
+                .withUnderlined(true)
+                .withClickEvent(openUrl(url))
+                .withHoverEvent(showText(Component.literal("§7点击在浏览器中打开")))
+            );
+    }
+
+    /**
+     * 打码密码
+     */
+    private static Component maskedPassword(String password) {
+        return Component
+            .literal("****************")
+            .withStyle(Style.EMPTY
+                .withColor(ChatFormatting.LIGHT_PURPLE)
+                .withObfuscated(true)
+                .withClickEvent(copyText(password))
+                .withHoverEvent(showText(Component.literal("§7点击复制密码到剪贴板")))
+            );
+    }
+
+    //? if >=1.21.5 {
+    private static ClickEvent openUrl(String url) {
+        return new ClickEvent.OpenUrl(java.net.URI.create(url));
+    }
+
+    private static ClickEvent copyText(String text) {
+        return new ClickEvent.CopyToClipboard(text);
+    }
+
+    private static HoverEvent showText(Component text) {
+        return new HoverEvent.ShowText(text);
+    }
+
+    //? } else {
+    /*private static ClickEvent openUrl(String url) {
+        return new ClickEvent(ClickEvent.Action.OPEN_URL, url);
+    }
+
+    private static ClickEvent copyText(String text) {
+        return new ClickEvent(ClickEvent.Action.COPY_TO_CLIPBOARD, text);
+    }
+
+    private static HoverEvent showText(Component text) {
+        return new HoverEvent(HoverEvent.Action.SHOW_TEXT, text);
+    }*/
+    //? }
+    /**
+     * 读取常驻编码能力快照并追加编码/显卡两行（线格式 {@code 后端|codecs[|显卡]}）；
+     * 快照还没建立或原生库不可用时显示未知
+     */
+    private static void appendEncoderLines(List<Component> lines, EncoderChannel channel) {
+        String summary = channel == null ? "" : channel.caps();
+        if (summary.isEmpty() || "unknown".equals(summary)) {
+            lines.add(row("编码信息", Component.literal("§8未知")));
+            return;
+        }
+        try {
+            String[] parts = summary.split("\\|");
+            if (parts.length < 2) {
+                lines.add(row("编码信息", Component.literal("§8未知")));
+                return;
+            }
+            String backend = switch (parts[0]) {
+                case "nvenc" -> "NVENC";
+                case "vulkan_video" -> "Vulkan Video";
+                case "software" -> "软件编码";
+                default -> parts[0];
+            };
+            String codecs = parts[1].replace("H264", "H.264").replace("H265", "H.265");
+            lines.add(row("编码信息", Component.literal("§f" + backend + " §8· §f" + codecs)));
+            if (parts.length >= 3 && !parts[2].isEmpty()) {
+                lines.add(row("使用显卡", Component.literal("§f" + parts[2])));
+            }
+        } catch (Throwable t) {
+            lines.add(row("编码信息", Component.literal("§8未知")));
+        }
+    }
+
+    /**
+     * 派发动作至服务控制面串行队列
+     */
+    private static void submit(Runnable action) {
+        VistrelService.submitControl(action);
+    }
+
+    /**
+     * 经主线程队列投递聊天反馈；任意线程调用均安全
+     *
+     * @param message 纯文本消息（自动加 Vistrel 前缀）
+     */
+    public static void feedback(String message) {
+        feedback(Component.literal(message));
+    }
+
+    /**
+     * 组件版反馈：需要点击事件等富文本时使用；任意线程调用均安全
+     *
+     * @param message 组件消息（自动加 Vistrel 前缀）；无游戏实例或无玩家时静默丢弃
+     */
+    public static void feedback(Component message) {
+        Minecraft minecraft = Minecraft.getInstance();
+        // 无游戏实例（纯 JVM 测试/无头上下文）时无处投递，静默跳过
+        if (minecraft == null) {
+            return;
+        }
+        minecraft.execute(() -> {
+            Component chatMessage = Component.literal(PREFIX).append(message);
+            //? if >=26.1 {
+            if (minecraft.player != null) {
+                minecraft.player.sendSystemMessage(chatMessage);
+            }
+            //? } else {
+            /*// 状态回执直写聊天组件：不过玩家系统消息管线——那条管线先过 onClientSystemChat 事件
+            //（可被其他 mod 改写或取消，回执必须保达），并附带举报日志推送与旁白副作用；
+            //系统消息不走延迟队列。26.1 起 addMessage 收私有，26.x 只能走 sendSystemMessage
+            minecraft.gui.getChat().addMessage(chatMessage);*/
+            //? }
+        });
+    }
+}

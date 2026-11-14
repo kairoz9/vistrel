@@ -1,0 +1,75 @@
+#version 450
+
+// `texture2D` 是「分离纹理对象」，不带采样器。`texelFetch` 的免采样器重载不是核心
+// 语法，由这个扩展提供（glslang 支持）。少了它 glslang 会直接报
+// "required extension not requested"。
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0) uniform texture2D u_rgba;
+
+// 绑定 1：输出 NV12 平面 0 (Y 平面, 8-bit 单通道, 全分辨率 W x H)
+layout(binding = 1, r8) uniform writeonly image2D out_y;
+
+// 绑定 2：输出 NV12 平面 1 (UV 平面, 8-bit 双通道, 半分辨率 W/2 x H/2)
+layout(binding = 2, rg8) uniform writeonly image2D out_uv;
+
+// 推送常量：图像分辨率边界
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+} pc;
+
+// BT.709 Limited Range 色彩空间转换常量 (ITU-R BT.709)
+// Y  = 16.0/255.0 + (0.182586 * R + 0.614231 * G + 0.062007 * B)
+// Cb = 128.0/255.0 + (-0.100644 * R - 0.338572 * G + 0.439216 * B)
+// Cr = 128.0/255.0 + (0.439216 * R - 0.398942 * G - 0.040274 * B)
+const vec3 COEFF_Y  = vec3(0.182586, 0.614231, 0.062007);
+const vec3 COEFF_CB = vec3(-0.100644, -0.338572, 0.439216);
+const vec3 COEFF_CR = vec3(0.439216, -0.398942, -0.040274);
+const float OFFSET_Y  = 16.0 / 255.0;
+const float OFFSET_UV = 128.0 / 255.0;
+
+void main() {
+    // 每个线程负责一个 2x2 像素块，对应 UV 平面上的 1 个采样点
+    ivec2 uv_coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 base_coord = uv_coord * 2;
+
+    if (base_coord.x >= pc.width || base_coord.y >= pc.height) {
+        return;
+    }
+
+    // 读取 4 个相邻像素并做边界保护。源图是 Vulkan 渲染附件，顶行在前——按原序采样
+    ivec2 max_coord = ivec2(pc.width - 1, pc.height - 1);
+    vec3 c00 = texelFetch(u_rgba, base_coord + ivec2(0, 0), 0).rgb;
+    vec3 c10 = texelFetch(u_rgba, min(base_coord + ivec2(1, 0), max_coord), 0).rgb;
+    vec3 c01 = texelFetch(u_rgba, min(base_coord + ivec2(0, 1), max_coord), 0).rgb;
+    vec3 c11 = texelFetch(u_rgba, min(base_coord + ivec2(1, 1), max_coord), 0).rgb;
+
+    // 计算 4 个亮度值 Y
+    float y00 = dot(c00, COEFF_Y) + OFFSET_Y;
+    float y10 = dot(c10, COEFF_Y) + OFFSET_Y;
+    float y01 = dot(c01, COEFF_Y) + OFFSET_Y;
+    float y11 = dot(c11, COEFF_Y) + OFFSET_Y;
+
+    // 写入 Y 平面 (R8)
+    imageStore(out_y, base_coord + ivec2(0, 0), vec4(y00, 0.0, 0.0, 0.0));
+    if (base_coord.x + 1 < pc.width) {
+        imageStore(out_y, base_coord + ivec2(1, 0), vec4(y10, 0.0, 0.0, 0.0));
+    }
+    if (base_coord.y + 1 < pc.height) {
+        imageStore(out_y, base_coord + ivec2(0, 1), vec4(y01, 0.0, 0.0, 0.0));
+    }
+    if (base_coord.x + 1 < pc.width && base_coord.y + 1 < pc.height) {
+        imageStore(out_y, base_coord + ivec2(1, 1), vec4(y11, 0.0, 0.0, 0.0));
+    }
+
+    // 计算 2x2 像素块均值色度 (U, V)
+    vec3 avg_rgb = (c00 + c10 + c01 + c11) * 0.25;
+    float u = dot(avg_rgb, COEFF_CB) + OFFSET_UV;
+    float v = dot(avg_rgb, COEFF_CR) + OFFSET_UV;
+
+    // 写入 UV 平面 (RG8: r=U, g=V)
+    imageStore(out_uv, uv_coord, vec4(u, v, 0.0, 0.0));
+}

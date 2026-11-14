@@ -1,0 +1,7 @@
+dist
+node_modules
+pnpm-lock.yaml
+pnpm-workspace.yaml
+public/icons
+# HTML 为手写模板：内含中文段落与 inline 标记，prettier 的结构重排会切碎句子
+index.html

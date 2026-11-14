@@ -1,0 +1,88 @@
+<!--
+  Vistrel 第三方声明生成模板
+  再生成：cd rust-native && cargo about generate about.hbs | sed "s|^\s*<p>生成日期：.*|<p>生成日期：$(date +%Y)</p>|" > THIRD-PARTY-NOTICES.html
+-->
+
+<html>
+
+<head>
+    <style>
+        @media (prefers-color-scheme: dark) {
+            body {
+                background: #333;
+                color: white;
+            }
+            a {
+                color: skyblue;
+            }
+        }
+        .container {
+            font-family: sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .intro {
+            text-align: center;
+        }
+        .licenses-list {
+            list-style-type: none;
+            margin: 0;
+            padding: 0;
+        }
+        .license-used-by {
+            margin-top: -10px;
+        }
+        .license-text {
+            max-height: 200px;
+            overflow-y: scroll;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+
+<body>
+    <main class="container">
+        <div class="intro">
+            <h1>Vistrel 第三方声明（THIRD-PARTY-NOTICES）</h1>
+            <p>本页列出随 Vistrel 模组 jar 分发的 Rust 原生引擎（<code>libvistrel.so</code> / <code>vistrel.dll</code>）所含全部第三方组件的许可信息，由 <code>cargo-about</code> 依据 <code>rust-native/Cargo.lock</code> 自动生成。</p>
+            <p>项目：<a href="https://github.com/kairoz9/vistrel">Vistrel</a> · 项目许可证：MIT（见仓库根目录 LICENSE）</p>
+            <p>生成日期：GENERATION_DATE</p>
+        </div>
+
+        <h2>随 jar 分发的二进制组件</h2>
+        <section>
+            <h3>Cisco OpenH264 2.6.0（运行期下载，<code>libopenh264.so</code> / <code>openh264.dll</code>）</h3>
+            <p><strong>OpenH264 Video Codec provided by Cisco Systems, Inc.</strong></p>
+            <p>OpenH264 二进制不随 jar 分发：首次需要软编时从 Cisco 官方源（<a href="https://ciscobinary.openh264.org">ciscobinary.openh264.org</a>）下载 2.6.0 预编译归档，解压后经 <code>openh264-sys2</code> 内嵌的 SHA-256 白名单校验方可加载。该下载与使用行为依 <a href="https://www.openh264.org/BINARY_LICENSE.txt">BINARY_LICENSE</a> 授权，最终用户可通过配置键 <code>softwareEncoder</code> 启用或停用。</p>
+            <h3>NVIDIA 视频编码头文件（<code>third_party/nv-codec-headers/nvEncodeAPI.h</code>）</h3>
+            <p>来自 FFmpeg 维护的 <a href="https://github.com/FFmpeg/nv-codec-headers">nv-codec-headers</a> 项目，头文件自带 NVIDIA 宽松许可声明（Copyright (c) 2010-2023 NVIDIA Corporation，MIT 式条款，允许再分发，需保留声明全文，见头文件头部）。运行期仅通过 dlopen 从已安装的 NVIDIA 驱动加载编码库，本 jar 不分发任何 NVIDIA 二进制。</p>
+            <h3>Vulkan / Khronos</h3>
+            <p>Vulkan API 定义经 <code>ash</code> crate（MIT OR Apache-2.0）以绑定形式使用，其绑定生成自 Khronos <code>vk.xml</code>；Vulkan-Headers 由 Khronos Group 以 Apache-2.0 OR MIT 双许可发布（<a href="https://github.com/KhronosGroup/Vulkan-Headers">KhronosGroup/Vulkan-Headers</a>）。本 jar 不分发任何 Khronos 二进制。</p>
+        </section>
+
+        <h2>许可证总览：</h2>
+        <ul class="licenses-overview">
+            {{#each overview}}
+            <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+            {{/each}}
+        </ul>
+
+        <h2>全部许可证文本：</h2>
+        <ul class="licenses-list">
+            {{#each licenses}}
+            <li class="license">
+                <h3 id="{{id}}">{{name}}</h3>
+                <h4>被以下 crate 使用：</h4>
+                <ul class="license-used-by">
+                    {{#each used_by}}
+                    <li><a href="{{#if crate.repository}} {{crate.repository}} {{else}} https://crates.io/crates/{{crate.name}} {{/if}}">{{crate.name}} {{crate.version}}</a></li>
+                    {{/each}}
+                </ul>
+                <pre class="license-text">{{text}}</pre>
+            </li>
+            {{/each}}
+        </ul>
+    </main>
+</body>
+
+</html>

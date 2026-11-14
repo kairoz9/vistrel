@@ -1,0 +1,106 @@
+# 版本矩阵唯一事实源
+# 覆盖顺序由宽到窄：顶层 → ["<版本>"] → [<分支>] → [<分支>"<版本>"]，窄段覆盖同名键。
+# 节点名 = minecraft.version_range 下界（与 settings.gradle.kts 一致）：编译目标对齐区间最低版，
+# 行内更高版本靠前向兼容；deps.api_version 绑定该下界版本对应的产物。
+# 依赖版本单档：deps.api_version = 编译所依赖的 API/平台产物版本；deps.loader_version = 运行时 loader 下限。
+# Fabric 分支对应 Fabric API / Fabric Loader；NeoForge/Forge 分支对应平台产物 / FML。
+# 模组身份与元数据在 gradle.properties。
+
+
+["26.3"]
+minecraft.version_range = "[26.3, 26.4)"
+java.version = 25
+loomx.obfuscated = false
+
+["26.2"]
+minecraft.version_range = "[26.2, 26.3)"
+java.version = 25
+loomx.obfuscated = false
+
+["26.1"]
+minecraft.version_range = "[26.1, 26.2)"
+java.version = 25
+loomx.obfuscated = false
+
+["1.21.9"]
+minecraft.version_range = "[1.21.9, 1.21.12)"
+java.version = 21
+loomx.obfuscated = true
+
+["1.21.5"]
+minecraft.version_range = "[1.21.5, 1.21.9)"
+java.version = 21
+loomx.obfuscated = true
+
+["1.21"]
+minecraft.version_range = "[1.21, 1.21.5)"
+java.version = 21
+loomx.obfuscated = true
+
+["1.20"]
+minecraft.version_range = "[1.20, 1.20.2)"
+java.version = 17
+loomx.obfuscated = true
+
+
+# ========== Fabric ==========
+[fabric."26.3"]
+deps.api_version = "0.160.6+26.3"
+deps.loader_version = "0.19.3"
+
+[fabric."26.2"]
+deps.api_version = "0.152.2+26.2"
+deps.loader_version = "0.18.4"
+
+[fabric."26.1"]
+deps.api_version = "0.144.1+26.1"
+deps.loader_version = "0.18.4"
+
+[fabric."1.21.9"]
+deps.api_version = "0.134.0+1.21.9"
+deps.loader_version = "0.17.0"
+
+[fabric."1.21.5"]
+deps.api_version = "0.119.6+1.21.5"
+deps.loader_version = "0.16.10"
+
+[fabric."1.21"]
+deps.api_version = "0.100.2+1.21"
+deps.loader_version = "0.15.11"
+
+[fabric."1.20"]
+deps.api_version = "0.83.0+1.20"
+deps.loader_version = "0.15.0"
+
+
+# ========== NeoForge ==========
+[neoforge]
+deps.loader_version = "4"
+
+[neoforge."26.3"]
+deps.api_version = "26.3.0.76"
+
+[neoforge."26.2"]
+deps.api_version = "26.2.0.57"
+
+[neoforge."26.1"]
+deps.api_version = "26.1.2.71"
+
+# 1.21.9 存活期短，NeoForge 未发稳定版，仅 21.9.x-beta 绑定 1.21.9
+[neoforge."1.21.9"]
+deps.api_version = "21.9.16-beta"
+
+[neoforge."1.21.5"]
+deps.api_version = "21.5.101"
+
+# NeoForge 未发绑定 1.21.0 的产物，本行编译下限为 1.21.1
+[neoforge."1.21"]
+deps.api_version = "21.1.1"
+
+
+# ========== Forge ==========
+[forge]
+deps.loader_version = "46"
+
+[forge."1.20"]
+deps.api_version = "46.0.14"
