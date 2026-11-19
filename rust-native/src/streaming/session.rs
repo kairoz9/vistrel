@@ -23,8 +23,6 @@ use webrtc::peer_connection::{
     RTCPeerConnectionIceEvent, RTCPeerConnectionState,
 };
 
-#[cfg(test)]
-use crate::encode::KeyframeTrigger;
 use crate::encode::{StreamingProfile, VideoCodec};
 use crate::streaming::input::InputRingBuffer;
 use crate::streaming::rate_control::RateControl;
@@ -147,7 +145,7 @@ impl StreamingSession {
     ) -> Result<(Arc<Self>, RTCSessionDescription), Box<dyn std::error::Error + Send + Sync>> {
         let state = Arc::new(AtomicU8::new(RTCPeerConnectionState::New as u8));
         let cancel = CancellationToken::new();
-        let throttle = KeyframeThrottle::new((*engine.video().keyframe()).clone());
+        let throttle = KeyframeThrottle::new(engine.video().control().clone());
         let outbox = engine.video().output();
         // 码率回路直连控制面：GCC 估计经 RateControl 钳位后派发给编码器，
         // 发送方克隆自引擎的控制面（控制面所有权在引擎，会话不另持一份）
@@ -584,7 +582,7 @@ impl StreamingSession {
     /// 单测会话装配：管线照常组装（死控制面只为产出写者要用的发件箱），
     /// 控制面由用例在 ask 时自备（活/死皆可）
     #[cfg(test)]
-    async fn new_mock(trigger: KeyframeTrigger) -> (Arc<Self>, Arc<VideoWriter>) {
+    async fn new_mock() -> (Arc<Self>, Arc<VideoWriter>) {
         let video_codec = RTCRtpCodecParameters {
             rtp_codec: RTCRtpCodec {
                 mime_type: MIME_TYPE_H264.to_owned(),
@@ -629,12 +627,12 @@ impl StreamingSession {
         );
 
         let state = Arc::new(AtomicU8::new(RTCPeerConnectionState::Connected as u8));
-        let throttle = KeyframeThrottle::new(trigger);
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let doorbell = Arc::new(tokio::sync::Notify::new());
+        let control = crate::encode::control::ControlSender::new(tx, Arc::clone(&doorbell), false);
+        let throttle = KeyframeThrottle::new(control.clone());
         let pipeline = Arc::new(crate::encode::VideoPipeline::assemble(
-            crate::encode::control::ControlSender::new(tx, Arc::clone(&doorbell), false),
-            Arc::new(KeyframeTrigger::new()),
+            control,
             Arc::new(crate::encode::frame::FrameInbox::new(Arc::clone(&doorbell))),
         ));
         let writer = VideoWriter::new(
@@ -687,7 +685,6 @@ mod tests {
         let audio = crate::streaming::audio_loopback::AudioLoopback::new();
         let pipeline = Arc::new(crate::encode::VideoPipeline::assemble(
             dead_control(),
-            Arc::new(KeyframeTrigger::new()),
             Arc::new(crate::encode::frame::FrameInbox::new(Arc::new(
                 tokio::sync::Notify::new(),
             ))),
@@ -746,7 +743,7 @@ a=rtpmap:102 H264/90000\r\n";
     /// 会话不再向 Java 推送状态，这里只钉住写者节奏依赖的状态机本身
     #[tokio::test]
     async fn test_session_handler_idempotent_closed_transition() {
-        let (session, _writer) = StreamingSession::new_mock(KeyframeTrigger::new()).await;
+        let (session, _writer) = StreamingSession::new_mock().await;
 
         session
             .state
@@ -788,8 +785,7 @@ a=rtpmap:102 H264/90000\r\n";
 
     #[tokio::test]
     async fn test_streaming_session_drop_cancels_tracked_tasks() {
-        let trigger = KeyframeTrigger::new();
-        let (session, _writer) = StreamingSession::new_mock(trigger).await;
+        let (session, _writer) = StreamingSession::new_mock().await;
 
         let flag = Arc::new(AtomicBool::new(false));
         let flag_clone = Arc::clone(&flag);
@@ -850,7 +846,7 @@ a=rtpmap:102 H264/90000\r\n";
     #[tokio::test]
     async fn test_session_input_ring_is_session_scoped() {
         let buf = &mut [0u8; 64];
-        let (session, _writer) = StreamingSession::new_mock(KeyframeTrigger::new()).await;
+        let (session, _writer) = StreamingSession::new_mock().await;
         assert_eq!(session.drain_input_events(buf, 16), 0, "新会话环为空");
 
         assert!(
@@ -860,7 +856,7 @@ a=rtpmap:102 H264/90000\r\n";
         );
         assert_eq!(session.drain_input_events(buf, 16), 1);
 
-        let (session2, _writer2) = StreamingSession::new_mock(KeyframeTrigger::new()).await;
+        let (session2, _writer2) = StreamingSession::new_mock().await;
         assert_eq!(
             session2.drain_input_events(buf, 16),
             0,

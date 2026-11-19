@@ -18,7 +18,6 @@ pub use audio::{
 };
 pub use encoder::EncodeBackendKind;
 pub(crate) use frame::FramePayload;
-pub use frame::KeyframeTrigger;
 pub use hardware::{
     HardwareProbeResult, bootstrap_hardware_caps, encoder_caps_summary, hardware_caps,
     is_hardware_caps_bootstrapped,

@@ -719,7 +719,7 @@ mod tests {
     /// 0×0 是暂停信号，协商缝不得把它「修正」成最小档位：0 与负数都必须被显式拒绝
     #[tokio::test]
     async fn test_negotiate_rejects_zero_geometry_as_pause_signal() {
-        let (engine, _rx, _kf) = make_test_engine(false);
+        let (engine, _rx) = make_test_engine(false);
         for geometry in [(0, 0, 0), (-1, -1, -1)] {
             let answer = handle_negotiate_offer(
                 Some(Arc::clone(&engine)),
@@ -741,7 +741,7 @@ mod tests {
     /// 关停开始后拒新协商，与引擎是否仍在位无关
     #[tokio::test]
     async fn test_negotiate_refuses_while_shutting_down() {
-        let (engine, _rx, _kf) = make_test_engine(false);
+        let (engine, _rx) = make_test_engine(false);
         let answer =
             handle_negotiate_offer(Some(engine), false, &offer_wire_json(), 1920, 1080, 60, 1.0)
                 .await;
@@ -765,7 +765,7 @@ mod tests {
     /// codec 令牌解析不出就不猜：缺失与无法识别同为拒绝
     #[tokio::test]
     async fn test_apply_profile_rejects_unresolvable_codec() {
-        let (engine, _rx, _kf) = make_test_engine(false);
+        let (engine, _rx) = make_test_engine(false);
         for token in [None, Some("wmv")] {
             let answer =
                 handle_apply_profile(Some(Arc::clone(&engine)), token, 1600, 900, 90, 0.2).await;
@@ -777,7 +777,7 @@ mod tests {
     /// 解析器锚定的线契约，多键少键都算漂移
     #[tokio::test]
     async fn test_negotiate_then_apply_roundtrip_pin_line_contract() {
-        let (engine, _rx, _kf) = make_test_engine(false);
+        let (engine, _rx) = make_test_engine(false);
 
         let answer = handle_negotiate_offer(
             Some(Arc::clone(&engine)),

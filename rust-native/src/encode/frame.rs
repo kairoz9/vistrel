@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -416,42 +415,6 @@ impl FrameInbox {
     }
 }
 
-/// 关键帧触发器
-///
-/// 具备原子覆写（Latest-Wins）行为，初值为 true 以确保新管线首帧必出 IDR。
-#[derive(Debug, Clone)]
-pub struct KeyframeTrigger {
-    need: Arc<AtomicBool>,
-}
-
-impl Default for KeyframeTrigger {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl KeyframeTrigger {
-    pub fn new() -> Self {
-        Self {
-            // 初值 true：首帧必须是 IDR
-            need: Arc::new(AtomicBool::new(true)),
-        }
-    }
-
-    /// 挂起一次关键帧请求
-    pub(crate) fn request(&self) {
-        self.need.store(true, Ordering::Release);
-    }
-
-    /// 编码段原子消费挂起的关键帧请求
-    ///
-    /// 消费即清空，所以调用方必须在**确认产出关键帧之后**才算兑现；失败时应重新
-    /// [`request`](Self::request)，否则请求会被静默吞掉。
-    pub fn take(&self) -> bool {
-        self.need.swap(false, Ordering::AcqRel)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,30 +429,6 @@ mod tests {
                 FramePayload::Host { .. } => None,
             })
             .collect()
-    }
-
-    /// 初值、消费与复燃：旗标的三段生命周期
-    #[test]
-    fn test_trigger_lifecycle() {
-        let trigger = KeyframeTrigger::new();
-        assert!(trigger.take(), "初值必须为 true（首帧必出 IDR）");
-        assert!(!trigger.take(), "消费即清空");
-        trigger.request();
-        assert!(trigger.take(), "request 后必须复燃");
-        assert!(!trigger.take());
-    }
-
-    /// Clone 共享同一份旗标（原子覆写行为），而非各自独立
-    #[test]
-    fn test_clone_shares_state() {
-        let trigger = KeyframeTrigger::new();
-        let clone = trigger.clone();
-        trigger.take();
-        clone.request();
-        assert!(
-            trigger.take(),
-            "Clone 必须共享旗标：clone 的 request 对原实例可见"
-        );
     }
 
     /// 被覆盖/清空的帧必须交出资源：显存槽位与主机块都进待归还队列

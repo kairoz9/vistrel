@@ -361,7 +361,6 @@ fn resolve_codec(
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    use crate::encode::KeyframeTrigger;
     use crate::encode::control::{ControlCommand, ControlSender, ControlStatus};
     use crate::encode::encoder::EncodeBackendKind;
     use crate::encode::frame::FrameInbox;
@@ -373,6 +372,7 @@ pub(crate) mod test_support {
         Prepare(StreamingProfile),
         ChangeProfile,
         SetBitrate,
+        RequestKeyframe,
         Other,
     }
 
@@ -384,11 +384,7 @@ pub(crate) mod test_support {
     /// `reject_change` 让档位重配一律被拒（回传 `ReconfigureFailed`），供拒绝路径用例。
     pub(crate) fn make_test_engine(
         reject_change: bool,
-    ) -> (
-        Arc<StreamingEngine>,
-        std::sync::mpsc::Receiver<Rec>,
-        KeyframeTrigger,
-    ) {
+    ) -> (Arc<StreamingEngine>, std::sync::mpsc::Receiver<Rec>) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ControlCommand>(16);
         let (recorded_tx, recorded_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -417,6 +413,7 @@ pub(crate) mod test_support {
                         Rec::Other
                     }
                     ControlCommand::Shutdown => Rec::Other,
+                    ControlCommand::RequestKeyframe => Rec::RequestKeyframe,
                     ControlCommand::BitrateChange(_) => Rec::SetBitrate,
                 };
                 if recorded_tx.send(rec).is_err() {
@@ -426,12 +423,10 @@ pub(crate) mod test_support {
         });
 
         let audio = AudioLoopback::new();
-        let keyframe = KeyframeTrigger::new();
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let pipeline = Arc::new(VideoPipeline::assemble(
             ControlSender::new(tx, bell, true),
-            Arc::new(keyframe.clone()),
             inbox,
         ));
         let mgr = Arc::new(StreamingEngine::new(
@@ -439,7 +434,7 @@ pub(crate) mod test_support {
             audio,
             "0.0.0.0:0".to_string(),
         ));
-        (mgr, recorded_rx, keyframe)
+        (mgr, recorded_rx)
     }
 
     pub(crate) fn make_test_offer() -> RTCSessionDescription {
@@ -466,7 +461,6 @@ a=rtpmap:102 H264/90000\r\n";
 mod tests {
     use super::test_support::{Rec, make_test_engine, make_test_offer};
     use super::*;
-    use crate::encode::KeyframeTrigger;
     use crate::encode::control::{ControlCommand, ControlSender};
     use crate::encode::encoder::EncodeBackendKind;
     use crate::encode::frame::FrameInbox;
@@ -476,7 +470,7 @@ mod tests {
     /// 新会话接入必须替换旧会话，`close` 必须清空
     #[tokio::test]
     async fn test_single_session_lifecycle_and_preemption() {
-        let (mgr, _rx, _kf) = make_test_engine(false);
+        let (mgr, _rx) = make_test_engine(false);
         assert!(!mgr.active_session.load().is_some());
 
         let (answer1, profile1, _backend1) = mgr
@@ -508,7 +502,7 @@ mod tests {
     /// 不被 Engine→Session→PC→Handler→Engine 强环拖住
     #[tokio::test]
     async fn test_candidate_handler_does_not_pin_engine() {
-        let (mgr, _rx, _kf) = make_test_engine(false);
+        let (mgr, _rx) = make_test_engine(false);
         let weak = Arc::downgrade(&mgr);
         {
             let (session, _answer, _backend) = mgr
@@ -550,7 +544,6 @@ mod tests {
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let pipeline = Arc::new(VideoPipeline::assemble(
             ControlSender::new(tx, bell, true),
-            Arc::new(KeyframeTrigger::new()),
             inbox,
         ));
         let mgr = Arc::new(StreamingEngine::new(
@@ -634,7 +627,7 @@ mod tests {
     /// 档位 ask 事务：成功返回实际档位、无会话与 0 几何/帧率显式拒绝
     #[tokio::test]
     async fn test_apply_profile_ask_transaction() {
-        let (mgr, _rx, _kf) = make_test_engine(false);
+        let (mgr, _rx) = make_test_engine(false);
         let codec = VideoCodec::H264;
 
         // 无活跃会话：NoSession
@@ -738,12 +731,10 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<ControlCommand>(16);
         let audio = AudioLoopback::new();
         let mut audio_rx = audio.attach_with_capacity(16);
-        let keyframe = KeyframeTrigger::new();
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let pipeline = Arc::new(VideoPipeline::assemble(
             ControlSender::new(tx, bell, true),
-            Arc::new(keyframe.clone()),
             inbox,
         ));
         let engine = Arc::new(StreamingEngine::new(
@@ -770,12 +761,10 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<ControlCommand>(16);
         let audio = AudioLoopback::new();
         let mut audio_rx = audio.attach_with_capacity(2);
-        let keyframe = KeyframeTrigger::new();
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let pipeline = Arc::new(VideoPipeline::assemble(
             ControlSender::new(tx, bell, true),
-            Arc::new(keyframe.clone()),
             inbox,
         ));
         let mgr = Arc::new(StreamingEngine::new(
@@ -799,17 +788,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_offer_leaves_keyframe_arming_to_session() {
-        let (mgr, _rx, kf) = make_test_engine(false);
-        // 初值消费掉，证明 establish 流程不存在任何隐式置位
-        assert!(kf.take(), "初值必须为 true");
-        assert!(!kf.take(), "消费后必须为 false");
-
+        let (mgr, rx) = make_test_engine(false);
         let _ = mgr
             .handle_offer(make_test_offer(), 1920, 1080, 60, None)
             .await
             .unwrap();
-        // 引擎不替会话请求关键帧：waiting 自愈归 send_video 的丢弃路径
-        assert!(!kf.take(), "handle_offer 不得触碰关键帧旗标");
+        // 引擎不替会话请求关键帧：waiting 自愈归会话写循环的节流路径。
+        // 假 Actor 线程仍持发送端，接收端只能 try_recv 排空，不得用阻塞迭代
+        let mut saw_request = false;
+        while let Ok(rec) = rx.try_recv() {
+            if matches!(rec, Rec::RequestKeyframe) {
+                saw_request = true;
+            }
+        }
+        assert!(!saw_request, "establish 不得隐式投递关键帧命令");
     }
 
     /// 会话建立必须是一条原子命令，而不是若干条互不等待的命令
@@ -819,7 +811,7 @@ mod tests {
     /// 而不是若干条互不等待命令的隐式产物。
     #[tokio::test]
     async fn test_new_session_dispatches_single_prepare_encoder() {
-        let (mgr, rx, _kf) = make_test_engine(false);
+        let (mgr, rx) = make_test_engine(false);
         let _ = mgr
             .handle_offer(make_test_offer(), 1920, 1080, 60, None)
             .await
@@ -835,8 +827,8 @@ mod tests {
                     prepare_count += 1;
                 }
                 // 建立路径上不该再出现任何零散命令：档位与初始码率都由
-                // PrepareEncoder 内部一次设定
-                Rec::ChangeProfile | Rec::SetBitrate => {
+                // PrepareEncoder 内部一次设定，关键帧请求只属于会话写循环
+                Rec::ChangeProfile | Rec::SetBitrate | Rec::RequestKeyframe => {
                     panic!("会话建立路径出现了本应被 PrepareEncoder 取代的命令");
                 }
                 Rec::Other => {}

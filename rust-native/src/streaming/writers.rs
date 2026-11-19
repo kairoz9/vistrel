@@ -290,7 +290,6 @@ impl AudioWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::KeyframeTrigger;
     use crate::encode::frame::{FrameOutcomes, Mailbox};
     use crate::streaming::transport::{VIDEO_CLOCK_RATE, h264_sdp_fmtp};
     use bytes::Bytes;
@@ -337,19 +336,26 @@ mod tests {
 
     /// 视频写者最小装配：独立账本的发件箱 + 新生节流窗口；测试模块就在本文件里，直接触碰私有字段
     fn make_video_writer(
-        trigger: KeyframeTrigger,
         sink: Option<tokio::sync::mpsc::Sender<Duration>>,
-    ) -> VideoWriter {
+    ) -> (
+        VideoWriter,
+        tokio::sync::mpsc::Receiver<crate::encode::control::ControlCommand>,
+    ) {
+        let (tx, cmd_rx) = tokio::sync::mpsc::channel(16);
         let mut writer = VideoWriter::new(
             test_track(),
             102,
             Arc::new(AtomicU8::new(RTCPeerConnectionState::Connected as u8)),
-            KeyframeThrottle::new(trigger),
+            KeyframeThrottle::new(crate::encode::control::ControlSender::new(
+                tx,
+                Arc::new(tokio::sync::Notify::new()),
+                false,
+            )),
             Arc::new(Mailbox::new(Arc::new(FrameOutcomes::new()))),
             CancellationToken::new(),
         );
         writer.test_sink = sink;
-        writer
+        (writer, cmd_rx)
     }
 
     /// 测试帧：IDR 带 0x65，P 帧带 0x61
@@ -369,39 +375,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_waiting_keyframe_self_heals_request() {
-        let trigger = KeyframeTrigger::new();
+        use crate::encode::control::ControlCommand;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let writer = make_video_writer(trigger.clone(), Some(tx));
-
-        // 消费掉初值 true，模拟旗标已被上一个会话吃光
-        assert!(trigger.take(), "初值必须为 true");
-        assert!(!trigger.take(), "消费后必须为 false");
+        let (writer, mut cmd_rx) = make_video_writer(Some(tx));
 
         // 新会话吃到的第一帧是 P 帧：就地拒收 + waiting 自愈再要 IDR
         post(&writer, video_frame(1_000_000, false));
         assert!(writer.drain_pending().await);
         assert_eq!(writer.outbox.outcomes().count(FrameOutcome::GateSkipped), 1);
-        assert!(trigger.take(), "丢弃 P 帧必须自请求关键帧");
-        assert!(!trigger.take(), "自请求为一次性置位");
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(ControlCommand::RequestKeyframe)),
+            "丢弃 P 帧必须自请求关键帧"
+        );
+        assert!(cmd_rx.try_recv().is_err(), "自请求为一次性投递");
 
         // IDR 到达：写上链后清除等待，之后不再自请求
         post(&writer, video_frame(2_000_000, true));
         assert!(writer.drain_pending().await);
         assert!(rx.recv().await.is_some());
-        assert!(!trigger.take(), "IDR 已兑现，不得再请求");
+        assert!(cmd_rx.try_recv().is_err(), "IDR 已兑现，不得再请求");
 
-        // 等待清除后的 P 帧正常写上链，同样不触碰旗标
+        // 等待清除后的 P 帧正常写上链，同样不触碰控制面
         post(&writer, video_frame(3_000_000, false));
         assert!(writer.drain_pending().await);
         assert!(rx.recv().await.is_some());
-        assert!(!trigger.take());
+        assert!(cmd_rx.try_recv().is_err());
     }
 
     /// 连续入箱但不写：箱里只留最新一帧，被覆盖的帧进 `Superseded`
     #[tokio::test]
     async fn test_post_keeps_latest_and_counts_superseded() {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
-        let writer = make_video_writer(KeyframeTrigger::new(), Some(tx));
+        let (writer, _cmd_rx) = make_video_writer(Some(tx));
 
         // 首帧 IDR 先兑现门控
         post(&writer, video_frame(1, true));
@@ -427,7 +432,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_delivery_drops_stale_pending_without_writing() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let writer = make_video_writer(KeyframeTrigger::new(), Some(tx));
+        let (writer, _cmd_rx) = make_video_writer(Some(tx));
 
         post(&writer, video_frame(1, true));
         // 60fps 下门槛为 33ms：空等 60ms 已经过了两个帧间隔
@@ -446,7 +451,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_failure_keeps_gate_shut() {
         // 不挂测试接收端：轨道未绑定 PeerConnection，每次写都会 Err
-        let writer = make_video_writer(KeyframeTrigger::new(), None);
+        let (writer, _cmd_rx) = make_video_writer(None);
 
         post(&writer, video_frame(1, true));
         assert!(writer.drain_pending().await);
@@ -468,7 +473,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_session_clock_baseline_isolated_after_idle_gap() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let writer = make_video_writer(KeyframeTrigger::new(), Some(tx));
+        let (writer, _cmd_rx) = make_video_writer(Some(tx));
 
         // 新会话首帧的诞生时刻距上一会话最后一帧跃迁 60 秒：differ 以满帧间隔重新起拍
         post(&writer, video_frame(60_001_000_000, true));

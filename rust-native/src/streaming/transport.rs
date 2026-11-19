@@ -20,7 +20,8 @@ use rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters;
 use rtc::sansio::Protocol;
 use rtc::shared::error::Error;
 
-use crate::encode::{KeyframeTrigger, VideoCodec};
+use crate::encode::VideoCodec;
+use crate::encode::control::ControlSender;
 use crate::streaming::rate_control::RateControl;
 
 /// 视频轨的 SSRC。只在本模块构造轨道与解析编解码参数时用得到
@@ -63,13 +64,14 @@ pub(crate) fn av1_sdp_fmtp(width: usize, height: usize, fps: usize, bitrate_kbps
 
 /// 关键帧节流器
 ///
-/// 限制 PLI/FIR 反馈与发送队列溢出触发的关键帧。
+/// 限制 PLI/FIR 反馈与发送队列溢出触发的关键帧：超过节流窗的请求经控制面
+/// `request_keyframe` 命令发往编码 Actor。
 /// 在 Intra-Refresh 模式下作为终极熔断兜底，日常丢包依赖条带滚动快速自愈。
 pub(crate) struct KeyframeThrottle {
     /// 上次放行时刻（相对 [`CLOCK_BASE`] 的纳秒）；0 表示从未放行。
     /// 内层 Arc 保证同一会话内反馈观察者与发送错误路径共用同一个节流窗口
     last: Arc<AtomicU64>,
-    trigger: KeyframeTrigger,
+    sender: ControlSender,
 }
 
 const KEYFRAME_THROTTLE: Duration = Duration::from_millis(3000);
@@ -85,20 +87,20 @@ impl Clone for KeyframeThrottle {
         // 复制会让每份 clone 各持独立窗口，节流上限放大为共享方数量倍
         Self {
             last: Arc::clone(&self.last),
-            trigger: self.trigger.clone(),
+            sender: self.sender.clone(),
         }
     }
 }
 
 impl KeyframeThrottle {
-    pub(crate) fn new(trigger: KeyframeTrigger) -> Self {
+    pub(crate) fn new(sender: ControlSender) -> Self {
         Self {
             last: Arc::new(AtomicU64::new(0)),
-            trigger,
+            sender,
         }
     }
 
-    /// 尝试请求关键帧：距离上次触发超过 2000ms 时才真正触发信标
+    /// 尝试请求关键帧：距上次放行超过节流窗时才向控制面投递一次命令
     ///
     /// 「检查窗口 + 盖章」由单次 CAS 成对完成，并发调用恰好一个赢家盖章并触发，
     /// 其余看到赢家刚写入的时刻落在窗口内而退回——「一个窗口一个赢家」由 CAS
@@ -118,7 +120,7 @@ impl KeyframeThrottle {
                 .compare_exchange_weak(prev, now, Ordering::Relaxed, Ordering::Relaxed)
             {
                 Ok(_) => {
-                    self.trigger.request();
+                    self.sender.request_keyframe();
                     return true;
                 }
                 Err(p) => prev = p,
@@ -426,6 +428,18 @@ mod tests {
         assert_eq!(resolve_codec_payload_type(&[], VideoCodec::H264), None);
     }
 
+    /// 测试控制面：发送端交给节流器，接收端留给用例断言命令是否抵达
+    fn test_control() -> (
+        ControlSender,
+        tokio::sync::mpsc::Receiver<crate::encode::control::ControlCommand>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        (
+            ControlSender::new(tx, Arc::new(tokio::sync::Notify::new()), false),
+            rx,
+        )
+    }
+
     fn test_feedback_observer(
         throttle: KeyframeThrottle,
     ) -> FeedbackObserver<impl Fn(), impl Fn(u64)> {
@@ -439,8 +453,8 @@ mod tests {
 
     #[test]
     fn test_feedback_observer_throttles_pli_storm() {
-        let trigger = KeyframeTrigger::new();
-        let throttle = KeyframeThrottle::new(trigger.clone());
+        let (sender, mut rx) = test_control();
+        let throttle = KeyframeThrottle::new(sender);
         let mut observer = test_feedback_observer(throttle);
         let mk_pli = || TaggedPacket {
             now: Instant::now(),
@@ -454,14 +468,18 @@ mod tests {
             },
         };
 
-        trigger.take();
+        assert!(observer.handle_read(mk_pli()).is_ok());
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(crate::encode::control::ControlCommand::RequestKeyframe)
+            ),
+            "首个 PLI 应投递关键帧命令"
+        );
 
         assert!(observer.handle_read(mk_pli()).is_ok());
-        assert!(trigger.take(), "首个 PLI 应触发 request_keyframe");
-
         assert!(observer.handle_read(mk_pli()).is_ok());
-        assert!(observer.handle_read(mk_pli()).is_ok());
-        assert!(!trigger.take(), "节流窗内的 PLI 不得再触发 IDR");
+        assert!(rx.try_recv().is_err(), "节流窗内的 PLI 不得再触发 IDR");
     }
 
     /// 并发请求最终只有单一赢家
@@ -474,9 +492,8 @@ mod tests {
         use std::sync::Barrier;
         use std::thread;
 
-        let trigger = KeyframeTrigger::new();
-        let throttle = KeyframeThrottle::new(trigger.clone());
-        trigger.take();
+        let (sender, mut rx) = test_control();
+        let throttle = KeyframeThrottle::new(sender);
 
         const THREADS: usize = 8;
         let barrier = Arc::new(Barrier::new(THREADS));
@@ -496,6 +513,11 @@ mod tests {
             .filter(|won| *won)
             .count();
         assert_eq!(wins, 1, "同一窗口内的并发请求必须只剩单一赢家");
+        let mut arrived = 0;
+        while rx.try_recv().is_ok() {
+            arrived += 1;
+        }
+        assert_eq!(arrived, 1, "单一赢家必须恰好向控制面投递一条命令");
     }
 
     #[test]
@@ -504,7 +526,7 @@ mod tests {
         let registry = build_interceptor_registry(
             &mut media_engine,
             &Arc::new(RateControl::new(20_000_000, |_| {})),
-            &KeyframeThrottle::new(KeyframeTrigger::new()),
+            &KeyframeThrottle::new(test_control().0),
         )
         .unwrap();
         let slots: Vec<Slot> = registry.slots().into_iter().map(|(slot, _)| slot).collect();

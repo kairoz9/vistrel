@@ -61,6 +61,9 @@ pub(crate) enum ControlCommand {
     Shutdown,
     /// 设置跟随码率
     BitrateChange(usize),
+    /// 挂起一次关键帧请求：下一帧以 IDR 编码（tell）
+    /// 请求是幂等意图而非逐条事件：重复投递在消费点塌缩成一个挂起标志
+    RequestKeyframe,
     /// 重配档位，回送实际生效的档位与当时后端身份或拒绝原因；
     /// 后端 None 表示编码器尚未就绪的纯采纳态（会话建立前不可达）
     ProfileChange {
@@ -139,6 +142,11 @@ impl ControlSender {
     /// 码率环路下一拍会再发，投递失败不必上报：丢掉一拍追随量与丢掉整条命令不同。
     pub(crate) fn set_bitrate(&self, bps: usize) {
         let _ = self.send(ControlCommand::BitrateChange(bps));
+    }
+
+    /// 关键帧请求（tell）：Actor 把挂起标志置位，下一帧以 IDR 编码
+    pub(crate) fn request_keyframe(&self) {
+        let _ = self.send(ControlCommand::RequestKeyframe);
     }
 
     /// 请求重配档位（ask）
@@ -296,7 +304,9 @@ mod tests {
                 ControlCommand::ProfileChange { reply, .. } => {
                     let _ = reply.send(Ok((StreamingProfile::default(), None)));
                 }
-                ControlCommand::Shutdown | ControlCommand::BitrateChange(_) => {}
+                ControlCommand::Shutdown
+                | ControlCommand::BitrateChange(_)
+                | ControlCommand::RequestKeyframe => {}
             }
         });
         (sender, recorded_rx)
@@ -307,6 +317,7 @@ mod tests {
         match cmd {
             ControlCommand::Shutdown => "shutdown",
             ControlCommand::BitrateChange(_) => "set_bitrate",
+            ControlCommand::RequestKeyframe => "request_keyframe",
             ControlCommand::ProfileChange { .. } => "change_profile",
             ControlCommand::PrepareEncoder { .. } => "prepare_encoder",
             ControlCommand::ImportVramSlots { .. } => "import_vram_slots",

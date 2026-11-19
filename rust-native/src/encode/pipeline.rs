@@ -25,8 +25,7 @@ use crate::encode::frame::{
 use crate::encode::hardware::slots::SlotStateBlock;
 use crate::encode::pool::FramePool;
 use crate::encode::{
-    KeyframeTrigger, StreamingProfile, bootstrap_hardware_caps, hardware_caps,
-    is_hardware_caps_bootstrapped,
+    StreamingProfile, bootstrap_hardware_caps, hardware_caps, is_hardware_caps_bootstrapped,
 };
 /// 关停等待编码线程的上限
 ///
@@ -38,7 +37,7 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// 编码管线组合根：一条编码段的全部协作组件与它们的唯一持有者
 ///
-/// 帧收件箱、控制队列、门铃、关键帧触发器、主机帧池、编码线程句柄按**机制**聚在一处
+/// 帧收件箱、控制队列、门铃、主机帧池、编码线程句柄按**机制**聚在一处
 /// （组件跨阶段共享，按阶段切会切出互相引用而不是边界）；对外只露具名门面与
 /// 「构造即完整、关停有界」的声明，行为仍在各组件模块
 pub struct VideoPipeline {
@@ -46,8 +45,6 @@ pub struct VideoPipeline {
     inbox: Arc<FrameInbox>,
     /// 控制命令发送端：入队与唤醒绑定，调用方无法只做一半
     control: ControlSender,
-    /// 关键帧触发器：请求方是推流段，消费方是编码线程
-    keyframe: Arc<KeyframeTrigger>,
     /// 主机内存帧池：本管线是它唯一的所有者，编码器只是被 `attach` 进来的租户
     ///
     /// 帧块由当前后端在自己的设备上分配、经编码线程 `attach` 装进池；换代就在池内换批，
@@ -75,11 +72,6 @@ impl VideoPipeline {
     /// 会话控制面的命令发送端：重配与跟随码率请求经它发往 Actor
     pub(crate) fn control(&self) -> &ControlSender {
         &self.control
-    }
-
-    /// 关键帧触发器：`VideoWriter` 用它在本会话的门控态就地要一次 IDR
-    pub(crate) fn keyframe(&self) -> Arc<KeyframeTrigger> {
-        Arc::clone(&self.keyframe)
     }
 
     /// 导入本次采集的显存槽位表（ask，阻塞式）
@@ -113,12 +105,10 @@ impl VideoPipeline {
         let doorbell = Arc::new(Notify::new());
         let (control_tx, control_rx) =
             tokio::sync::mpsc::channel::<ControlCommand>(CONTROL_QUEUE_DEPTH);
-        let keyframe = Arc::new(KeyframeTrigger::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&doorbell)));
         let output: Arc<FrameOutbox> = Arc::new(Mailbox::new(inbox.outcomes_arc()));
 
         let actor_inbox = Arc::clone(&inbox);
-        let actor_keyframe = Arc::clone(&keyframe);
         let actor_output = Arc::clone(&output);
         let actor_doorbell = Arc::clone(&doorbell);
         // 先建池再建 Actor：Actor 构造时就要把第一批块（软编的堆块）装进去，
@@ -134,13 +124,8 @@ impl VideoPipeline {
             .spawn(move || {
                 // `extern "system"` 不允许 unwind 穿过互操作边界，编码线程必须自己兜住 panic
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let actor = EncoderActor::new(
-                        actor_inbox,
-                        actor_keyframe,
-                        actor_output,
-                        actor_pool,
-                        actor_slot_state,
-                    );
+                    let actor =
+                        EncoderActor::new(actor_inbox, actor_output, actor_pool, actor_slot_state);
                     actor.run(control_rx, actor_doorbell);
                 }));
                 if outcome.is_err() {
@@ -161,7 +146,6 @@ impl VideoPipeline {
         Arc::new(Self {
             inbox,
             control: ControlSender::new(control_tx, Arc::clone(&doorbell), prefer_hardware),
-            keyframe,
             pool,
             slot_state,
             output,
@@ -174,15 +158,10 @@ impl VideoPipeline {
     /// 测试用它保留控制队列的接收端以断言派发了哪些命令，同时自己决定要不要真的跑编码
     /// 线程。生产路径用 [`VideoPipeline::spawn`]——那是唯一会拉起线程的入口。
     #[cfg(test)]
-    pub(crate) fn assemble(
-        control: ControlSender,
-        keyframe: Arc<KeyframeTrigger>,
-        inbox: Arc<FrameInbox>,
-    ) -> Self {
+    pub(crate) fn assemble(control: ControlSender, inbox: Arc<FrameInbox>) -> Self {
         Self {
             inbox: Arc::clone(&inbox),
             control,
-            keyframe,
             pool: FramePool::new(),
             slot_state: SlotStateBlock::new_leaked(),
             output: Arc::new(Mailbox::new(inbox.outcomes_arc())),

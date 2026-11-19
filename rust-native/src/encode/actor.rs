@@ -15,8 +15,7 @@ use crate::encode::hardware::VramSlotDescriptor;
 use crate::encode::hardware::slots::{ActorStage, SlotStateBlock};
 use crate::encode::pool::{FramePool, HostBlock};
 use crate::encode::{
-    FramePayload, KeyframeTrigger, StampedVideoPacket, StreamingProfile, VideoPacket,
-    display_nv12_len,
+    FramePayload, StampedVideoPacket, StreamingProfile, VideoPacket, display_nv12_len,
 };
 
 use super::encoder::{EncodeBackendKind, VideoEncoder};
@@ -34,8 +33,9 @@ type HardwareBuilder = dyn Fn(StreamingProfile, &'static SlotStateBlock) -> Resu
 pub struct EncoderActor {
     /// 帧收件箱 (Capture→Encode)
     inbox: Arc<FrameInbox>,
-    /// 关键帧触发器，Actor 拥有并直接消费/触发
-    keyframe: Arc<KeyframeTrigger>,
+    /// 挂起的关键帧请求：控制命令置位、帧步消费、编码未兑现时回挂。
+    /// 初值 true 确保新管线首帧必出 IDR
+    pending_keyframe: bool,
     /// 编码器：Hardware 或 Software；无硬件或未就绪时为 None
     encoder: Option<VideoEncoder>,
     /// 编码产物发件箱：管线持有、会话取用。这里只做同步入箱，写轨道由会话自己的写循环
@@ -62,14 +62,12 @@ impl EncoderActor {
     /// 随构造装入弱引用的帧池。测试注入假工厂走 `new_with_hardware_builder`
     pub fn new(
         inbox: Arc<FrameInbox>,
-        keyframe: Arc<KeyframeTrigger>,
         output: Arc<FrameOutbox>,
         pool: Weak<FramePool>,
         slot_state: &'static SlotStateBlock,
     ) -> Self {
         Self::new_with_hardware_builder(
             inbox,
-            keyframe,
             output,
             pool,
             slot_state,
@@ -80,7 +78,6 @@ impl EncoderActor {
     /// 构造器注入硬编工厂；生产入口 [`Self::new`] 固定用真实驱动
     fn new_with_hardware_builder(
         inbox: Arc<FrameInbox>,
-        keyframe: Arc<KeyframeTrigger>,
         output: Arc<FrameOutbox>,
         pool: Weak<FramePool>,
         slot_state: &'static SlotStateBlock,
@@ -94,7 +91,7 @@ impl EncoderActor {
         };
         let actor = Self {
             inbox,
-            keyframe,
+            pending_keyframe: true,
             encoder,
             output,
             bitrate: 0,
@@ -185,6 +182,9 @@ impl EncoderActor {
                 self.slot_state.set_stage(ActorStage::Reconfigure);
                 self.bitrate = bitrate;
                 Self::apply_bitrate(&mut self.encoder, bitrate);
+            }
+            ControlCommand::RequestKeyframe => {
+                self.pending_keyframe = true;
             }
             ControlCommand::ProfileChange { profile, reply } => {
                 let (before, had_table) = self.begin_profile_command();
@@ -291,9 +291,7 @@ impl EncoderActor {
         };
         self.slot_state.set_stage(ActorStage::Drain);
         if let Err(e) = encoder.drain() {
-            // 排空失败即上下文不可信：后端整体弃置（mem::forget 永不析构——
-            // 病态上下文上的释放调用可能同样卡死线程），回退软编打底；
-            // Java 按 ReleaseFailed 保留导出资源
+            // 排空失败即上下文不可信：后端整体弃置
             if let Some(dead) = self.encoder.take() {
                 std::mem::forget(dead);
             }
@@ -592,7 +590,7 @@ impl EncoderActor {
             }
         }
 
-        let force_keyframe = self.keyframe.take();
+        let force_keyframe = std::mem::take(&mut self.pending_keyframe);
         self.slot_state.set_stage(ActorStage::EncodeFrame);
         match encoder.encode(payload, force_keyframe) {
             Ok((nalu, is_keyframe)) if !nalu.is_empty() => {
@@ -625,11 +623,10 @@ impl EncoderActor {
 
     /// 编码未兑现时把关键帧请求挂回去
     ///
-    /// `request()` 是幂等的 `store(true)`，所以只在本轮确实带着请求时才重挂——否则会凭空
-    /// 多要一个 IDR。
-    fn rearm_keyframe(&self, requested: bool) {
+    /// 挂起标志是幂等布尔，只在本轮确实带着请求时才重置——否则会凭空多要一个 IDR。
+    fn rearm_keyframe(&mut self, requested: bool) {
         if requested {
-            self.keyframe.request();
+            self.pending_keyframe = true;
         }
     }
 
@@ -739,28 +736,20 @@ mod tests {
     /// 建一个测试 Actor：池由测试持有（与生产一致，Actor 只有弱引用）
     fn test_actor(
         inbox: Arc<FrameInbox>,
-        keyframe: Arc<KeyframeTrigger>,
         output: Arc<FrameOutbox>,
     ) -> (EncoderActor, Arc<FramePool>) {
-        test_actor_with_builder(
-            inbox,
-            keyframe,
-            output,
-            Arc::new(VideoEncoder::new_hardware),
-        )
+        test_actor_with_builder(inbox, output, Arc::new(VideoEncoder::new_hardware))
     }
 
     /// 注入自定义硬编工厂的 Actor 构造
     fn test_actor_with_builder(
         inbox: Arc<FrameInbox>,
-        keyframe: Arc<KeyframeTrigger>,
         output: Arc<FrameOutbox>,
         hardware_builder: Arc<HardwareBuilder>,
     ) -> (EncoderActor, Arc<FramePool>) {
         let pool = FramePool::new();
         let actor = EncoderActor::new_with_hardware_builder(
             inbox,
-            keyframe,
             output,
             Arc::downgrade(&pool),
             SlotStateBlock::new_leaked(),
@@ -777,13 +766,11 @@ mod tests {
     fn test_actor_prepare_switches_frame_domain() {
         crate::encode::software::init_api_for_tests();
 
-        let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let output = test_outbox();
         let (mut actor, pool) = test_actor_with_builder(
             inbox,
-            keyframe,
             Arc::clone(&output),
             fake_hardware_builder(EncodeBackendKind::Nvenc),
         );
@@ -820,13 +807,11 @@ mod tests {
     fn test_prepare_reports_fallback_backend_identity() {
         crate::encode::software::init_api_for_tests();
 
-        let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let output = test_outbox();
         let (mut actor, _pool) = test_actor_with_builder(
             inbox,
-            keyframe,
             Arc::clone(&output),
             Arc::new(|_profile, _slot_state| Err("硬编构建失败".to_string())),
         );
@@ -863,13 +848,11 @@ mod tests {
     /// 同一张图并发读写。这条用例钉死时序：清零必须发生在排空之后
     #[test]
     fn test_bit_clearing_only_after_drain() {
-        let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let output = test_outbox();
         let (mut actor, _pool) = test_actor_with_builder(
             inbox,
-            keyframe,
             Arc::clone(&output),
             fake_hardware_builder(EncodeBackendKind::Nvenc),
         );
@@ -904,11 +887,10 @@ mod tests {
     #[test]
     fn test_soft_path_encodes_heap_frame() {
         crate::encode::software::init_api_for_tests();
-        let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let output = test_outbox();
-        let (mut state, pool) = test_actor(inbox, keyframe, Arc::clone(&output));
+        let (mut state, pool) = test_actor(inbox, Arc::clone(&output));
 
         let (w, h) = (1280usize, 720usize);
         let profile = StreamingProfile::new(w, h, 60, VideoCodec::H264);
@@ -932,15 +914,56 @@ mod tests {
         assert_eq!(pool.len(), POOL_DEPTH, "编码完成的块必须归还到池中");
     }
 
+    /// 关键帧请求走控制面：命令置位挂起标志，下一帧以 IDR 编码，消费即清空
+    #[test]
+    fn test_request_keyframe_command_forces_next_idr() {
+        crate::encode::software::init_api_for_tests();
+        let bell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
+        let output = test_outbox();
+        let (mut state, pool) = test_actor(inbox, Arc::clone(&output));
+
+        let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        state.profile = profile;
+        if let Ok((encoder, blocks)) = VideoEncoder::new_software(profile) {
+            pool.attach(blocks);
+            state.encoder = Some(encoder);
+        }
+
+        let keyframe_of = |out: &Arc<FrameOutbox>| {
+            out.take()
+                .map(|f| f.packet.is_keyframe)
+                .expect("必须产出编码产物")
+        };
+        let payload_bytes = || vec![0u8; display_nv12_len(&profile)];
+
+        // 初值请求让首帧出 IDR；第二帧无挂起请求，回到 P 帧
+        let first = host_payload(&pool, payload_bytes());
+        state.encode_frame(&first, 0);
+        drop(first);
+        assert!(keyframe_of(&output), "首帧必须携带挂起的初值请求出 IDR");
+
+        let second = host_payload(&pool, payload_bytes());
+        state.encode_frame(&second, 16);
+        drop(second);
+        assert!(!keyframe_of(&output), "请求已兑现，第二帧不得再出 IDR");
+
+        // 控制命令置位：第三帧以 IDR 编码
+        assert!(state.apply(ControlCommand::RequestKeyframe));
+        let third = host_payload(&pool, payload_bytes());
+        state.encode_frame(&third, 33);
+        drop(third);
+        assert!(keyframe_of(&output), "RequestKeyframe 后下一帧必须出 IDR");
+    }
+
     /// 主机帧字节数与编码器几何不符时必须丢帧：错行距的像素交给编码器换的是一屏花屏
     #[test]
     fn test_soft_path_drops_mismatched_host_frame() {
         crate::encode::software::init_api_for_tests();
-        let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let output = test_outbox();
-        let (mut state, pool) = test_actor(inbox, keyframe, Arc::clone(&output));
+        let (mut state, pool) = test_actor(inbox, Arc::clone(&output));
 
         let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
         state.profile = profile;
@@ -962,11 +985,10 @@ mod tests {
     #[test]
     fn test_soft_encoder_rebuilt_on_dimension_change() {
         crate::encode::software::init_api_for_tests();
-        let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let output = test_outbox();
-        let (mut state, pool) = test_actor(inbox, keyframe, Arc::clone(&output));
+        let (mut state, pool) = test_actor(inbox, Arc::clone(&output));
 
         let p1_profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
         state.profile = p1_profile;
@@ -1062,7 +1084,6 @@ mod tests {
     #[test]
     fn test_encoder_actor_thread_run_loop_and_drain() {
         crate::encode::software::init_api_for_tests();
-        let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let (ctl_tx, ctl_rx) = tokio::sync::mpsc::channel::<ControlCommand>(16);
@@ -1072,7 +1093,6 @@ mod tests {
         let pool = FramePool::new();
         let actor_pool = Arc::downgrade(&pool);
         let actor_inbox = Arc::clone(&inbox);
-        let actor_keyframe = Arc::clone(&keyframe);
         let actor_bell = Arc::clone(&bell);
         let actor_output = Arc::clone(&output);
         let join = std::thread::Builder::new()
@@ -1080,7 +1100,6 @@ mod tests {
             .spawn(move || {
                 let actor = EncoderActor::new(
                     actor_inbox,
-                    actor_keyframe,
                     actor_output,
                     actor_pool,
                     SlotStateBlock::new_leaked(),
@@ -1159,10 +1178,9 @@ mod tests {
     /// 实际派发过的值，之后 RC 的死区会拿一个编码器没在跑的数值做参照。
     #[test]
     fn test_bitrate_cache_follows_rate_control_only() {
-        let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
-        let (mut actor, _pool) = test_actor(inbox, keyframe, test_outbox());
+        let (mut actor, _pool) = test_actor(inbox, test_outbox());
 
         // 1. 初始为 1080p Profile (上限 20_000_000 bps)：走公共缝装配，不直写字段
         let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
@@ -1281,7 +1299,6 @@ mod tests {
     /// 围栏测试专用构造：额外交出槽位所有权块，供用例模拟渲染线程置位与断言位协议
     fn fence_actor(
         inbox: Arc<FrameInbox>,
-        keyframe: Arc<KeyframeTrigger>,
         output: Arc<FrameOutbox>,
         drain_ok: bool,
         import_ok: bool,
@@ -1290,7 +1307,6 @@ mod tests {
         let block = SlotStateBlock::new_leaked();
         let actor = EncoderActor::new_with_hardware_builder(
             inbox,
-            keyframe,
             output,
             Arc::downgrade(&pool),
             block,
@@ -1339,12 +1355,10 @@ mod tests {
     /// 导入完成后关窗，新槽位帧恢复编码
     #[test]
     fn test_fence_drops_window_frames_then_admits_new_generation() {
-        let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let output = test_outbox();
-        let (mut actor, pool, block) =
-            fence_actor(inbox.clone(), keyframe, output.clone(), true, true);
+        let (mut actor, pool, block) = fence_actor(inbox.clone(), output.clone(), true, true);
 
         let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
         assert_eq!(prepare(&mut actor, p1080, true), ControlStatus::Ok);
@@ -1398,12 +1412,10 @@ mod tests {
     /// 这是重配触发面的语义洞：几何比对拦不住几何相同的旧帧，只有入口拒收能
     #[test]
     fn test_fence_covers_same_geometry_codec_change() {
-        let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let output = test_outbox();
-        let (mut actor, _pool, block) =
-            fence_actor(inbox.clone(), keyframe, output.clone(), true, true);
+        let (mut actor, _pool, block) = fence_actor(inbox.clone(), output.clone(), true, true);
 
         let p1080_h264 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
         assert_eq!(prepare(&mut actor, p1080_h264, true), ControlStatus::Ok);
@@ -1436,12 +1448,10 @@ mod tests {
             crate::encode::software::init_api_for_tests(),
             "openh264 测试夹具应就绪"
         );
-        let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let output = test_outbox();
-        let (mut actor, pool, _block) =
-            fence_actor(inbox.clone(), keyframe, output.clone(), false, true);
+        let (mut actor, pool, _block) = fence_actor(inbox.clone(), output.clone(), false, true);
 
         let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
         assert_eq!(prepare(&mut actor, p1080, true), ControlStatus::Ok);
@@ -1476,12 +1486,10 @@ mod tests {
     /// 用例 4：清空槽位表后，显存帧拒收直到下一次导入
     #[test]
     fn test_slots_cleared_rejects_until_next_import() {
-        let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let output = test_outbox();
-        let (mut actor, _pool, block) =
-            fence_actor(inbox.clone(), keyframe, output.clone(), true, true);
+        let (mut actor, _pool, block) = fence_actor(inbox.clone(), output.clone(), true, true);
 
         let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
         assert_eq!(prepare(&mut actor, p1080, true), ControlStatus::Ok);
@@ -1516,12 +1524,10 @@ mod tests {
     /// 旧代帧；恢复只认导入
     #[test]
     fn test_fps_only_change_keeps_rejecting_until_import() {
-        let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let output = test_outbox();
-        let (mut actor, _pool, block) =
-            fence_actor(inbox.clone(), keyframe, output.clone(), true, true);
+        let (mut actor, _pool, block) = fence_actor(inbox.clone(), output.clone(), true, true);
 
         let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
         assert_eq!(prepare(&mut actor, p1080, true), ControlStatus::Ok);
