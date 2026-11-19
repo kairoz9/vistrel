@@ -129,8 +129,11 @@ impl VideoWriter {
     }
 
     /// 单帧上链：以「诞生时刻 + 过期门槛 + 写上限」为死线，排队与写共用一次计时
+    ///
+    /// 门控兑现与 `Admitted` 记账同点结算：只有确实上链的 IDR 才解锁后续 P 帧写入
     async fn admit(&self, pending: StampedVideoPacket) -> bool {
         let deadline = pending.posted_at + STALE_AFTER + WRITE_TIMEOUT;
+        let is_keyframe = pending.packet.is_keyframe;
         let write = tokio::time::timeout_at(deadline, self.write_sample(pending.packet));
         tokio::select! {
             _ = self.cancel.cancelled() => {
@@ -142,9 +145,14 @@ impl VideoWriter {
             }
             result = write => {
                 match result {
-                    Ok(WriteResult::Sent) => self.outbox
-                        .outcomes()
-                        .record(FrameOutcome::Admitted),
+                    Ok(WriteResult::Sent) => {
+                        if is_keyframe {
+                            self.waiting_for_keyframe.store(false, Ordering::Release);
+                        }
+                        self.outbox
+                            .outcomes()
+                            .record(FrameOutcome::Admitted);
+                    }
                     Ok(WriteResult::Failed) => {
                         self.outbox
                             .outcomes()
@@ -174,9 +182,6 @@ impl VideoWriter {
         #[cfg(test)]
         if let Some(sink) = &self.test_sink {
             let _ = sink.send(duration).await;
-            if packet.is_keyframe {
-                self.waiting_for_keyframe.store(false, Ordering::Release);
-            }
             return WriteResult::Sent;
         }
 
@@ -195,12 +200,7 @@ impl VideoWriter {
             .write_sample(&sample)
             .await
         {
-            Ok(()) => {
-                if packet.is_keyframe {
-                    self.waiting_for_keyframe.store(false, Ordering::Release);
-                }
-                WriteResult::Sent
-            }
+            Ok(()) => WriteResult::Sent,
             Err(_) => WriteResult::Failed,
         }
     }
