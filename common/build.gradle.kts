@@ -21,6 +21,9 @@ dependencies {
     annotationProcessor(libs.mixinextras.common)
     compileOnly(libs.fabric.loader)
 
+    // Loom interface injection 在 MC 与 fabric-api 类上写入 @Environment(EnvType.CLIENT)，
+    // 测试编译读取这些类时必须能解析 EnvType，否则 javac 对每处注解告警并静默丢弃
+    testCompileOnly(libs.fabric.loader)
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.platform.launcher)
 }
