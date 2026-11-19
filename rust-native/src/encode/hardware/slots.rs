@@ -222,6 +222,34 @@ impl<S> SlotTable<S> {
 /// 共享块容纳的槽位上限：与游戏侧掩码容量同一条约定，改动必须两端同步
 pub(crate) const SLOT_STATE_SLOTS: usize = 8;
 
+/// 编码 Actor 当前阻塞的阶段码，心跳冻结时由游戏侧读回定位卡点
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActorStage {
+    /// 主循环等待输入
+    Idle = 0,
+    /// 重配或重建编码器
+    Reconfigure = 1,
+    /// 排空编码器与 CUDA 上下文
+    Drain = 2,
+    /// 导入显存槽位
+    ImportSlots = 3,
+    /// 注销显存槽位
+    ClearSlots = 4,
+    /// 关停编码线程
+    Shutdown = 5,
+    /// 等待外部时间线信号量
+    WaitTimeline = 6,
+    /// 映射输入资源
+    MapInput = 7,
+    /// 提交编码
+    EncodeSubmit = 8,
+    /// 锁定码流
+    LockBitstream = 9,
+    /// 帧编码（软编与未细分阶段的后端）
+    EncodeFrame = 10,
+}
+
 /// 共享块字节数：游戏侧按此尺寸包装直接内存缓冲区，两端必须一致
 pub(crate) const SLOT_STATE_BLOCK_BYTES: usize = 64;
 
@@ -230,7 +258,7 @@ pub(crate) const SLOT_STATE_BLOCK_BYTES: usize = 64;
 /// 64 字节单缓存行，经直接内存缓冲区暴露给游戏侧，访问全部走 acquire/release。
 ///
 /// 布局是跨语言约定（游戏侧按 `ValueLayout` 原生端序按偏移访问）：
-/// `[0..32) = busy[8]`、`[32..40) = heartbeat`、`[40..64) = 保留`。
+/// `[0..32) = busy[8]`、`[32..40) = heartbeat`、`[40..48) = stage`、`[48..64) = 保留`。
 ///
 /// 块随引擎实例创建并故意泄漏：卡死弃用的旧 Actor 只能写到自己那一代的块上，
 /// 碰不到新一代——跨代复用同一块的话，旧线程复活的心跳会让新一代的超时判定失效。
@@ -240,8 +268,10 @@ pub(crate) struct SlotStateBlock {
     busy: [AtomicU32; SLOT_STATE_SLOTS],
     /// Actor 每轮循环 +1；游戏侧在 push 时快照，判定挂 capture tick 侧
     heartbeat: AtomicU64,
+    /// Actor 当前阻塞的阶段码：心跳冻结时游戏侧读回写进停滞日志
+    stage: AtomicU64,
     /// 布局保留段：凑满单缓存行，游戏侧不得访问
-    _reserved: [u8; 24],
+    _reserved: [u8; 16],
 }
 
 const _: () = assert!(std::mem::size_of::<SlotStateBlock>() == SLOT_STATE_BLOCK_BYTES);
@@ -253,9 +283,15 @@ impl SlotStateBlock {
         let block = Box::new(Self {
             busy: std::array::from_fn(|_| AtomicU32::new(0)),
             heartbeat: AtomicU64::new(0),
-            _reserved: [0; 24],
+            stage: AtomicU64::new(ActorStage::Idle as u64),
+            _reserved: [0; 16],
         });
         Box::leak(block)
+    }
+
+    /// 标记 Actor 进入某阶段：只在可能长时间阻塞的调用前后写
+    pub(crate) fn set_stage(&self, stage: ActorStage) {
+        self.stage.store(stage as u64, Ordering::Release);
     }
 
     /// 归还槽位（编码完成或帧被丢弃）；越界与重复归还均无害
@@ -380,6 +416,30 @@ mod tests {
             SLOT_STATE_BLOCK_BYTES
         );
         assert_eq!(std::mem::size_of::<SlotStateBlock>(), 64);
+        assert_eq!(std::mem::offset_of!(SlotStateBlock, heartbeat), 32);
+        assert_eq!(std::mem::offset_of!(SlotStateBlock, stage), 40);
+    }
+
+    /// 阶段码是跨语言约定：判别值被 Java 侧按下标取名，改动必须两端同步
+    #[test]
+    fn test_stage_codes_are_cross_language_contract() {
+        let block = SlotStateBlock::new_leaked();
+        block.set_stage(ActorStage::LockBitstream);
+        assert_eq!(
+            block.stage.load(Ordering::Acquire),
+            ActorStage::LockBitstream as u64
+        );
+        assert_eq!(ActorStage::Idle as u64, 0);
+        assert_eq!(ActorStage::Reconfigure as u64, 1);
+        assert_eq!(ActorStage::Drain as u64, 2);
+        assert_eq!(ActorStage::ImportSlots as u64, 3);
+        assert_eq!(ActorStage::ClearSlots as u64, 4);
+        assert_eq!(ActorStage::Shutdown as u64, 5);
+        assert_eq!(ActorStage::WaitTimeline as u64, 6);
+        assert_eq!(ActorStage::MapInput as u64, 7);
+        assert_eq!(ActorStage::EncodeSubmit as u64, 8);
+        assert_eq!(ActorStage::LockBitstream as u64, 9);
+        assert_eq!(ActorStage::EncodeFrame as u64, 10);
     }
 
     /// 归还/全清/越界：位状态的全部变化

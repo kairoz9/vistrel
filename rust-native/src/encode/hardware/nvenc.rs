@@ -41,12 +41,12 @@ use cudarc::driver::{CudaContext, CudaStream};
 #[cfg(test)]
 use crate::encode::encoder::BackendStageTimings;
 use crate::encode::encoder::{EncodeBackendKind, VideoEncodeBackend};
-use crate::encode::hardware::slots::{SlotStateBlock, SlotTable, VramSlotDescriptor};
+use crate::encode::hardware::slots::{ActorStage, SlotStateBlock, SlotTable, VramSlotDescriptor};
 use crate::encode::pool::{HOST_SLOT_BYTES, HostBlock, POOL_DEPTH};
 use crate::encode::{FramePayload, StreamingProfile};
 
 pub(crate) use cuda::new_cuda_context;
-use cuda::{VramSlot, PinnedHost, import_cuda_slot, wait_timeline_sem};
+use cuda::{PinnedHost, VramSlot, import_cuda_slot, wait_timeline_sem};
 pub(crate) use dl::{NvencDriver, ensure_cuda_init, probe_cuda};
 use ffi::*;
 use session::NvencSession;
@@ -256,8 +256,8 @@ impl NvencBackend {
 
     /// 显存槽位编码：等待生产者就绪 → 映射 → 提交 → 锁定 → 拷出 → 解映射
     ///
-    /// 前置校验失败（查不到槽位/未注册）与编码失败统一以 Err 出口；所有权
-    /// 归还由调用方在出口统一处理，本方法不碰共享块
+    /// 前置校验失败（查不到槽位/未注册/几何过期）与编码失败统一以 Err 出口；
+    /// 所有权归还由调用方在出口统一处理，本方法只写共享块的阶段码
     fn encode_vram_slot(
         &mut self,
         slot_idx: u32,
@@ -275,7 +275,17 @@ impl NvencBackend {
             .ok_or_else(|| format!("Vram slot {slot_idx} 尚未在当前会话上注册"))?;
         let (ext_sem, slot_width, slot_height) =
             (entry.cuda.ext_sem, entry.cuda.width, entry.cuda.height);
+        // 重配窗口里管道仍在递旧几何的帧：NVENC 重配会保留已注册槽位。
+        // 核对必须在等待与映射之前，让这一帧以可诊断的错误丢在入口而不是交给驱动
+        let profile = self.session.profile();
+        let (profile_width, profile_height) = (profile.width() as u32, profile.height() as u32);
+        if slot_width != profile_width || slot_height != profile_height {
+            return Err(format!(
+                "Vram slot {slot_idx} 几何 {slot_width}x{slot_height} 与编码器 {profile_width}x{profile_height} 不一致"
+            ));
+        }
         // 2. 时间线信号量等待：异步入队进专属 CUDA Stream，由 GPU 硬件流调度
+        self.slot_state.set_stage(ActorStage::WaitTimeline);
         wait_timeline_sem(&self.cuda_ctx, ext_sem, sync_value, self.stream.cu_stream())?;
         // 3. 映射 → 提交 → 锁定 → 拷出 → 解映射
         let spec = InputSpec {
@@ -285,7 +295,7 @@ impl NvencBackend {
             buffer_format: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR,
         };
         self.session
-            .encode_from_resource(registered, spec, force_idr, frame_idx)
+            .encode_from_resource(registered, spec, force_idr, frame_idx, self.slot_state)
     }
 }
 
@@ -431,7 +441,7 @@ impl VideoEncodeBackend for NvencBackend {
                 // 池块已按 CUDADEVICEPTR 登记（UVA 主机别名，零拷贝）：每帧映射后由
                 // 引擎经 PCIe 直读帧内容，没有 H2D 拷贝也没有主机同步点
                 self.session
-                    .encode_host(host.as_ptr(), force_idr, frame_idx)?
+                    .encode_host(host.as_ptr(), force_idr, frame_idx, self.slot_state)?
             }
             FramePayload::VramSlot {
                 slot_idx,

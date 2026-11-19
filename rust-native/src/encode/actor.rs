@@ -12,10 +12,11 @@ use tokio::sync::mpsc::Receiver;
 use crate::encode::control::{ControlCommand, ControlStatus};
 use crate::encode::frame::{FrameInbox, FrameOutbox, FrameOutcome};
 use crate::encode::hardware::VramSlotDescriptor;
-use crate::encode::hardware::slots::SlotStateBlock;
+use crate::encode::hardware::slots::{ActorStage, SlotStateBlock};
 use crate::encode::pool::{FramePool, HostBlock};
 use crate::encode::{
-    FramePayload, KeyframeTrigger, StampedVideoPacket, StreamingProfile, VideoPacket, display_nv12_len,
+    FramePayload, KeyframeTrigger, StampedVideoPacket, StreamingProfile, VideoPacket,
+    display_nv12_len,
 };
 
 use super::encoder::VideoEncoder;
@@ -129,6 +130,7 @@ impl EncoderActor {
         runtime.block_on(async move {
             loop {
                 // 1. 阻塞等待第一个输入。
+                self.slot_state.set_stage(ActorStage::Idle);
                 tokio::select! {
                     msg = control_rx.recv() => match msg {
                         Some(cmd) => {
@@ -173,12 +175,17 @@ impl EncoderActor {
     /// `ClearVramSlots`）会让旧编码器上的一切（显存槽位注册、会话状态）失效。
     fn apply(&mut self, cmd: ControlCommand) -> bool {
         match cmd {
-            ControlCommand::Shutdown => return false,
+            ControlCommand::Shutdown => {
+                self.slot_state.set_stage(ActorStage::Shutdown);
+                return false;
+            }
             ControlCommand::BitrateChange(bitrate) => {
+                self.slot_state.set_stage(ActorStage::Reconfigure);
                 self.bitrate = bitrate;
                 Self::apply_bitrate(&mut self.encoder, bitrate);
             }
             ControlCommand::ProfileChange { profile, reply } => {
+                self.slot_state.set_stage(ActorStage::Reconfigure);
                 self.discard_frames_before_rebuild();
                 let outcome = self.change_profile(profile);
                 let _ = reply.send(outcome);
@@ -188,6 +195,7 @@ impl EncoderActor {
                 prefer_hardware,
                 reply,
             } => {
+                self.slot_state.set_stage(ActorStage::Reconfigure);
                 self.discard_frames_before_rebuild();
                 let code = self.prepare_encoder(profile, prefer_hardware);
                 let _ = reply.send(code);
@@ -240,10 +248,12 @@ impl EncoderActor {
         let Some(encoder) = &mut self.encoder else {
             return ControlStatus::Ok;
         };
+        self.slot_state.set_stage(ActorStage::Drain);
         if let Err(e) = encoder.drain() {
             log::error!("槽位注销前排空失败，保留导入引用: {e}");
             return ControlStatus::ReleaseFailed;
         }
+        self.slot_state.set_stage(ActorStage::ClearSlots);
         self.slot_state.mark_all_free();
         encoder.clear_vram_slots();
         ControlStatus::Ok
@@ -259,10 +269,12 @@ impl EncoderActor {
             return ControlStatus::NoHardwareEncoder;
         };
         // 换表全清前置 drain
+        self.slot_state.set_stage(ActorStage::Drain);
         if let Err(e) = encoder.drain() {
             log::error!("槽位导入前排空失败，整批拒绝: {e}");
             return ControlStatus::ImportFailed;
         }
+        self.slot_state.set_stage(ActorStage::ImportSlots);
         self.slot_state.mark_all_free();
         match encoder.import_vram_slots(&mut slots) {
             Ok(()) => ControlStatus::Ok,
@@ -291,7 +303,11 @@ impl EncoderActor {
 
     /// 按给定档位配好编码器：档位与后端必须同进同退
     /// **后端未变时不重建。**
-    fn prepare_encoder(&mut self, profile: StreamingProfile, prefer_hardware: bool) -> ControlStatus {
+    fn prepare_encoder(
+        &mut self,
+        profile: StreamingProfile,
+        prefer_hardware: bool,
+    ) -> ControlStatus {
         let same_backend = self
             .encoder
             .as_ref()
@@ -330,7 +346,11 @@ impl EncoderActor {
     }
 
     /// 重建编码器。会销毁旧编码器的一切：CUcontext、已导入的显存槽位、当前 GOP。
-    fn rebuild_encoder(&mut self, profile: StreamingProfile, prefer_hardware: bool) -> ControlStatus {
+    fn rebuild_encoder(
+        &mut self,
+        profile: StreamingProfile,
+        prefer_hardware: bool,
+    ) -> ControlStatus {
         let had_hardware = self.encoder.as_ref().is_some_and(|e| e.is_hardware());
         if had_hardware {
             log::warn!("重建硬件编码器：已导入的显存槽位随旧编码器失效，需重新注册");
@@ -415,6 +435,7 @@ impl EncoderActor {
         let profile = self.profile;
         // 不看返回码：`rebuild_encoder` 只在「一个编码器都建不起来」时失败，
         // 而硬编创建失败会静默回退软编并返回 Ok。这里要问的是「是不是硬编」。
+        self.slot_state.set_stage(ActorStage::Reconfigure);
         self.rebuild_encoder(profile, true);
         if !self.encoder.as_ref().is_some_and(|e| e.is_hardware()) {
             return false;
@@ -429,7 +450,10 @@ impl EncoderActor {
     }
 
     /// 应用档位，返回**实际生效**的档位或拒绝原因
-    fn change_profile(&mut self, profile: StreamingProfile) -> Result<StreamingProfile, ControlStatus> {
+    fn change_profile(
+        &mut self,
+        profile: StreamingProfile,
+    ) -> Result<StreamingProfile, ControlStatus> {
         // 软编在跑：档位顶格 min(Content, 1080p)@60，生效档位如实反映钳制结果
         let profile = if self.encoder.as_ref().is_some_and(|e| !e.is_hardware()) {
             Self::software_ceiling_profile(profile)
@@ -505,6 +529,7 @@ impl EncoderActor {
         }
 
         let force_keyframe = self.keyframe.take();
+        self.slot_state.set_stage(ActorStage::EncodeFrame);
         match encoder.encode(payload, force_keyframe) {
             Ok((nalu, is_keyframe)) if !nalu.is_empty() => {
                 self.output.post(StampedVideoPacket::now(VideoPacket {
@@ -589,7 +614,10 @@ mod tests {
             Err("假后端不编码".to_string())
         }
 
-        fn reconfigure(&mut self, _new_profile: StreamingProfile) -> Result<Vec<HostBlock>, String> {
+        fn reconfigure(
+            &mut self,
+            _new_profile: StreamingProfile,
+        ) -> Result<Vec<HostBlock>, String> {
             Ok(Vec::new())
         }
 

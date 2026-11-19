@@ -19,6 +19,7 @@ use crate::encode::StreamingProfile;
 use crate::encode::encoder::BackendStageTimings;
 use crate::encode::hardware::nvenc::nvfn;
 use crate::encode::hardware::nvenc::session_params::build_pic_params;
+use crate::encode::hardware::slots::{ActorStage, SlotStateBlock};
 
 // ============================================================================
 // 编码器会话 (NVENC Session)
@@ -501,8 +502,10 @@ impl NvencSession {
         spec: InputSpec,
         force_idr: bool,
         frame_idx: u64,
+        stage: &SlotStateBlock,
     ) -> Result<(Vec<u8>, bool), String> {
         // 1. 映射。此处的 `?` 是安全的：映射尚未成功，没有需要归还的东西。
+        stage.set_stage(ActorStage::MapInput);
         // SAFETY: 该结构为 bindgen 生成的 C POD，成员均为整型/指针或 0 值合法的枚举
         // （BUFFER_FORMAT 的 UNDEFINED），全零位模式合法；version 随后回填
         let mut map_params: NV_ENC_MAP_INPUT_RESOURCE = unsafe { std::mem::zeroed() };
@@ -542,6 +545,7 @@ impl NvencSession {
             handle,
             &mut pic_params,
             Some(mapped_ptr),
+            stage,
             #[cfg(test)]
             &mut self.benchmark_stages,
         );
@@ -561,6 +565,7 @@ impl NvencSession {
         block: *const u8,
         force_idr: bool,
         frame_idx: u64,
+        stage: &SlotStateBlock,
     ) -> Result<(Vec<u8>, bool), String> {
         let registered = self.device_input(block)?;
         let spec = InputSpec {
@@ -580,6 +585,7 @@ impl NvencSession {
         {
             self.benchmark_stages = BackendStageTimings::default();
         }
+        stage.set_stage(ActorStage::MapInput);
         unsafe {
             // SAFETY: registered 由调用方持有且尚未注销
             let res = map(self.encoder.as_raw(), &mut map_params);
@@ -603,6 +609,7 @@ impl NvencSession {
             handle,
             &mut pic_params,
             Some(mapped_ptr),
+            stage,
             #[cfg(test)]
             &mut self.benchmark_stages,
         );
@@ -649,6 +656,7 @@ pub(super) fn encode_and_lock(
     handle: BitstreamHandle,
     pic_params: &mut NV_ENC_PIC_PARAMS,
     mapped: Option<*mut c_void>,
+    stage: &SlotStateBlock,
     #[cfg(test)] stages: &mut BackendStageTimings,
 ) -> Result<(Vec<u8>, bool), String> {
     let encode_picture = nvfn!(driver, nvEncEncodePicture);
@@ -667,6 +675,7 @@ pub(super) fn encode_and_lock(
     // 1. 提交编码（失败路径直接返回，收尾交给 inflight 的 Drop）
     #[cfg(test)]
     let submit_start = std::time::Instant::now();
+    stage.set_stage(ActorStage::EncodeSubmit);
     let res = unsafe {
         // SAFETY: pic_params 完全初始化且 outputBitstream 为刚取出的有效句柄；
         // inputBuffer 为已映射资源；inflight 独占 encoder 借用，同一时刻只有本调用在碰这台 encoder
@@ -705,6 +714,7 @@ pub(super) fn encode_and_lock(
     #[cfg(test)]
     let lock_start = std::time::Instant::now();
 
+    stage.set_stage(ActorStage::LockBitstream);
     let res = unsafe {
         // SAFETY: outputBitstream 为刚提交过编码的有效码流缓冲
         lock_bitstream(inflight.encoder.as_raw(), &mut lock_params)
