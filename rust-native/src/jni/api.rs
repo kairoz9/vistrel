@@ -157,67 +157,84 @@ fn negotiate_offer<'caller>(
         Ok(s) => s,
         Err(_) => return Ok(JString::default()),
     };
-    let offer: RTCSessionDescription = match serde_json::from_str(&offer_str) {
+    let state = get_global();
+    let is_running = state.is_running.load(Ordering::SeqCst);
+    let engine = state.streaming_engine.load_full();
+    let answer = state.runtime.block_on(handle_negotiate_offer(
+        engine, is_running, &offer_str, width, height, fps, bpp,
+    ));
+    let Some(resp_str) = answer else {
+        return Ok(JString::default());
+    };
+    match env.new_string(resp_str) {
+        Ok(output) => Ok(output),
+        Err(_) => {
+            log::error!("negotiateOffer 创建 Java 字符串失败");
+            Ok(JString::default())
+        }
+    }
+}
+
+/// negotiateOffer 线上请求的处理函数：存活守卫、offer 反序列化、几何透传与应答
+/// 整形都在这里，出口只做 JString/Env 搬运，测试不经 Env 直接驱动本函数钉住线契约。
+async fn handle_negotiate_offer(
+    engine: Option<Arc<StreamingEngine>>,
+    is_running: bool,
+    offer_json: &str,
+    width: i32,
+    height: i32,
+    fps: i32,
+    bpp: f32,
+) -> Option<String> {
+    if !is_running {
+        return None;
+    }
+    let Some(engine) = engine else {
+        log::error!("StreamingEngine 未启动，无法协商 Offer");
+        return None;
+    };
+    let offer: RTCSessionDescription = match serde_json::from_str(offer_json) {
         Ok(sdp) => sdp,
         Err(e) => {
             log::error!("无法反序列化 Offer SDP: {e}");
-            return Ok(JString::default());
+            return None;
         }
     };
 
-    let state = get_global();
-    // 关停开始后拒绝新协商：此时 GPU 设备可能已被销毁，建会话只会把编码器拽进
-    // 「在死上下文上初始化 NVENC」的路径，表现为退出卡死
-    if !state.is_running.load(Ordering::SeqCst) {
-        return Ok(JString::default());
-    }
-    let Some(engine) = state.streaming_engine.load_full() else {
-        log::error!("StreamingEngine 未启动，无法协商 Offer");
-        return Ok(JString::default());
-    };
-
-    let w = width.max(1) as usize;
-    let h = height.max(1) as usize;
-    let f = fps.max(1) as usize;
+    // 几何原样透传：0×0 是暂停信号，由引擎按契约在 handle_offer 入口显式拒绝，
+    // 缝上不做「修正成最小档位」；负数钳成 0 只为保证 i32→usize 不回绕
+    let w = width.max(0) as usize;
+    let h = height.max(0) as usize;
+    let f = fps.max(0) as usize;
     let initial_bpp = if bpp.is_finite() && bpp > 0.0 {
         Some(bpp)
     } else {
         None
     };
 
-    let res = state
-        .runtime
-        .block_on(async move { engine.handle_offer(offer, w, h, f, initial_bpp).await });
-
-    Ok(match res {
-        Ok((answer, profile, backend)) => {
-            let resp_json = serde_json::json!({
-                "type": "answer",
-                "width": profile.width(),
-                "height": profile.height(),
-                "fps": profile.fps(),
-                "bpp": profile.bpp(),
-                "bitrate": profile.bitrate(),
-                "codec": profile.codec().as_str(),
-                "backend": backend.as_str(),
-                "bppMin": encode::MIN_BPP,
-                "bppMax": encode::MAX_BPP,
-                "sdp": answer,
-            });
-            let resp_str = resp_json.to_string();
-            match env.new_string(resp_str) {
-                Ok(output) => output,
-                Err(_) => {
-                    log::error!("negotiateOffer 创建 Java 字符串失败");
-                    JString::default()
-                }
-            }
-        }
+    let (answer, profile, backend) = match engine.handle_offer(offer, w, h, f, initial_bpp).await {
+        Ok(parts) => parts,
         Err(e) => {
             log::error!("WebRTC Offer 协商失败: {e}");
-            JString::default()
+            return None;
         }
-    })
+    };
+    Some(
+        serde_json::json!({
+            "type": "answer",
+            "width": profile.width(),
+            "height": profile.height(),
+            "fps": profile.fps(),
+            "bpp": profile.bpp(),
+            "bitrate": profile.bitrate(),
+            "codec": profile.codec().as_str(),
+            "backend": backend.as_str(),
+            "bppMin": encode::MIN_BPP,
+            "bppMax": encode::MAX_BPP,
+            "sdp": answer,
+        })
+        .to_string(),
+    )
 }
 
 const _: jni::NativeMethod = native_method! {
@@ -249,53 +266,83 @@ fn apply_profile<'caller>(
     codec: JString<'caller>,
 ) -> jni::errors::Result<JString<'caller>> {
     let state = get_global();
-    let Some(engine) = state.streaming_engine.load_full() else {
-        log::warn!("applyProfile 时引擎未启动，拒绝档位请求");
-        return Ok(JString::default());
+    let engine = state.streaming_engine.load_full();
+    let codec_token = if codec.is_null() {
+        None
+    } else {
+        codec.try_to_string(env).ok()
     };
-
-    // codec 决定后端与会话已协商的载荷类型：解析不出就不猜，按拒绝处理
-    if codec.is_null() {
-        log::warn!("applyProfile 的 codec 缺失，拒绝档位请求");
-        return Ok(JString::default());
-    }
-    let Some(codec) = codec
-        .try_to_string(env)
-        .ok()
-        .and_then(|token| encode::VideoCodec::from_token(&token))
-    else {
-        log::warn!("applyProfile 的 codec 无法识别，拒绝档位请求");
-        return Ok(JString::default());
-    };
-
-    let outcome = state.runtime.block_on(engine.apply_profile(
-        width.max(0) as usize,
-        height.max(0) as usize,
-        fps.max(0) as usize,
+    let answer = state.runtime.block_on(handle_apply_profile(
+        engine,
+        codec_token.as_deref(),
+        width,
+        height,
+        fps,
         bpp,
-        codec,
     ));
-
-    let (profile, backend) = match outcome {
-        crate::streaming::ProfileApply::Applied(profile, backend) => (profile, backend),
-        crate::streaming::ProfileApply::Rejected | crate::streaming::ProfileApply::NoSession => {
-            return Ok(JString::default());
-        }
+    let Some(resp_str) = answer else {
+        return Ok(JString::default());
     };
-    let resp_json = serde_json::json!({
-        "width": profile.width(),
-        "height": profile.height(),
-        "fps": profile.fps(),
-        "bpp": profile.bpp(),
-        "bitrate": profile.bitrate(),
-        "codec": profile.codec().as_str(),
-        // 后端未就绪的采纳态为 null，Java 按未知处理
-        "backend": backend.map(|b| b.as_str()),
-    });
-    match env.new_string(resp_json.to_string()) {
+    match env.new_string(resp_str) {
         Ok(s) => Ok(s),
         Err(_) => Ok(JString::default()),
     }
+}
+
+/// applyProfile 线上请求的处理函数：codec 令牌解析、几何透传与应答整形都在这里，
+/// 出口只做 JString/Env 搬运，测试不经 Env 直接驱动本函数钉住线契约。
+/// 返回 `None` = 无应答，Java 按「无应答」保持自己的生效基线。
+async fn handle_apply_profile(
+    engine: Option<Arc<StreamingEngine>>,
+    codec_token: Option<&str>,
+    width: i32,
+    height: i32,
+    fps: i32,
+    bpp: f32,
+) -> Option<String> {
+    let Some(engine) = engine else {
+        log::warn!("applyProfile 时引擎未启动，拒绝档位请求");
+        return None;
+    };
+    // codec 决定后端与会话已协商的载荷类型：解析不出就不猜，按拒绝处理
+    let Some(token) = codec_token else {
+        log::warn!("applyProfile 的 codec 缺失，拒绝档位请求");
+        return None;
+    };
+    let Some(codec) = encode::VideoCodec::from_token(token) else {
+        log::warn!("applyProfile 的 codec 无法识别，拒绝档位请求");
+        return None;
+    };
+
+    // 几何透传同协商缝：0 由引擎按暂停信号契约拒绝，负数钳成 0 只为保证不回绕
+    let outcome = engine
+        .apply_profile(
+            width.max(0) as usize,
+            height.max(0) as usize,
+            fps.max(0) as usize,
+            bpp,
+            codec,
+        )
+        .await;
+    let (profile, backend) = match outcome {
+        crate::streaming::ProfileApply::Applied(profile, backend) => (profile, backend),
+        crate::streaming::ProfileApply::Rejected | crate::streaming::ProfileApply::NoSession => {
+            return None;
+        }
+    };
+    Some(
+        serde_json::json!({
+            "width": profile.width(),
+            "height": profile.height(),
+            "fps": profile.fps(),
+            "bpp": profile.bpp(),
+            "bitrate": profile.bitrate(),
+            "codec": profile.codec().as_str(),
+            // 后端未就绪的采纳态为 null，Java 按未知处理
+            "backend": backend.map(|b| b.as_str()),
+        })
+        .to_string(),
+    )
 }
 
 const _: jni::NativeMethod = native_method! {
@@ -656,4 +703,130 @@ fn push_audio_pcm<'caller>(
     let pcm = unsafe { std::slice::from_raw_parts(ptr as *const i16, total_samples) };
     engine.audio().push_sample(pcm);
     Ok(())
+}
+
+/// JNI 线契约用例：不经 Env 直接驱动 handle_negotiate_offer / handle_apply_profile
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::streaming::test_support::{make_test_engine, make_test_offer};
+
+    /// make_test_offer 的线协议形态：Java 信令层透传的就是这份 JSON
+    fn offer_wire_json() -> String {
+        serde_json::to_string(&make_test_offer()).expect("测试 SDP 必可序列化")
+    }
+
+    /// 0×0 是暂停信号，协商缝不得把它「修正」成最小档位：0 与负数都必须被显式拒绝
+    #[tokio::test]
+    async fn test_negotiate_rejects_zero_geometry_as_pause_signal() {
+        let (engine, _rx, _kf) = make_test_engine(false);
+        for geometry in [(0, 0, 0), (-1, -1, -1)] {
+            let answer = handle_negotiate_offer(
+                Some(Arc::clone(&engine)),
+                true,
+                &offer_wire_json(),
+                geometry.0,
+                geometry.1,
+                geometry.2,
+                1.0,
+            )
+            .await;
+            assert!(
+                answer.is_none(),
+                "几何 {geometry:?} 必须被拒绝而非修正成 1×1@1"
+            );
+        }
+    }
+
+    /// 关停开始后拒新协商，与引擎是否仍在位无关
+    #[tokio::test]
+    async fn test_negotiate_refuses_while_shutting_down() {
+        let (engine, _rx, _kf) = make_test_engine(false);
+        let answer =
+            handle_negotiate_offer(Some(engine), false, &offer_wire_json(), 1920, 1080, 60, 1.0)
+                .await;
+        assert!(answer.is_none(), "关停期协商必须无应答");
+    }
+
+    /// 引擎未启动 = 无应答，不是 panic 也不是错误应答
+    #[tokio::test]
+    async fn test_negotiate_without_engine_returns_no_answer() {
+        let answer =
+            handle_negotiate_offer(None, true, &offer_wire_json(), 1920, 1080, 60, 1.0).await;
+        assert!(answer.is_none(), "无引擎协商必须无应答");
+    }
+
+    #[tokio::test]
+    async fn test_apply_profile_without_engine_returns_no_answer() {
+        let answer = handle_apply_profile(None, Some("h264"), 1600, 900, 90, 0.2).await;
+        assert!(answer.is_none(), "无引擎档位请求必须无应答");
+    }
+
+    /// codec 令牌解析不出就不猜：缺失与无法识别同为拒绝
+    #[tokio::test]
+    async fn test_apply_profile_rejects_unresolvable_codec() {
+        let (engine, _rx, _kf) = make_test_engine(false);
+        for token in [None, Some("wmv")] {
+            let answer =
+                handle_apply_profile(Some(Arc::clone(&engine)), token, 1600, 900, 90, 0.2).await;
+            assert!(answer.is_none(), "codec {token:?} 必须被拒绝");
+        }
+    }
+
+    /// 全线往返：协商建会话 → 档位生效 → 0 几何档位被拒。应答 JSON 的键集是 Java
+    /// 解析器锚定的线契约，多键少键都算漂移
+    #[tokio::test]
+    async fn test_negotiate_then_apply_roundtrip_pin_line_contract() {
+        let (engine, _rx, _kf) = make_test_engine(false);
+
+        let answer = handle_negotiate_offer(
+            Some(Arc::clone(&engine)),
+            true,
+            &offer_wire_json(),
+            1920,
+            1080,
+            60,
+            1.0,
+        )
+        .await;
+        let Some(answer_json) = answer else {
+            panic!("假后端上的合法协商必须得到应答");
+        };
+        let answer: serde_json::Value = serde_json::from_str(&answer_json).unwrap();
+        assert_eq!(answer["type"], "answer");
+        assert_eq!(answer["width"], 1920);
+        assert_eq!(answer["height"], 1080);
+        assert_eq!(answer["fps"], 60);
+        // sdp 原样透传给浏览器，保持 W3C 形态（嵌套对象携带 type 与 SDP 文本）
+        assert_eq!(answer["sdp"]["type"], "answer");
+        assert!(!answer["sdp"]["sdp"].as_str().unwrap_or_default().is_empty());
+        for key in [
+            "width", "height", "fps", "bpp", "bitrate", "codec", "backend", "bppMin", "bppMax",
+            "sdp",
+        ] {
+            assert!(answer.get(key).is_some(), "offer 应答缺 {key} 键");
+        }
+
+        let applied =
+            handle_apply_profile(Some(Arc::clone(&engine)), Some("h264"), 1600, 900, 90, 0.2).await;
+        let Some(applied_json) = applied else {
+            panic!("活跃会话上的合法档位必须生效");
+        };
+        let applied: serde_json::Value = serde_json::from_str(&applied_json).unwrap();
+        assert_eq!(applied["width"], 1600);
+        // 请求令牌大小写不敏感地解析，应答回规范拼写
+        assert_eq!(applied["codec"], "H264");
+        for key in [
+            "width", "height", "fps", "bpp", "bitrate", "codec", "backend",
+        ] {
+            assert!(applied.get(key).is_some(), "档位应答缺 {key} 键");
+        }
+
+        assert!(
+            handle_apply_profile(Some(Arc::clone(&engine)), Some("h264"), 0, 0, 0, 0.2)
+                .await
+                .is_none(),
+            "0 几何档位必须按暂停信号契约被拒"
+        );
+    }
 }

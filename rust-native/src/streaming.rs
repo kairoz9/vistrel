@@ -356,19 +356,20 @@ fn resolve_codec(
     VideoCodec::H264
 }
 
+/// 引擎级测试基建，供本模块与 `jni` 层的线契约用例共用：jni 缝测试驱动同一批假后端，
+/// 「出口 → 核心 → 引擎」整条线只有这一份假 Actor 行为
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use crate::encode::KeyframeTrigger;
     use crate::encode::control::{ControlCommand, ControlSender, ControlStatus};
     use crate::encode::encoder::EncodeBackendKind;
     use crate::encode::frame::FrameInbox;
-    use std::time::Duration;
     use tokio::sync::Notify;
 
     /// 假 Actor 转发出来的命令摘要：只保留断言要看的两个事实，避免用字符串当命令名
     #[derive(Debug, Clone, Copy)]
-    enum Rec {
+    pub(crate) enum Rec {
         Prepare(StreamingProfile),
         ChangeProfile,
         SetBitrate,
@@ -377,11 +378,11 @@ mod tests {
 
     /// 造一个引擎，并配一个**假编码线程**
     ///
-    /// `handle_offer` 现在要等 `PrepareEncoder` 的 ACK，没有应答者就会走满 5s 超时，
+    /// `handle_offer` 要等 `PrepareEncoder` 的 ACK，没有应答者就会走满 5s 超时，
     /// 所有会话用例都会退化成超时失败。假线程只回 `Ok`、不碰编码器，同时把收到的命令
     /// 转发出来供断言——真正的编码行为由 `encode/actor.rs` 的用例覆盖。
     /// `reject_change` 让档位重配一律被拒（回传 `ReconfigureFailed`），供拒绝路径用例。
-    fn make_test_engine(
+    pub(crate) fn make_test_engine(
         reject_change: bool,
     ) -> (
         Arc<StreamingEngine>,
@@ -441,7 +442,7 @@ mod tests {
         (mgr, recorded_rx, keyframe)
     }
 
-    fn make_test_offer() -> RTCSessionDescription {
+    pub(crate) fn make_test_offer() -> RTCSessionDescription {
         let sdp = "v=0\r\n\
 o=- 1495799811084970 1 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
@@ -459,6 +460,18 @@ a=sendrecv\r\n\
 a=rtpmap:102 H264/90000\r\n";
         RTCSessionDescription::offer(sdp.to_string()).unwrap()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{Rec, make_test_engine, make_test_offer};
+    use super::*;
+    use crate::encode::KeyframeTrigger;
+    use crate::encode::control::{ControlCommand, ControlSender};
+    use crate::encode::encoder::EncodeBackendKind;
+    use crate::encode::frame::FrameInbox;
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
     /// 新会话接入必须替换旧会话，`close` 必须清空
     #[tokio::test]
