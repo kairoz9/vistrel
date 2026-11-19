@@ -121,13 +121,18 @@ pub(crate) enum FrameOutcome {
     TrackWriteFailed,
     /// 已编码，等关键帧门控态下主动跳过（非错误）
     GateSkipped,
+    /// 在入口被拒收的显存帧
+    FenceDropped,
 }
 
 impl FrameOutcome {
     /// 日志开头那句；不出声的几格给空串
     fn headline(self) -> &'static str {
         match self {
-            FrameOutcome::Admitted | FrameOutcome::Superseded | FrameOutcome::GateSkipped => "",
+            FrameOutcome::Admitted
+            | FrameOutcome::Superseded
+            | FrameOutcome::GateSkipped
+            | FrameOutcome::FenceDropped => "",
             FrameOutcome::PoolEmpty => "主机帧池无可用块",
             FrameOutcome::WriteFailed => "主机帧写入失败并丢弃",
             FrameOutcome::GeometryMismatch => "主机帧布局与编码器不一致",
@@ -138,7 +143,7 @@ impl FrameOutcome {
     }
 }
 
-/// 帧结局计数：九格只增不减，出声的五格各带一个限频器
+/// 帧结局计数：十格只增不减，出声的六格各带一个限频器
 ///
 /// 计数与日志同住一处：调用点只交代「这一帧是什么结局」加一句详情，限频、文案与级别
 /// 都在这里定，免得四处各写一套。只碰 `Relaxed` 原子，无锁无分配；窗口本身仍归
@@ -154,8 +159,9 @@ pub(crate) struct FrameOutcomes {
     write_stalled: AtomicU64,
     track_write_failed: AtomicU64,
     gate_skipped: AtomicU64,
-    /// 要出声的几格各带一个限频器（`Admitted` 是成功路径、`Superseded`
-    /// 与 `GateSkipped` 是常态，都不出声）
+    fence_dropped: AtomicU64,
+    /// 要出声的几格各带一个限频器（`Admitted` 是成功路径，`Superseded`、
+    /// `GateSkipped` 与 `FenceDropped` 是常态，都不出声）
     pool_empty_log: RateLimitLog,
     write_failed_log: RateLimitLog,
     geometry_mismatch_log: RateLimitLog,
@@ -165,7 +171,7 @@ pub(crate) struct FrameOutcomes {
 }
 
 impl FrameOutcomes {
-    /// 九格归零，出声五格的日志各就位
+    /// 十格归零，出声六格的日志各就位
     pub(crate) fn new() -> Self {
         Self {
             admitted: AtomicU64::new(0),
@@ -177,6 +183,7 @@ impl FrameOutcomes {
             write_stalled: AtomicU64::new(0),
             track_write_failed: AtomicU64::new(0),
             gate_skipped: AtomicU64::new(0),
+            fence_dropped: AtomicU64::new(0),
             // 五格各自限频；文案与级别见 `record_with`
             pool_empty_log: RateLimitLog::new(DROP_LOG_WINDOW_MS),
             write_failed_log: RateLimitLog::new(DROP_LOG_WINDOW_MS),
@@ -196,7 +203,8 @@ impl FrameOutcomes {
     pub(crate) fn record_with(&self, outcome: FrameOutcome, detail: impl std::fmt::Display) {
         self.counter(outcome).fetch_add(1, Ordering::Relaxed);
 
-        // `Admitted` / `Superseded` 按设计不出声，其余四格各自限频
+        // `Admitted` / `Superseded` / `GateSkipped` / `FenceDropped` 按设计不出声，
+        // 其余六格各自限频
         let Some(log) = self.log(outcome) else {
             return;
         };
@@ -240,12 +248,16 @@ impl FrameOutcomes {
             FrameOutcome::WriteStalled => &self.write_stalled,
             FrameOutcome::TrackWriteFailed => &self.track_write_failed,
             FrameOutcome::GateSkipped => &self.gate_skipped,
+            FrameOutcome::FenceDropped => &self.fence_dropped,
         }
     }
 
     fn log(&self, outcome: FrameOutcome) -> Option<&RateLimitLog> {
         match outcome {
-            FrameOutcome::Admitted | FrameOutcome::Superseded | FrameOutcome::GateSkipped => None,
+            FrameOutcome::Admitted
+            | FrameOutcome::Superseded
+            | FrameOutcome::GateSkipped
+            | FrameOutcome::FenceDropped => None,
             FrameOutcome::PoolEmpty => Some(&self.pool_empty_log),
             FrameOutcome::WriteFailed => Some(&self.write_failed_log),
             FrameOutcome::GeometryMismatch => Some(&self.geometry_mismatch_log),

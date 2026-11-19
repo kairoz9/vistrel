@@ -277,8 +277,9 @@ impl NvencBackend {
             .ok_or_else(|| format!("Vram slot {slot_idx} 尚未在当前会话上注册"))?;
         let (ext_sem, slot_width, slot_height) =
             (entry.cuda.ext_sem, entry.cuda.width, entry.cuda.height);
-        // 重配窗口里管道仍在递旧几何的帧：NVENC 重配会保留已注册槽位。
-        // 核对必须在等待与映射之前，让这一帧以可诊断的错误丢在入口而不是交给驱动
+        // 兜底不变量：旧代帧已在 Actor 入口被拒收，导入期整批校验也保证
+        // 槽位几何与会话一致，到这里还不符只可能是前两道防线的漏网。核对仍必须在
+        // 等待与映射之前，让漏网帧以可诊断的错误丢在入口而不是交给驱动
         let profile = self.session.profile();
         let (profile_width, profile_height) = (profile.width() as u32, profile.height() as u32);
         if slot_width != profile_width || slot_height != profile_height {

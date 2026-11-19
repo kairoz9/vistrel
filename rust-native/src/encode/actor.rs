@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::Receiver;
 
 use crate::encode::control::{ControlCommand, ControlStatus};
-use crate::encode::frame::{FrameInbox, FrameOutbox, FrameOutcome};
+use crate::encode::frame::{FrameInbox, FrameOutbox, FrameOutcome, VideoFrame};
 use crate::encode::hardware::VramSlotDescriptor;
 use crate::encode::hardware::slots::{ActorStage, SlotStateBlock};
 use crate::encode::pool::{FramePool, HostBlock};
@@ -50,6 +50,9 @@ pub struct EncoderActor {
     slot_state: &'static SlotStateBlock,
     /// 硬编后端工厂：唯一依赖注入点
     hardware_builder: Arc<HardwareBuilder>,
+    /// true＝拒收显存帧：档位已换等重导入、或槽位表已清空等重新导入。
+    /// 只开不关——恢复接收只认导入命令，见 `end_profile_command`；主机帧不受影响
+    rejecting_frames: bool,
 }
 
 impl EncoderActor {
@@ -99,6 +102,7 @@ impl EncoderActor {
             pool,
             slot_state,
             hardware_builder,
+            rejecting_frames: false,
         };
         actor.attach(blocks);
         actor
@@ -158,12 +162,10 @@ impl EncoderActor {
                     }
                 }
 
-                // 5. 有帧就编码并把产物放进管线的发件箱（Latest-Frame-Wins）
+                // 5. 有帧就处理并把产物放进管线的发件箱（Latest-Frame-Wins）
                 // 入箱是同步的：本帧处理完立刻取下一帧，控制命令最坏延迟 = 一次编码
                 if let Some(frame) = self.inbox.take() {
-                    // 帧的归还在 `FrameBuf::drop` 里完成（析构即归还），
-                    // 因此编码成功、编码失败、被收件箱覆盖三条路径都不会泄漏或提前释放
-                    self.encode_frame(&frame.payload, frame.birth_nanos);
+                    self.handle_frame(frame);
                 }
             }
         })
@@ -185,9 +187,9 @@ impl EncoderActor {
                 Self::apply_bitrate(&mut self.encoder, bitrate);
             }
             ControlCommand::ProfileChange { profile, reply } => {
-                self.slot_state.set_stage(ActorStage::Reconfigure);
-                self.discard_frames_before_rebuild();
+                let (before, had_table) = self.begin_profile_command();
                 let outcome = self.change_profile(profile);
+                self.end_profile_command(before, had_table);
                 let _ = reply.send(outcome);
             }
             ControlCommand::PrepareEncoder {
@@ -195,23 +197,60 @@ impl EncoderActor {
                 prefer_hardware,
                 reply,
             } => {
-                self.slot_state.set_stage(ActorStage::Reconfigure);
-                self.discard_frames_before_rebuild();
+                let (before, had_table) = self.begin_profile_command();
                 let code = self.prepare_encoder(profile, prefer_hardware);
+                self.end_profile_command(before, had_table);
                 let _ = reply.send(code);
             }
             ControlCommand::ImportVramSlots { slots, reply } => {
                 self.discard_frames_before_rebuild();
                 let code = self.import_vram_slots(slots);
+                // 恢复接收只认导入，无论成败：成功即新表生效；失败时旧表恢复或
+                // 表空，交给既有索引查找与几何兜底
+                self.rejecting_frames = false;
                 let _ = reply.send(code);
             }
             ControlCommand::ClearVramSlots { reply } => {
                 self.discard_frames_before_rebuild();
                 let code = self.clear_vram_slots();
+                if code == ControlStatus::Ok {
+                    // 表空：继续拒收直到下一次导入
+                    self.rejecting_frames = true;
+                } else {
+                    // 排空失败，注销没发生，旧表原样保留——旧帧仍合法
+                    self.rejecting_frames = false;
+                }
                 let _ = reply.send(code);
             }
         }
         true
+    }
+
+    /// 换档类命令（`ProfileChange` / `PrepareEncoder`）的统一前置：
+    /// 置阶段码、清收件箱，返回命令前快照 `(档位, 此前是否硬编在位)`——
+    /// 只有硬编可能持有槽位注册，软编在位时无从谈起拒收
+    fn begin_profile_command(&mut self) -> (StreamingProfile, bool) {
+        self.slot_state.set_stage(ActorStage::Reconfigure);
+        self.discard_frames_before_rebuild();
+        (
+            self.profile,
+            self.encoder.as_ref().is_some_and(|e| e.is_hardware()),
+        )
+    }
+
+    /// 换档类命令的统一收尾：几何或 codec 实际变化且此前硬编在位时，开始拒收
+    /// 显存帧。只开不关——一旦拒收，恢复只认导入命令，中途的 fps-only 重配
+    /// 不得提前放行旧代帧；本体重配失败不开（档位没变就没有漂移）
+    fn end_profile_command(&mut self, before: StreamingProfile, hardware_table: bool) {
+        let after = &self.profile;
+        if hardware_table
+            && (before.width() != after.width()
+                || before.height() != after.height()
+                || before.codec() != after.codec())
+        {
+            self.rejecting_frames = true;
+            log::debug!("档位已变，等待槽位重导入：期间显存帧在入口拒收");
+        }
     }
 
     /// 换代命令的前置收尾：清空收件箱，被丢弃帧的资源在本线程归还
@@ -567,6 +606,27 @@ impl EncoderActor {
         if requested {
             self.keyframe.request();
         }
+    }
+
+    /// 处理取出的最新帧：换档拒收先于编码
+    ///
+    /// 档位已换、槽位表待重导入期间到达的槽位帧引用的是重导入前的旧槽位表
+    /// （几何过期或索引悬空，旧 sync_value 还可能落到新导入的信号量上长期等待），
+    /// 在入口丢弃并
+    /// 归还所有权位；主机帧自带像素、不引用表，照常编码。正常期两类帧都进编码。
+    /// 帧的归还在 `FrameBuf::drop` 里完成（析构即归还），各出口都不会泄漏或提前释放
+    fn handle_frame(&mut self, frame: VideoFrame) {
+        if self.rejecting_frames
+            && let FramePayload::VramSlot { slot_idx, .. } = &frame.payload
+        {
+            self.slot_state.mark_free(*slot_idx);
+            self.inbox.outcomes().record_with(
+                FrameOutcome::FenceDropped,
+                "槽位表重建中：显存帧暂不接收，等待重新导入",
+            );
+            return;
+        }
+        self.encode_frame(&frame.payload, frame.birth_nanos);
     }
 }
 
@@ -1022,15 +1082,11 @@ mod tests {
         let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
-        let (mut actor, pool) = test_actor(inbox, keyframe, test_outbox());
+        let (mut actor, _pool) = test_actor(inbox, keyframe, test_outbox());
 
-        // 1. 初始为 1080p Profile (上限 20_000_000 bps)
+        // 1. 初始为 1080p Profile (上限 20_000_000 bps)：走公共缝装配，不直写字段
         let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
-        actor.profile = p1080;
-        if let Ok((encoder, blocks)) = VideoEncoder::new_software(p1080) {
-            pool.attach(blocks);
-            actor.encoder = Some(encoder);
-        }
+        assert_eq!(prepare(&mut actor, p1080, false), ControlStatus::Ok);
 
         // 2. 模拟 Rate Control 将 Followed Bitrate 调至 5_000_000 bps
         set_bitrate(&mut actor, 5_000_000);
@@ -1060,5 +1116,347 @@ mod tests {
             actor.bitrate, 10_000_000,
             "缓存不得被档位变化改写：它只反映 RC 派发过的值"
         );
+    }
+
+    /// 围栏测试后端：槽位表行为可配置，不碰任何驱动；编码恒产出非空 NALU，
+    /// 让「被围栏拒收」与「被编码 admitted」在账本上可区分。成功出口归还
+    /// 所有权位，与真实后端同一位协议纪律
+    struct FenceBackend {
+        slot_state: &'static SlotStateBlock,
+        drain_ok: bool,
+        import_ok: bool,
+    }
+
+    impl VideoEncodeBackend for FenceBackend {
+        fn kind(&self) -> EncodeBackendKind {
+            EncodeBackendKind::Nvenc
+        }
+
+        fn coded_align(&self) -> (u32, u32) {
+            (1, 1)
+        }
+
+        fn encode(
+            &mut self,
+            payload: &FramePayload,
+            _force_idr: bool,
+            _frame_idx: u64,
+        ) -> Result<(Bytes, bool), String> {
+            if let FramePayload::VramSlot { slot_idx, .. } = payload {
+                self.slot_state.mark_free(*slot_idx);
+            }
+            Ok((Bytes::from_static(b"fence-test-nalu"), false))
+        }
+
+        fn reconfigure(
+            &mut self,
+            _new_profile: StreamingProfile,
+        ) -> Result<Vec<HostBlock>, String> {
+            Ok(Vec::new())
+        }
+
+        fn set_bitrate(&mut self, _bps: u32) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn import_vram_slots(
+            &mut self,
+            _descriptors: &mut [VramSlotDescriptor],
+        ) -> Result<(), String> {
+            if self.import_ok {
+                Ok(())
+            } else {
+                Err("导入失败模拟".to_string())
+            }
+        }
+
+        fn clear_vram_slots(&mut self) {}
+
+        fn drain(&mut self) -> Result<(), String> {
+            if self.drain_ok {
+                Ok(())
+            } else {
+                Err("排空失败模拟".to_string())
+            }
+        }
+    }
+
+    /// 围栏测试工厂：交出硬件身份编码器（行为按用例配置）
+    fn fence_backend_builder(drain_ok: bool, import_ok: bool) -> Arc<HardwareBuilder> {
+        Arc::new(move |profile, slot_state| {
+            Ok((
+                VideoEncoder::from_backend(
+                    profile,
+                    Box::new(FenceBackend {
+                        slot_state,
+                        drain_ok,
+                        import_ok,
+                    }),
+                ),
+                fake_device_blocks(FAKE_DEVICE_DOMAIN),
+            ))
+        })
+    }
+
+    /// 围栏测试专用构造：额外交出槽位所有权块，供用例模拟渲染线程置位与断言位协议
+    fn fence_actor(
+        inbox: Arc<FrameInbox>,
+        keyframe: Arc<KeyframeTrigger>,
+        output: Arc<FrameOutbox>,
+        drain_ok: bool,
+        import_ok: bool,
+    ) -> (EncoderActor, Arc<FramePool>, &'static SlotStateBlock) {
+        let pool = FramePool::new();
+        let block = SlotStateBlock::new_leaked();
+        let actor = EncoderActor::new_with_hardware_builder(
+            inbox,
+            keyframe,
+            output,
+            Arc::downgrade(&pool),
+            block,
+            fence_backend_builder(drain_ok, import_ok),
+        );
+        (actor, pool, block)
+    }
+
+    /// 槽位帧构造（句柄 -1 且已接管，Drop 不会触碰系统句柄）
+    fn vram_frame(slot_idx: u32, sync_value: u64) -> VideoFrame {
+        VideoFrame {
+            birth_nanos: 0,
+            payload: FramePayload::VramSlot {
+                slot_idx,
+                sync_value,
+            },
+        }
+    }
+
+    /// 读取槽位类命令的阻塞应答（槽位命令的控制面走 std 通道）
+    fn wait_control_reply(rx: std::sync::mpsc::Receiver<ControlStatus>) -> ControlStatus {
+        rx.recv_timeout(std::time::Duration::from_millis(500))
+            .expect("槽位命令应答超时")
+    }
+
+    /// 经控制出口导入一批 720p 槽位并取回结果码
+    fn import_slots(actor: &mut EncoderActor, slot_idx: u32) -> ControlStatus {
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        assert!(actor.apply(ControlCommand::ImportVramSlots {
+            slots: vec![VramSlotDescriptor {
+                slot_idx,
+                mem_handle: -1,
+                sem_handle: -1,
+                width: 1280,
+                height: 720,
+                size_bytes: 0,
+                offset: 0,
+                handles_taken: true,
+            }],
+            reply,
+        }));
+        wait_control_reply(rx)
+    }
+
+    /// 用例 1：几何变化开窗——窗口内槽位帧入口拒收并归还所有权位，主机帧照收；
+    /// 导入完成后关窗，新槽位帧恢复编码
+    #[test]
+    fn test_fence_drops_window_frames_then_admits_new_generation() {
+        let keyframe = Arc::new(KeyframeTrigger::new());
+        let bell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
+        let output = test_outbox();
+        let (mut actor, pool, block) =
+            fence_actor(inbox.clone(), keyframe, output.clone(), true, true);
+
+        let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
+        assert_eq!(prepare(&mut actor, p1080, true), ControlStatus::Ok);
+        assert!(!actor.rejecting_frames);
+
+        // 几何变化生效：窗口开启
+        let p720 = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        assert_eq!(switch_profile(&mut actor, p720), Ok(p720));
+        assert!(actor.rejecting_frames);
+
+        // 窗口内槽位帧：入口拒收、busy 位归还、不进编码
+        block.set_busy(0);
+        inbox.push(vram_frame(0, 5));
+        let frame = inbox.take().expect("帧在收件箱");
+        actor.handle_frame(frame);
+        assert_eq!(
+            inbox.outcomes().count(FrameOutcome::FenceDropped),
+            1,
+            "窗口内槽位帧必须被围栏拒收"
+        );
+        assert!(!block.is_busy(0), "被拒帧的所有权位必须在入口归还");
+        assert!(
+            output.take().is_none(),
+            "被拒帧不得进编码，发件箱不得有产物"
+        );
+
+        // 窗口内主机帧：自带像素不引用表，照收。
+        // `Admitted` 由会话写循环记账，Actor 层以发件箱产物为准
+        let host = host_payload(&pool, vec![100u8; display_nv12_len(&p720)]);
+        inbox.push(VideoFrame {
+            birth_nanos: 1,
+            payload: host,
+        });
+        let frame = inbox.take().expect("主机帧在收件箱");
+        actor.handle_frame(frame);
+        assert!(output.take().is_some(), "窗口内主机帧必须照收");
+
+        // 导入完成：关窗，新槽位帧恢复编码
+        assert_eq!(import_slots(&mut actor, 0), ControlStatus::Ok);
+        assert!(!actor.rejecting_frames);
+
+        block.set_busy(0);
+        inbox.push(vram_frame(0, 6));
+        let frame = inbox.take().expect("新代帧在收件箱");
+        actor.handle_frame(frame);
+        assert!(output.take().is_some(), "新代槽位帧必须恢复编码");
+        assert!(!block.is_busy(0), "编码出口归还所有权位");
+    }
+
+    /// 用例 2：同几何换 codec 也开窗——旧 sync_value 帧不得落进新导入的信号量。
+    /// 这是重配触发面的语义洞：几何比对拦不住几何相同的旧帧，只有入口拒收能
+    #[test]
+    fn test_fence_covers_same_geometry_codec_change() {
+        let keyframe = Arc::new(KeyframeTrigger::new());
+        let bell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
+        let output = test_outbox();
+        let (mut actor, _pool, block) =
+            fence_actor(inbox.clone(), keyframe, output.clone(), true, true);
+
+        let p1080_h264 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
+        assert_eq!(prepare(&mut actor, p1080_h264, true), ControlStatus::Ok);
+
+        let p1080_h265 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H265);
+        assert_eq!(switch_profile(&mut actor, p1080_h265), Ok(p1080_h265));
+        assert!(actor.rejecting_frames);
+
+        block.set_busy(3);
+        inbox.push(vram_frame(3, 100));
+        let frame = inbox.take().expect("帧在收件箱");
+        actor.handle_frame(frame);
+        assert_eq!(
+            inbox.outcomes().count(FrameOutcome::FenceDropped),
+            1,
+            "同几何换 codec 的旧 sync_value 帧必须被围栏拒收"
+        );
+        assert!(!block.is_busy(3), "被拒帧的所有权位必须归还");
+        assert!(output.take().is_none(), "被拒帧不得进编码");
+
+        assert_eq!(import_slots(&mut actor, 3), ControlStatus::Ok);
+        assert!(!actor.rejecting_frames);
+    }
+
+    /// 用例 3：导入前排空失败——整批拒绝且窗口不滞留，旧代恢复接收
+    #[test]
+    fn test_fence_closes_window_when_import_drain_fails() {
+        let keyframe = Arc::new(KeyframeTrigger::new());
+        let bell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
+        let output = test_outbox();
+        let (mut actor, _pool, _block) =
+            fence_actor(inbox.clone(), keyframe, output.clone(), false, true);
+
+        let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
+        assert_eq!(prepare(&mut actor, p1080, true), ControlStatus::Ok);
+        let p720 = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        let _ = switch_profile(&mut actor, p720);
+        assert!(actor.rejecting_frames);
+
+        assert_eq!(
+            import_slots(&mut actor, 0),
+            ControlStatus::ImportFailed,
+            "排空失败必须整批拒绝"
+        );
+        assert!(!actor.rejecting_frames);
+
+        inbox.push(vram_frame(0, 7));
+        let frame = inbox.take().expect("帧在收件箱");
+        actor.handle_frame(frame);
+        assert!(output.take().is_some(), "导入失败后窗口关闭，帧恢复接收");
+        assert_eq!(inbox.outcomes().count(FrameOutcome::FenceDropped), 0);
+    }
+
+    /// 用例 4：清空槽位表后，显存帧拒收直到下一次导入
+    #[test]
+    fn test_slots_cleared_rejects_until_next_import() {
+        let keyframe = Arc::new(KeyframeTrigger::new());
+        let bell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
+        let output = test_outbox();
+        let (mut actor, _pool, block) =
+            fence_actor(inbox.clone(), keyframe, output.clone(), true, true);
+
+        let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
+        assert_eq!(prepare(&mut actor, p1080, true), ControlStatus::Ok);
+        assert!(!actor.rejecting_frames);
+
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        assert!(actor.apply(ControlCommand::ClearVramSlots { reply }));
+        assert_eq!(wait_control_reply(rx), ControlStatus::Ok);
+        assert!(actor.rejecting_frames);
+
+        block.set_busy(2);
+        inbox.push(vram_frame(2, 9));
+        let frame = inbox.take().expect("帧在收件箱");
+        actor.handle_frame(frame);
+        assert_eq!(
+            inbox.outcomes().count(FrameOutcome::FenceDropped),
+            1,
+            "槽位表清空后的槽位帧必须被拒收"
+        );
+        assert!(!block.is_busy(2), "被拒帧的所有权位必须归还");
+
+        assert_eq!(import_slots(&mut actor, 2), ControlStatus::Ok);
+        assert!(!actor.rejecting_frames);
+
+        inbox.push(vram_frame(2, 10));
+        let frame = inbox.take().expect("新代帧在收件箱");
+        actor.handle_frame(frame);
+        assert!(output.take().is_some(), "新导入后槽位帧恢复编码");
+    }
+
+    /// 用例 5：拒收只开不关——窗口开着时来一条 fps-only 重配，不得提前放行
+    /// 旧代帧；恢复只认导入
+    #[test]
+    fn test_fps_only_change_keeps_rejecting_until_import() {
+        let keyframe = Arc::new(KeyframeTrigger::new());
+        let bell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
+        let output = test_outbox();
+        let (mut actor, _pool, block) =
+            fence_actor(inbox.clone(), keyframe, output.clone(), true, true);
+
+        let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
+        assert_eq!(prepare(&mut actor, p1080, true), ControlStatus::Ok);
+
+        // fps-only 重配不动表：单独发生时不开窗
+        let p1080_30fps_h264 = StreamingProfile::new(1920, 1080, 30, VideoCodec::H264);
+        let _ = switch_profile(&mut actor, p1080_30fps_h264);
+        assert!(!actor.rejecting_frames, "fps-only 重配不得开窗");
+
+        // 同几何换 codec 开窗（旧 sync_value 帧自此不得进编码）
+        let p1080_h265 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H265);
+        let _ = switch_profile(&mut actor, p1080_h265);
+        assert!(actor.rejecting_frames);
+
+        // 窗口期间来一条 fps-only 重配：不得关闭拒收
+        let p1080_30fps = StreamingProfile::new(1920, 1080, 30, VideoCodec::H265);
+        let _ = switch_profile(&mut actor, p1080_30fps);
+        assert!(actor.rejecting_frames, "fps-only 重配不得提前放行旧代帧");
+
+        block.set_busy(1);
+        inbox.push(vram_frame(1, 77));
+        let frame = inbox.take().expect("帧在收件箱");
+        actor.handle_frame(frame);
+        assert_eq!(
+            inbox.outcomes().count(FrameOutcome::FenceDropped),
+            1,
+            "窗口内旧代帧必须仍被拒收"
+        );
+
+        assert_eq!(import_slots(&mut actor, 1), ControlStatus::Ok);
+        assert!(!actor.rejecting_frames);
     }
 }
