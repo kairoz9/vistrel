@@ -714,9 +714,10 @@ a=rtpmap:102 H264/90000\r\n";
         let engine = test_engine();
         let handler = Arc::new(SessionHandler::new(Arc::new(|_| {})));
 
-        let (session, answer) = StreamingSession::establish(&engine, offer, initial_profile, handler)
-            .await
-            .unwrap();
+        let (session, answer) =
+            StreamingSession::establish(&engine, offer, initial_profile, handler)
+                .await
+                .unwrap();
 
         assert!(answer.sdp.contains("102"));
 

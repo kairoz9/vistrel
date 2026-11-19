@@ -137,11 +137,9 @@ fn stop_engine<'caller>(
         // 主动关闭活跃会话并等到底：写者排空、Peer 关闭完成后 UDP 绑定才放手，
         // 本函数返回后紧随的重建引擎才能确定性 bind 成功。有界等待，超时交还后台收尾
         let closing_engine = Arc::clone(&engine);
-        let closed = state
-            .runtime
-            .block_on(async {
-                tokio::time::timeout(SESSION_CLOSE_BUDGET, closing_engine.close()).await
-            });
+        let closed = state.runtime.block_on(async {
+            tokio::time::timeout(SESSION_CLOSE_BUDGET, closing_engine.close()).await
+        });
         if closed.is_err() {
             log::warn!("会话关闭超出 {SESSION_CLOSE_BUDGET:?} 预算，UDP 端口释放延后");
         }
@@ -204,11 +202,9 @@ fn negotiate_offer<'caller>(
         None
     };
 
-    let res = state.runtime.block_on(async move {
-        engine
-            .handle_offer(offer, w, h, f, initial_bpp)
-            .await
-    });
+    let res = state
+        .runtime
+        .block_on(async move { engine.handle_offer(offer, w, h, f, initial_bpp).await });
 
     Ok(match res {
         Ok((answer, profile)) => {

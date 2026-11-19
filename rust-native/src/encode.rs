@@ -884,8 +884,13 @@ mod tests {
 
         // 4K144 / 4K240 无 level 可覆盖：压到 120（MaxMBPS 上限 128.9，触顶取整到 10）
         for requested in [144, 240] {
-            let p =
-                StreamingProfile::new_with_bpp(3840, 2160, requested, Some(MAX_BPP), VideoCodec::H264);
+            let p = StreamingProfile::new_with_bpp(
+                3840,
+                2160,
+                requested,
+                Some(MAX_BPP),
+                VideoCodec::H264,
+            );
             assert_eq!(p.fps(), 120, "4K{requested} 必须压到 120");
             assert_eq!(
                 (p.width(), p.height()),

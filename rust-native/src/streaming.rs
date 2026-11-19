@@ -350,7 +350,7 @@ fn resolve_codec(
 mod tests {
     use super::*;
     use crate::encode::KeyframeTrigger;
-    use crate::encode::control::{ControlCommand, ControlStatus, ControlSender};
+    use crate::encode::control::{ControlCommand, ControlSender, ControlStatus};
     use crate::encode::encoder::EncodeBackendKind;
     use crate::encode::frame::FrameInbox;
     use std::time::Duration;
@@ -423,7 +423,11 @@ mod tests {
             Arc::new(keyframe.clone()),
             inbox,
         ));
-        let mgr = Arc::new(StreamingEngine::new(pipeline, audio, "0.0.0.0:0".to_string()));
+        let mgr = Arc::new(StreamingEngine::new(
+            pipeline,
+            audio,
+            "0.0.0.0:0".to_string(),
+        ));
         (mgr, recorded_rx, keyframe)
     }
 
@@ -718,7 +722,11 @@ a=rtpmap:102 H264/90000\r\n";
             Arc::new(keyframe.clone()),
             inbox,
         ));
-        let engine = Arc::new(StreamingEngine::new(pipeline, audio, "0.0.0.0:0".to_string()));
+        let engine = Arc::new(StreamingEngine::new(
+            pipeline,
+            audio,
+            "0.0.0.0:0".to_string(),
+        ));
 
         // 构造静音 PCM 帧 (1920 个采样点)
         let silence = vec![0i16; crate::encode::AUDIO_TOTAL_SAMPLES];
@@ -746,7 +754,11 @@ a=rtpmap:102 H264/90000\r\n";
             Arc::new(keyframe.clone()),
             inbox,
         ));
-        let mgr = Arc::new(StreamingEngine::new(pipeline, audio, "0.0.0.0:0".to_string()));
+        let mgr = Arc::new(StreamingEngine::new(
+            pipeline,
+            audio,
+            "0.0.0.0:0".to_string(),
+        ));
 
         let silence = vec![0i16; crate::encode::AUDIO_TOTAL_SAMPLES];
         mgr.audio().push_sample(&silence);
@@ -812,4 +824,3 @@ a=rtpmap:102 H264/90000\r\n";
         );
     }
 }
-

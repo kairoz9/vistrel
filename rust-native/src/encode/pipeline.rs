@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::encode::actor::EncoderActor;
-use crate::encode::control::{CONTROL_QUEUE_DEPTH, ControlCommand, ControlStatus, ControlSender};
+use crate::encode::control::{CONTROL_QUEUE_DEPTH, ControlCommand, ControlSender, ControlStatus};
 use crate::encode::frame::{
     FrameInbox, FrameOutbox, FrameOutcome, FramePayload, Mailbox, VideoFrame,
 };
@@ -90,7 +90,10 @@ impl VideoPipeline {
     }
 
     /// 会话建立前把编码器按档位就绪（ask）
-    pub(crate) async fn prepare_encoder(&self, profile: StreamingProfile) -> Result<(), ControlStatus> {
+    pub(crate) async fn prepare_encoder(
+        &self,
+        profile: StreamingProfile,
+    ) -> Result<(), ControlStatus> {
         self.control.prepare_encoder(profile).await
     }
 

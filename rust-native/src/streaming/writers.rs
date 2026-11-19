@@ -20,7 +20,9 @@ use webrtc::peer_connection::RTCPeerConnectionState;
 use crate::encode::frame::{FrameOutbox, FrameOutcome};
 use crate::encode::{AudioPacket, StampedVideoPacket, VideoPacket};
 use crate::streaming::cancellation::CancellationToken;
-use crate::streaming::transport::{AUDIO_TRACK_SSRC, KeyframeThrottle, TickDiffer, VIDEO_TRACK_SSRC};
+use crate::streaming::transport::{
+    AUDIO_TRACK_SSRC, KeyframeThrottle, TickDiffer, VIDEO_TRACK_SSRC,
+};
 
 /// 单帧写轨道上限：写卡住时不能无限期占住写循环，超时就丢帧并要求下一次 IDR
 const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
@@ -448,7 +450,13 @@ mod tests {
 
         post(&writer, video_frame(1, true));
         assert!(writer.drain_pending().await);
-        assert_eq!(writer.outbox.outcomes().count(FrameOutcome::TrackWriteFailed), 1);
+        assert_eq!(
+            writer
+                .outbox
+                .outcomes()
+                .count(FrameOutcome::TrackWriteFailed),
+            1
+        );
         assert_eq!(writer.outbox.outcomes().count(FrameOutcome::Admitted), 0);
 
         // IDR 没写出去：门控仍是关的，P 帧被跳过并就地再要一次

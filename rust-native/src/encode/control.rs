@@ -159,7 +159,10 @@ impl ControlSender {
     ///
     /// 命令名说的是编码段**自己的**动作：Actor 不知道什么叫会话，新会话接入、顶号、
     /// 预热都走这一条。`Ok(())` 才代表「编码器已按该档位就绪」，调用方不必靠猜。
-    pub(crate) async fn prepare_encoder(&self, profile: StreamingProfile) -> Result<(), ControlStatus> {
+    pub(crate) async fn prepare_encoder(
+        &self,
+        profile: StreamingProfile,
+    ) -> Result<(), ControlStatus> {
         let (reply, wait) = tokio::sync::oneshot::channel();
         self.send(ControlCommand::PrepareEncoder {
             profile,

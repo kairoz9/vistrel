@@ -131,7 +131,9 @@ impl VideoEncoder {
     ///
     /// 连同新分配的堆块一并返回，调用方负责装进帧池；软编不进硬件能力快照，
     /// 构造不产生全局发布副作用
-    pub(crate) fn new_software(profile: StreamingProfile) -> Result<(Self, Vec<HostBlock>), String> {
+    pub(crate) fn new_software(
+        profile: StreamingProfile,
+    ) -> Result<(Self, Vec<HostBlock>), String> {
         Self::new_backend(profile, EncodeBackendKind::Software, None)
     }
 
