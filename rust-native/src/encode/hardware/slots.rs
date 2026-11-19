@@ -255,14 +255,14 @@ pub(crate) const SLOT_STATE_BLOCK_BYTES: usize = 64;
 
 /// 游戏侧渲染线程与编码 Actor 之间共享的槽位所有权块：
 /// 游戏侧认领槽位写 1，Actor 归还写 0（均为 CAS），心跳供游戏侧做停滞判定。
-/// 64 字节单缓存行，经直接内存缓冲区暴露给游戏侧，访问全部走 acquire/release。
+/// 64 字节单缓存行（按 64 字节对齐），经直接内存缓冲区暴露给游戏侧，访问全部走 acquire/release。
 ///
 /// 布局是跨语言约定（游戏侧按 `ValueLayout` 原生端序按偏移访问）：
 /// `[0..32) = busy[8]`、`[32..40) = heartbeat`、`[40..48) = stage`、`[48..64) = 保留`。
 ///
 /// 块随引擎实例创建并故意泄漏：卡死弃用的旧 Actor 只能写到自己那一代的块上，
 /// 碰不到新一代——跨代复用同一块的话，旧线程复活的心跳会让新一代的超时判定失效。
-#[repr(C, align(8))]
+#[repr(C, align(64))]
 pub(crate) struct SlotStateBlock {
     /// 1 = 渲染线程已认领且尚未归还；0 = Actor 手中无该槽的帧
     busy: [AtomicU32; SLOT_STATE_SLOTS],
@@ -275,6 +275,7 @@ pub(crate) struct SlotStateBlock {
 }
 
 const _: () = assert!(std::mem::size_of::<SlotStateBlock>() == SLOT_STATE_BLOCK_BYTES);
+const _: () = assert!(std::mem::align_of::<SlotStateBlock>() == SLOT_STATE_BLOCK_BYTES);
 
 impl SlotStateBlock {
     /// 分配并泄漏一块：泄漏是有界的（64 字节/引擎重建，30s 自愈冷却封顶），
