@@ -20,7 +20,7 @@ class SlotOwnershipTest {
     private static final long TIMEOUT = SlotOwnership.STALL_HEARTBEAT_TIMEOUT_NS;
 
     /**
-     * 64 字节块替身：busy 位在 [0..32)，心跳在 [32..40)。
+     * 64 字节块替身：busy 位在 [0..32)，心跳在 [32..40)，停滞阶段码在 [40..48)。
      * 必须用 long[]——byte[] 数据起点在本 JVM 非 8 对齐，堆段 8 字节访问会被拒
      */
     private MemorySegment newBlock() {
@@ -112,6 +112,17 @@ class SlotOwnershipTest {
                 ownership.release(0);
             }
         }
+    }
+
+    @Test
+    void testStageNameReadsCrossLanguageContract() {
+        MemorySegment block = newBlock();
+        SlotOwnership ownership = new SlotOwnership(block, 3);
+        Assertions.assertEquals("空闲等待", ownership.stageName(), "零值必须是空闲阶段");
+        block.set(ValueLayout.JAVA_LONG, 40L, 9L);
+        Assertions.assertEquals("锁定码流", ownership.stageName(), "阶段码 9 与 Rust ActorStage::LockBitstream 对应");
+        block.set(ValueLayout.JAVA_LONG, 40L, 99L);
+        Assertions.assertEquals("未知阶段(99)", ownership.stageName(), "未约定的码按原值展示，不得越界");
     }
 
     private static void writeHeartbeat(MemorySegment block, long value) {

@@ -168,12 +168,20 @@ public class RenderpearlVramPipeline implements VideoPipeline {
          */
         static final long STALL_HEARTBEAT_TIMEOUT_NS = 1_000_000_000L;
         private static final long HEARTBEAT_OFFSET = 32L;
+        private static final long STAGE_OFFSET = 40L;
         private static final long BUSY_STRIDE = ValueLayout.JAVA_INT.byteSize();
+        /**
+         * 阶段码名称：下标是跨语言约定，与 Rust `ActorStage` 的判别值一一对应。
+         * 改动必须两端同步
+         */
+        private static final String[] STAGE_NAMES =
+                {"空闲等待", "重配编码器", "排空编码器", "导入显存槽位", "注销显存槽位", "编码器关停", "等待时间线信号量", "映射输入资源", "提交编码", "锁定码流", "帧编码"};
         /**
          * 共享块字段的内存序视图：原生端序，读 acquire、写 release，认领走 CAS
          */
         private static final VarHandle BUSY_HANDLE = ValueLayout.JAVA_INT.varHandle();
         private static final VarHandle HEARTBEAT_HANDLE = ValueLayout.JAVA_LONG.varHandle();
+        private static final VarHandle STAGE_HANDLE = ValueLayout.JAVA_LONG.varHandle();
         private final MemorySegment block;
         private final int slotCount;
         /**
@@ -235,6 +243,15 @@ public class RenderpearlVramPipeline implements VideoPipeline {
          */
         boolean heartbeatTimedOut(long nowNanos) {
             return heartbeat() == snapshotHeartbeat && nowNanos - snapshotNanos >= STALL_HEARTBEAT_TIMEOUT_NS;
+        }
+
+        /**
+         * 编码线程最后进入的阶段名：心跳冻结时据此判断卡在哪一段原生调用，
+         * 超出约定范围的码按原值展示
+         */
+        String stageName() {
+            long code = (long) STAGE_HANDLE.getAcquire(block, STAGE_OFFSET);
+            return code >= 0 && code < STAGE_NAMES.length ? STAGE_NAMES[(int) code] : "未知阶段(" + code + ")";
         }
 
         /**
@@ -617,8 +634,9 @@ public class RenderpearlVramPipeline implements VideoPipeline {
         }
         stallTriggered = true;
         Constants.LOG.error(
-                "显存直通停滞：{}s 内编码线程心跳冻结，判定编码线程死亡，停推显存帧并触发引擎自愈",
-                SlotOwnership.STALL_HEARTBEAT_TIMEOUT_NS / 1_000_000_000L
+                "显存直通停滞：{}s 内编码线程心跳冻结（最后阶段：{}），判定编码线程死亡，停推显存帧并触发引擎自愈",
+                SlotOwnership.STALL_HEARTBEAT_TIMEOUT_NS / 1_000_000_000L,
+                ownership.stageName()
         );
         try {
             onEncoderStall.run();
@@ -655,11 +673,22 @@ public class RenderpearlVramPipeline implements VideoPipeline {
 
     @Override
     public CaptureOutcome capture() {
+        long startNanos = CaptureProfiler.begin();
+        try {
+            return captureInternal();
+        } finally {
+            CaptureProfiler.end(CaptureProfiler.Stage.VRAM_TOTAL, startNanos);
+        }
+    }
+
+    private CaptureOutcome captureInternal() {
         // 心跳超时已触发：编码器可能仍映射着槽位纹理，一律停推，等引擎自愈
         if (stallTriggered) {
             return CaptureOutcome.Dropped;
         }
+        long prepStart = CaptureProfiler.begin();
         if (!ensureFlipPipeline()) {
+            CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
             return CaptureOutcome.Failed;
         }
         Minecraft mc = Minecraft.getInstance();
@@ -669,6 +698,7 @@ public class RenderpearlVramPipeline implements VideoPipeline {
             mainColorView = mainTarget == null ? null : mainTarget.getColorTextureView();
         }
         if (mainColorView == null) {
+            CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
             return CaptureOutcome.Failed;
         }
 
@@ -678,12 +708,14 @@ public class RenderpearlVramPipeline implements VideoPipeline {
             // 心跳代表编码线程还活着——Actor 每轮循环都会推进，不推进只有卡死一种解释
             long nowNanos = System.nanoTime();
             if (ownership.heartbeatTimedOut(nowNanos)) {
+                CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
                 onHeartbeatTimeout();
                 return CaptureOutcome.Dropped;
             }
             int preferredIdx = (int) (globalFrameIndex % SLOT_COUNT);
             VulkanSlot preferred = slots[preferredIdx];
             if (preferred == null || preferred.blitTextureView == null) {
+                CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
                 return CaptureOutcome.Failed;
             }
             // 槽位所有权：读到 0 即占位为 1，绝不覆写编码器可能仍在读取的显存。
@@ -691,13 +723,16 @@ public class RenderpearlVramPipeline implements VideoPipeline {
             // 区分——调度器若把它当故障，一次槽位压力就会永久降级到 RAM 回读
             int slotIdx = ownership.claim(preferredIdx);
             if (slotIdx < 0) {
+                CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
                 pressureGate.accumulate(1L);
                 reportSlotPressure();
                 return CaptureOutcome.Dropped;
             }
             claimed = slotIdx;
             VulkanSlot slot = slots[slotIdx];
+            CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
             // 1. 等比 Blit 缩放绘制到槽位专属导出颜色附件（行序契约见 FlipBlit 类文档）
+            long stageStart = CaptureProfiler.begin();
             try (RenderPass pass =
                     encoder.createRenderPass(() -> "Vistrel Blit", slot.blitTextureView, Optional.empty())) {
                 RenderSystem.bindDefaultUniforms(pass);
@@ -718,8 +753,10 @@ public class RenderpearlVramPipeline implements VideoPipeline {
                 //? }
                 pass.draw(3, 1, 0, 0);
             }
+            CaptureProfiler.end(CaptureProfiler.Stage.VRAM_BLIT, stageStart);
             // 2. 转换 Image Layout 为 VK_IMAGE_LAYOUT_GENERAL 并提交 pipeline barrier
             long signalVal = globalFrameIndex + 1;
+            stageStart = CaptureProfiler.begin();
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkImageMemoryBarrier.Buffer imageBarrier = VkImageMemoryBarrier
                     .calloc(1, stack)
@@ -752,17 +789,25 @@ public class RenderpearlVramPipeline implements VideoPipeline {
                 VK12.vkEndCommandBuffer(cmd);
                 vkEncoder.execute(cmd);
             }
+            CaptureProfiler.end(CaptureProfiler.Stage.VRAM_BARRIER, stageStart);
             // 3. 挂载时间线信号量至当前提交流：signal 先于 push，是所有权协议的
             //    数据依赖不变量（渲染完成先于编码可读）
+            stageStart = CaptureProfiler.begin();
             vkEncoder.signalSemaphore(slot.vkSemaphore, signalVal, 0x10000L);
+            CaptureProfiler.end(CaptureProfiler.Stage.VRAM_SIGNAL, stageStart);
 
+            stageStart = CaptureProfiler.begin();
             encoder.submit();
+            CaptureProfiler.end(CaptureProfiler.Stage.VRAM_SUBMIT, stageStart);
+            stageStart = CaptureProfiler.begin();
             try {
                 this.slotLease.push(slotIdx, signalVal);
             } catch (Throwable pushError) {
                 // submit 已在途，信号量必被信号到 signalVal：帧计数照常推进
                 globalFrameIndex++;
                 throw pushError;
+            } finally {
+                CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PUSH, stageStart);
             }
             // 认领位随帧移交给编码器：编码出口（成功/失败）归还。此处记录心跳基准，
             // 时刻用本帧开头那个，误差只是 blit+submit 的耗时（~0.1ms）

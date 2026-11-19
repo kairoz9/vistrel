@@ -202,10 +202,21 @@ public class RenderpearlRamPipeline implements VideoPipeline {
 
     @Override
     public CaptureOutcome capture() {
+        long startNanos = CaptureProfiler.begin();
+        try {
+            return captureInternal();
+        } finally {
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_TOTAL, startNanos);
+        }
+    }
+
+    private CaptureOutcome captureInternal() {
         if (disabled || encoder == null || channel == null) {
             return CaptureOutcome.Dropped;
         }
+        long prepStart = CaptureProfiler.begin();
         if (!ensurePipelines()) {
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_PREP, prepStart);
             return CaptureOutcome.Dropped;
         }
 
@@ -220,25 +231,36 @@ public class RenderpearlRamPipeline implements VideoPipeline {
             mainColorView = mainTarget == null ? null : mainTarget.getColorTextureView();
         }
         if (mainColorView == null) {
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_PREP, prepStart);
             return CaptureOutcome.Failed;
         }
 
         int writeIdx = currentBufferIndex;
         GpuBuffer writeBuffer = pboBuffers[writeIdx];
         if (writeBuffer == null || writeBuffer.isClosed()) {
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_PREP, prepStart);
             return CaptureOutcome.Failed;
         }
+        CaptureProfiler.end(CaptureProfiler.Stage.RAM_PREP, prepStart);
 
         try {
             // 1. 两趟自建 pass 分别产出亮度平面与色度平面
+            long stageStart = CaptureProfiler.begin();
             blitInto(this.lumaView, Nv12Blit.LUMA, mainColorView);
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_BLIT_Y, stageStart);
+            stageStart = CaptureProfiler.begin();
             blitInto(this.chromaView, Nv12Blit.CHROMA, mainColorView);
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_BLIT_UV, stageStart);
             // 2. 两个平面按 NV12 布局写进同一块 PBO：色度紧跟亮度之后
+            long copyStart = CaptureProfiler.begin();
             //? if vulkan_backend {
             this.encoder.copyTextureToBuffer(this.lumaTexture, writeBuffer, 0L, () -> {}, 0);
             this.encoder.copyTextureToBuffer(this.chromaTexture, writeBuffer, (long) width * height, () -> {}, 0);
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_COPY, copyStart);
             // 26.2+ 为命令缓冲语义，显式提交；26.1 的 GL 后端即时执行，无提交概念
+            long submitStart = CaptureProfiler.begin();
             this.encoder.submit();
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_SUBMIT, submitStart);
             //? } else {
             /*// 26.1 的 GL 后端不管理 GL_PACK_ALIGNMENT（copyTextureToBuffer 只设 PACK_ROW_LENGTH），
             // 环境值停留在 GL 默认 4：R8 平面行宽非 4 倍数时 glReadPixels 逐行填充，既溢出 PBO
@@ -251,7 +273,8 @@ public class RenderpearlRamPipeline implements VideoPipeline {
                 this.encoder.copyTextureToBuffer(this.chromaTexture, writeBuffer, (long) width * height, () -> {}, 0);
             } finally {
                 GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, prevPackAlignment);
-            }*/
+            }
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_COPY, copyStart);*/
             //? }
             // 3. 读取并映射上一个 PBO (已完成 GPU-CPU DMA 传输)，就地投递至 Channel
             int readIdx = 1 - writeIdx;
@@ -260,23 +283,53 @@ public class RenderpearlRamPipeline implements VideoPipeline {
                 GpuBuffer readBuffer = pboBuffers[readIdx];
                 if (readBuffer != null && !readBuffer.isClosed()) {
                     //? if vulkan_backend {
-                    try (GpuBufferSlice.MappedView mappedView = readBuffer.map(true, false)) {
-                        if (mappedView != null) {
+                    long mapStart = CaptureProfiler.begin();
+                    GpuBufferSlice.MappedView mappedView = readBuffer.map(true, false);
+                    CaptureProfiler.end(CaptureProfiler.Stage.RAM_MAP, mapStart);
+                    if (mappedView != null) {
+                        try {
                             ByteBuffer data = mappedView.data();
                             if (data != null) {
-                                channel.pushSystemFrame(data);
-                                delivered = true;
+                                long pushStart = CaptureProfiler.begin();
+                                try {
+                                    channel.pushSystemFrame(data);
+                                    delivered = true;
+                                } finally {
+                                    CaptureProfiler.end(CaptureProfiler.Stage.RAM_PUSH, pushStart);
+                                }
+                            }
+                        } finally {
+                            long unmapStart = CaptureProfiler.begin();
+                            try {
+                                mappedView.close();
+                            } finally {
+                                CaptureProfiler.end(CaptureProfiler.Stage.RAM_UNMAP, unmapStart);
                             }
                         }
                     }
                     //? } else {
                     /*// 26.1 的映射入口在 CommandEncoder 上，视图嵌套类型也不同
-                    try (GpuBuffer.MappedView mappedView = this.encoder.mapBuffer(readBuffer, true, false)) {
-                        if (mappedView != null) {
+                    long mapStart = CaptureProfiler.begin();
+                    GpuBuffer.MappedView mappedView = this.encoder.mapBuffer(readBuffer, true, false);
+                    CaptureProfiler.end(CaptureProfiler.Stage.RAM_MAP, mapStart);
+                    if (mappedView != null) {
+                        try {
                             ByteBuffer data = mappedView.data();
                             if (data != null) {
-                                channel.pushSystemFrame(data);
-                                delivered = true;
+                                long pushStart = CaptureProfiler.begin();
+                                try {
+                                    channel.pushSystemFrame(data);
+                                    delivered = true;
+                                } finally {
+                                    CaptureProfiler.end(CaptureProfiler.Stage.RAM_PUSH, pushStart);
+                                }
+                            }
+                        } finally {
+                            long unmapStart = CaptureProfiler.begin();
+                            try {
+                                mappedView.close();
+                            } finally {
+                                CaptureProfiler.end(CaptureProfiler.Stage.RAM_UNMAP, unmapStart);
                             }
                         }
                     }*/

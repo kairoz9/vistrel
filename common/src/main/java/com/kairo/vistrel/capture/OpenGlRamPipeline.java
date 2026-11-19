@@ -247,18 +247,40 @@ public class OpenGlRamPipeline implements VideoPipeline {
 
     @Override
     public CaptureOutcome capture() {
+        long startNanos = CaptureProfiler.begin();
+        try {
+            return captureInternal();
+        } finally {
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_TOTAL, startNanos);
+        }
+    }
+
+    private CaptureOutcome captureInternal() {
+        long prepStart = CaptureProfiler.begin();
         if (samplerObjectId == 0 || lumaFboIds[0] == 0 || chromaFboIds[0] == 0 || channel == null) {
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_PREP, prepStart);
             return CaptureOutcome.Failed;
         }
 
         Minecraft mc = Minecraft.getInstance();
         RenderTarget mainTarget = mc.getMainRenderTarget();
-        if (mainTarget == null) return CaptureOutcome.Failed;
+        if (mainTarget == null) {
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_PREP, prepStart);
+            return CaptureOutcome.Failed;
+        }
         var window = mc.getWindow();
-        if (window == null) return CaptureOutcome.Failed;
+        if (window == null) {
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_PREP, prepStart);
+            return CaptureOutcome.Failed;
+        }
         int windowWidth = window.getWidth();
         int windowHeight = window.getHeight();
-        if (windowWidth <= 0 || windowHeight <= 0) return CaptureOutcome.Failed;
+        if (windowWidth <= 0 || windowHeight <= 0) {
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_PREP, prepStart);
+            return CaptureOutcome.Failed;
+        }
+        CaptureProfiler.end(CaptureProfiler.Stage.RAM_PREP, prepStart);
+        long stateSaveStart = CaptureProfiler.begin();
         // 本管线绕过 GlStateManager 直改全局绑定，而游戏对 VAO/Program/Texture 均有「相同即跳过重绑」
         // 的状态缓存：离开时必须把每个动过的绑定恢复原值，否则游戏后续绘制会跳过重绑，
         // 逐帧报 GL_INVALID_OPERATION
@@ -286,6 +308,7 @@ public class OpenGlRamPipeline implements VideoPipeline {
         GlStateManager._disableBlend();
         GlStateManager._disableCull();
         GL11.glDisable(GL30.GL_FRAMEBUFFER_SRGB);
+        CaptureProfiler.end(CaptureProfiler.Stage.RAM_STATE_SAVE, stateSaveStart);
 
         try {
             // 1. 直采主画面颜色纹理：缩放由采样器的线性过滤完成*/
@@ -319,6 +342,7 @@ public class OpenGlRamPipeline implements VideoPipeline {
 /*            int cur = currentPboIndex;
 
             // 2. 两趟自建 pass：全分辨率亮度 + 半分辨率色度
+            long stageStart = CaptureProfiler.begin();
             GL13.glActiveTexture(GL13.GL_TEXTURE0);
             GL11.glBindTexture(GL11.GL_TEXTURE_2D, sourceTexture);
             GL33.glBindSampler(0, samplerObjectId);
@@ -328,7 +352,9 @@ public class OpenGlRamPipeline implements VideoPipeline {
             GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, lumaFboIds[cur]);
             GL11.glViewport(0, 0, width, height);
             GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, 3);
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_BLIT_Y, stageStart);
 
+            stageStart = CaptureProfiler.begin();
             GL30.glUseProgram(chromaProgramId);
             GL20.glUniform1i(chromaSamplerLoc, 0);
             // 色度目标每纹素覆盖 2 个采集像素：缩小方向才需要四采样拼出面积核，
@@ -339,10 +365,12 @@ public class OpenGlRamPipeline implements VideoPipeline {
             GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, 3);
             GL30.glBindVertexArray(0);
             GL30.glUseProgram(0);
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_BLIT_UV, stageStart);
 
             // 3. 异步 DMA 回读到当前写入 PBO：Y 在偏移 0、UV 紧跟其后
             // 原版取画面缩略图的路径会把 PACK_ROW_LENGTH 留成窗口宽度且不恢复：
             // 行跨距一旦偏离本次读取宽度，UV 平面就会越过 PBO 容量，驱动判非法并熔断拷贝引擎
+            long readbackStart = CaptureProfiler.begin();
             GL11.glPixelStorei(GL11.GL_PACK_ROW_LENGTH, 0);
             GL11.glPixelStorei(GL11.GL_PACK_SKIP_ROWS, 0);
             GL11.glPixelStorei(GL11.GL_PACK_SKIP_PIXELS, 0);
@@ -356,6 +384,7 @@ public class OpenGlRamPipeline implements VideoPipeline {
             GL11.glReadPixels(0, 0, width / 2, height / 2, GL30.GL_RG, GL11.GL_UNSIGNED_BYTE, (long) width * height);
             // 围栏标记本次 DMA 提交点，供下一帧无等待探询是否已完成
             readFences[cur] = GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_READBACK, readbackStart);
 
             // 4. 读取并映射上一个 PBO (已完成 DMA 传输)，投递至 Channel 后就地 unmap
             int readPboIndex = 1 - cur;
@@ -364,21 +393,35 @@ public class OpenGlRamPipeline implements VideoPipeline {
             boolean transferDone = true;
             long fence = readFences[readPboIndex];
             if (fence != 0) {
+                long fenceStart = CaptureProfiler.begin();
                 int status = GL32.glClientWaitSync(fence, 0, 0);
                 GL32.glDeleteSync(fence);
                 readFences[readPboIndex] = 0;
                 transferDone = status == GL32.GL_ALREADY_SIGNALED || status == GL32.GL_CONDITION_SATISFIED;
+                CaptureProfiler.end(CaptureProfiler.Stage.RAM_FENCE, fenceStart);
             }
             if (hasPreviousFrame && transferDone) {
                 int readPbo = pboIds[readPboIndex];
                 GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, readPbo);
+                long mapStart = CaptureProfiler.begin();
                 ByteBuffer mapped = GL30.glMapBufferRange(GL21.GL_PIXEL_PACK_BUFFER, 0, frameBytes, GL30.GL_MAP_READ_BIT);
+                CaptureProfiler.end(CaptureProfiler.Stage.RAM_MAP, mapStart);
                 if (mapped != null) {
                     try {
-                        channel.pushSystemFrame(mapped);
-                        delivered = true;
+                        long pushStart = CaptureProfiler.begin();
+                        try {
+                            channel.pushSystemFrame(mapped);
+                            delivered = true;
+                        } finally {
+                            CaptureProfiler.end(CaptureProfiler.Stage.RAM_PUSH, pushStart);
+                        }
                     } finally {
-                        GL15.glUnmapBuffer(GL21.GL_PIXEL_PACK_BUFFER);
+                        long unmapStart = CaptureProfiler.begin();
+                        try {
+                            GL15.glUnmapBuffer(GL21.GL_PIXEL_PACK_BUFFER);
+                        } finally {
+                            CaptureProfiler.end(CaptureProfiler.Stage.RAM_UNMAP, unmapStart);
+                        }
                     }
                 }
             }
@@ -390,6 +433,7 @@ public class OpenGlRamPipeline implements VideoPipeline {
             Constants.LOG.error("OpenGlRamPipeline.capture 异常: {}", t.getMessage());
             return CaptureOutcome.Failed;
         } finally {
+            long restoreStart = CaptureProfiler.begin();
             if (scissorWasEnabled) GlStateManager._enableScissorTest();
             if (blendWasEnabled) GlStateManager._enableBlend();
             if (cullWasEnabled) GlStateManager._enableCull();
@@ -409,6 +453,7 @@ public class OpenGlRamPipeline implements VideoPipeline {
             GL11.glBindTexture(GL11.GL_TEXTURE_2D, prevTexture0);
             GL13.glActiveTexture(prevActiveTexture);
             GL11.glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_STATE_RESTORE, restoreStart);
         }
     }
 

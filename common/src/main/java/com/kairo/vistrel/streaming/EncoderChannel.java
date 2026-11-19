@@ -141,8 +141,9 @@ public interface EncoderChannel {
      *
      * <p>
      * 布局：{@code [0..32) = busy[8] int 位}（1 = Java 已认领且未归还）、
-     * {@code [32..40) = heartbeat long}。访问走 acquire/release 语义，
-     * 块随引擎实例换代——每次构建显存管线时取一次，不得缓存跨引擎复用。
+     * {@code [32..40) = heartbeat long}、{@code [40..48) = stage long}
+     * （编码线程最后进入的阶段码，停滞日志据此定位卡点）。访问走 acquire/release
+     * 语义，块随引擎实例换代——每次构建显存管线时取一次，不得缓存跨引擎复用。
      *
      * @return DirectBuffer；引擎未运行或不支持显存直通时为 null
      */

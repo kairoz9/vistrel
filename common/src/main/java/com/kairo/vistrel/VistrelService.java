@@ -126,13 +126,13 @@ public final class VistrelService {
 
         try {
             VistrelConfig cfg = Objects.requireNonNull(config.get(), "配置视图求值结果不能为空");
-            // 1. 探测硬件直通能力（由编码能力快照里的实际后端派生）
-            boolean vramDirectSupported = cfg.vramDirect() && supportsVramDirect(encoder.caps());
-            // 2. 显式组装并唤醒视频调度器与音频环回会话
-            VideoCaptureScheduler videoScheduler = new VideoCaptureScheduler(encoder, vramDirectSupported);
+            // 1. 组装采集调度器：显存直通能力延迟到会话建立时求值
+            VideoCaptureScheduler videoScheduler =
+                    new VideoCaptureScheduler(encoder, () -> cfg.vramDirect() && supportsVramDirect(encoder.caps()));
             // 编码线程停滞时由显存管线心跳超时触发，整套推流服务自动重启自愈
             videoScheduler.setEncoderStallListener(() -> autoRestartEngine(videoScheduler));
             activeVideoScheduler = videoScheduler;
+            // 2. 唤醒音频环回会话
             AudioCaptureScheduler audioScheduler = new AudioCaptureScheduler(encoder);
             activeAudioScheduler = audioScheduler;
             // 3. 构造输入注入器（平台适配器的版本差异在此单点选择）；光标内缝在此转统一事件
@@ -423,27 +423,30 @@ public final class VistrelService {
      * 客户端 tick 回调（由各加载器的客户端 tick 事件触发，20Hz）
      */
     public static void onClientTick() {
-        // 空闲期绝对静默：无活跃会话时连采样都不做
         ProfileCoordinator profileCoordinator = activeProfileCoordinator;
-        if (profileCoordinator != null && isStreaming()) {
-            Minecraft mc = Minecraft.getInstance();
-            if (mc == null || mc.getWindow() == null) {
-                return;
-            }
-            int width = mc.getWindow().getWidth();
-            int height = mc.getWindow().getHeight();
-            int configFps = mc.options.framerateLimit().get();
-            boolean vsync = mc.options.enableVsync().get();
-            //? if >=26.3 {
-            com.mojang.blaze3d.platform.VideoMode videoMode = mc.getWindow().getActiveVideoMode();
-            int refreshHz = videoMode != null ? Math.round(videoMode.getRefreshRate()) : 0;
-            //? } else {
-            /*int refreshHz = mc.getWindow().getRefreshRate();*/
-            //? }
-            profileCoordinator.onContentSnapshot(
-                    new ContentSnapshot(width, height, configFps, vsync, refreshHz),
-                    System.nanoTime()
-            );
+        if (profileCoordinator == null) {
+            return;
+        }
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || mc.getWindow() == null) {
+            return;
+        }
+        int width = mc.getWindow().getWidth();
+        int height = mc.getWindow().getHeight();
+        int configFps = mc.options.framerateLimit().get();
+        boolean vsync = mc.options.enableVsync().get();
+        //? if >=26.3 {
+        com.mojang.blaze3d.platform.VideoMode videoMode = mc.getWindow().getActiveVideoMode();
+        int refreshHz = videoMode != null ? Math.round(videoMode.getRefreshRate()) : 0;
+        //? } else {
+        /*int refreshHz = mc.getWindow().getRefreshRate();*/
+        //? }
+        ContentSnapshot snapshot = new ContentSnapshot(width, height, configFps, vsync, refreshHz);
+        if (isStreaming()) {
+            profileCoordinator.onContentSnapshot(snapshot, System.nanoTime());
+        } else {
+            // 无会话只种子快照：纯 Java 读取，不碰采集/输入/JNI，让 offer 按真实内容规划
+            profileCoordinator.seedContentSnapshot(snapshot);
         }
     }
 

@@ -5,6 +5,7 @@ import com.kairo.vistrel.streaming.EncoderChannel;
 import com.kairo.vistrel.streaming.SessionServer.SessionState;
 import net.minecraft.client.Minecraft;
 import java.util.Objects;
+import java.util.function.BooleanSupplier;
 
 /**
  * 视频渲染捕获总调度器
@@ -18,7 +19,10 @@ import java.util.Objects;
  */
 public class VideoCaptureScheduler {
     private final EncoderChannel channel;
-    private final boolean vramDirectEnabled;
+    /**
+     * 显存直通能力判定：每次会话变更时求值一次
+     */
+    private final BooleanSupplier vramDirectAllowed;
     private final FramePacingThrottler throttler;
     /**
      * 采集状态（仅渲染线程读写，与 capture 同线程串行）：IDLE ⇄ CAPTURING 由会话广播
@@ -52,23 +56,44 @@ public class VideoCaptureScheduler {
     }
 
     /**
-     * 生产构造：以 60fps 节拍器初始化
+     * 固定开关构造：以 60fps 节拍器初始化
      *
      * @param channel           数据面通道，采集帧经它投递
-     * @param vramDirectEnabled 是否允许显存直通（由配置开关与编码后端能力共同裁定）；
-     *                          false 时恒定走 RAM 回读管线，true 时显存管线构建失败
-     *                          仍会在运行期永久降级到 RAM
+     * @param vramDirectEnabled 是否允许显存直通；false 时恒定走 RAM 回读管线，
+     *                          true 时显存管线构建失败仍会在运行期永久降级到 RAM
      */
     public VideoCaptureScheduler(EncoderChannel channel, boolean vramDirectEnabled) {
-        this(channel, vramDirectEnabled, new FramePacingThrottler(60));
+        this(channel, () -> vramDirectEnabled, new FramePacingThrottler(60));
     }
 
     /**
-     * 测试装配构造：节流器注入（经它编排虚拟时间）
+     * 固定开关构造：节流器注入（经它编排虚拟时间）
      */
     public VideoCaptureScheduler(EncoderChannel channel, boolean vramDirectEnabled, FramePacingThrottler throttler) {
+        this(channel, () -> vramDirectEnabled, throttler);
+    }
+
+    /**
+     * 生产构造：以 60fps 节拍器初始化，显存直通能力延迟求值
+     *
+     * @param channel           数据面通道，采集帧经它投递
+     * @param vramDirectAllowed 显存直通能力判定；每次会话变更时求值一次。调用方须保证
+     *                          Native 编码能力探测已完成（首次启动的构造期 caps 仍为空）
+     */
+    public VideoCaptureScheduler(EncoderChannel channel, BooleanSupplier vramDirectAllowed) {
+        this(channel, vramDirectAllowed, new FramePacingThrottler(60));
+    }
+
+    /**
+     * 测试装配构造：能力判定与节流器均注入
+     */
+    public VideoCaptureScheduler(
+            EncoderChannel channel,
+            BooleanSupplier vramDirectAllowed,
+            FramePacingThrottler throttler
+    ) {
         this.channel = channel;
-        this.vramDirectEnabled = vramDirectEnabled;
+        this.vramDirectAllowed = Objects.requireNonNull(vramDirectAllowed, "显存直通能力判定不能为空");
         this.throttler = Objects.requireNonNull(throttler, "节流器不能为空");
     }
 
@@ -92,7 +117,7 @@ public class VideoCaptureScheduler {
     /**
      * 会话广播主入口（经 {@code ProfileCoordinator} 的监听回调触发）：把生效档位同步给
      * 节拍器，并在渲染线程上按档位重建 / 降级采集管线；TORN_DOWN 之后才落地的
-     * 重建任务一律拒绝（管线必须保持已释放，泄漏防线）
+     * 重建任务一律拒绝（管线必须保持已释放，泄漏防线）。
      */
     public void onSessionChanged(SessionState session) {
         if (session.active() && session.fps() > 0) {
@@ -113,8 +138,11 @@ public class VideoCaptureScheduler {
                 return;
             }
             this.state = CaptureState.CAPTURING;
-            // 只变了帧率：尺寸没变且管线还在，直接复用（暂停后管线已释放，自然不会命中）
-            boolean vramSettled = !vramDirectEnabled || vramPipeline != null || vramBreaker.isTripped();
+            boolean vramDirectEnabled = resolveVramDirect();
+            // 只变了帧率：尺寸没变且管线还在，直接复用（暂停后管线已释放，自然不会命中）；
+            // 能力从 false 变 true 时必须重建
+            boolean vramSettled =
+                    vramDirectEnabled ? vramPipeline != null || vramBreaker.isTripped() : vramPipeline == null;
             if (width == pipelineWidth && height == pipelineHeight && ramPipeline != null && vramSettled) {
                 return;
             }
@@ -131,7 +159,7 @@ public class VideoCaptureScheduler {
                 Constants.LOG.error("构建 RAM 回读管道异常: {}", t.getMessage(), t);
             }
             // 2. 构造期就定死显存直通 (VRAM Direct) 能不能用：失败即永久降级，本次会话不再重试
-            if (this.vramDirectEnabled && !this.vramBreaker.isTripped()) {
+            if (vramDirectEnabled && !this.vramBreaker.isTripped()) {
                 try {
                     this.vramPipeline = createVramPipeline(width, height);
                     if (this.vramPipeline == null) {
@@ -146,6 +174,18 @@ public class VideoCaptureScheduler {
             this.pipelineWidth = width;
             this.pipelineHeight = height;
         });
+    }
+
+    /**
+     * 读取显存直通能力：失败按禁用处理，绝不让 JNI 能力查询异常掀翻渲染线程
+     */
+    private boolean resolveVramDirect() {
+        try {
+            return this.vramDirectAllowed.getAsBoolean();
+        } catch (Throwable t) {
+            Constants.LOG.error("读取显存直通能力失败，按禁用处理: {}", t.getMessage());
+            return false;
+        }
     }
 
     /**
@@ -192,12 +232,23 @@ public class VideoCaptureScheduler {
      */
     public boolean capture() {
         if (this.state != CaptureState.CAPTURING) {
+            CaptureProfiler.count(CaptureProfiler.Counter.SCHEDULER_IDLE);
             return false;
         }
 
         if (!throttler.shouldCapture()) {
+            CaptureProfiler.count(CaptureProfiler.Counter.SCHEDULER_THROTTLED);
             return false;
         }
+        long startNanos = CaptureProfiler.begin();
+        try {
+            return dispatchCapture();
+        } finally {
+            CaptureProfiler.end(CaptureProfiler.Stage.SCHEDULER_CAPTURE, startNanos);
+        }
+    }
+
+    private boolean dispatchCapture() {
         // Level 1: 显存直通 (VRAM Direct)
         if (vramPipeline != null) {
             VideoPipeline.CaptureOutcome outcome;
@@ -212,19 +263,33 @@ public class VideoCaptureScheduler {
             }
             switch (outcome) {
                 case Delivered:
+                    CaptureProfiler.count(CaptureProfiler.Counter.VRAM_DELIVERED);
                     return true;
                 case Dropped:
                     // 主动丢帧（槽位全在途 / 首帧预热）：管线健康，本帧直接跳过
+                    CaptureProfiler.count(CaptureProfiler.Counter.VRAM_DROPPED);
                     return false;
                 case Failed:
+                    CaptureProfiler.count(CaptureProfiler.Counter.VRAM_FAILED);
                     break;
             }
         }
         // Level 2: 内存回读 (RAM Readback)
         if (ramPipeline != null) {
-            return captureRamSafely() == VideoPipeline.CaptureOutcome.Delivered;
+            VideoPipeline.CaptureOutcome outcome = captureRamSafely();
+            if (outcome == VideoPipeline.CaptureOutcome.Delivered) {
+                CaptureProfiler.count(CaptureProfiler.Counter.RAM_DELIVERED);
+                return true;
+            }
+            CaptureProfiler.count(
+                    outcome == VideoPipeline.CaptureOutcome.Dropped
+                    ? CaptureProfiler.Counter.RAM_DROPPED
+                    : CaptureProfiler.Counter.RAM_FAILED
+            );
+            return false;
         }
 
+        CaptureProfiler.count(CaptureProfiler.Counter.SCHEDULER_NO_PIPELINE);
         return false;
     }
 
@@ -247,6 +312,7 @@ public class VideoCaptureScheduler {
      */
     private void demoteVram(String reason) {
         this.vramBreaker.trip();
+        CaptureProfiler.count(CaptureProfiler.Counter.VRAM_DEMOTED);
         Constants.LOG.warn("显存直通 (VRAM Direct) 永久降级到 RAM 回读: {}", reason);
         if (this.vramPipeline != null) {
             try {

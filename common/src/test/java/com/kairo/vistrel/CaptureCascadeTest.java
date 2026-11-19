@@ -284,6 +284,54 @@ public class CaptureCascadeTest {
     }
 
     @Test
+    void testVramCapabilityEvaluatedOnSessionChangeNotConstruction() {
+        FakeEncoderChannel channel = new FakeEncoderChannel();
+        FakeClock clock = new FakeClock();
+        boolean[] capsReady = {false};
+        int[] evaluations = {0};
+        List<FakePipeline> createdVrams = new ArrayList<>();
+        List<FakePipeline> createdRams = new ArrayList<>();
+
+        VideoCaptureScheduler capture =
+                new VideoCaptureScheduler(channel, () -> {
+            evaluations[0]++;
+            return capsReady[0];
+        }, new FramePacingThrottler(60, clock)) {
+            @Override
+            protected VideoPipeline createVramPipeline(int width, int height) {
+                FakePipeline p = new FakePipeline(width, height, true, null);
+                createdVrams.add(p);
+                return p;
+            }
+
+            @Override
+            protected VideoPipeline createRamPipeline(int width, int height) {
+                FakePipeline p = new FakePipeline(width, height, true, null);
+                createdRams.add(p);
+                return p;
+            }
+        };
+        Assertions.assertEquals(0, evaluations[0], "显存直通能力不得在构造期求值");
+
+        SessionState session = new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.1, "H264");
+        capture.onSessionChanged(session);
+        Assertions.assertEquals(1, evaluations[0], "首次会话变更时求值一次");
+        Assertions.assertEquals(0, createdVrams.size(), "能力未就绪时不得尝试显存管线");
+        Assertions.assertEquals(1, createdRams.size(), "应保留 RAM 兜底管线");
+
+        capsReady[0] = true;
+        capture.onSessionChanged(session);
+        Assertions.assertEquals(2, evaluations[0], "后续会话变更必须重新求值");
+        Assertions.assertEquals(1, createdVrams.size(), "能力就绪后必须启用显存直通");
+        Assertions.assertEquals(1, createdRams.get(0).closeCalls, "旧 RAM 管线应在重建时释放");
+        Assertions.assertEquals(2, createdRams.size(), "启用显存直通后仍保留 RAM 兜底");
+
+        Assertions.assertTrue(capture.capture(), "显存管线启用后应投递");
+        Assertions.assertEquals(1, createdVrams.get(0).captureCalls);
+        Assertions.assertEquals(0, createdRams.get(1).captureCalls);
+    }
+
+    @Test
     void testNoSessionSkipsEntireCapture() {
         FakeEncoderChannel channel = new FakeEncoderChannel();
         channel.streaming = false;
