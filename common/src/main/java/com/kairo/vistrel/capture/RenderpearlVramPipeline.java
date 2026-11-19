@@ -310,8 +310,8 @@ public class RenderpearlVramPipeline implements VideoPipeline {
      * @param onEncoderStall 编码停滞自愈回调，不得为 {@code null}；心跳超时判定在渲染线程
      *                       触发一次，实现方必须立即移交后台线程，回调内不得做任何显存操作
      * @throws IllegalArgumentException channel 或回调为 {@code null}
-     * @throws IllegalStateException    槽位所有权块缺失、GpuDevice 不可用或后端非 Vulkan，
-     *                                  调用方据此降级 RAM 回读管线
+     * @throws IllegalStateException    槽位所有权块缺失、GpuDevice 不可用、后端非 Vulkan
+     *                                  或翻转 blit 管线预编译失败，调用方据此降级 RAM 回读管线
      * @throws RuntimeException         槽位资源创建 / 句柄导出 / 整批注册任一环节失败
      *                                  （失败路径已清理已建资源）
      */
@@ -371,6 +371,9 @@ public class RenderpearlVramPipeline implements VideoPipeline {
         int textureUsage = GpuTexture.USAGE_RENDER_ATTACHMENT | GpuTexture.USAGE_COPY_SRC;
 
         try {
+            if (!ensureFlipPipeline()) {
+                throw new IllegalStateException("翻转 blit 管线预编译失败");
+            }
             // 1. 创建携带 VkExportMemoryAllocateInfoKHR 的专用 VmaPool
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkImageCreateInfo testImgInfo = VkImageCreateInfo
@@ -625,8 +628,8 @@ public class RenderpearlVramPipeline implements VideoPipeline {
     }
 
     /**
-     * 逐帧预热翻转 blit 管线：命中即查表（26.1/26.2 的设备缓存会被资源重载清空，逐帧补种自愈）；
-     * 失败即锁定降级，不逐帧重试
+     * 编译/预热翻转 blit 管线：构造期首编，逐帧命中即查表
+     * （26.1/26.2 的设备缓存会被资源重载清空，逐帧补种自愈）；失败即锁定降级，不逐帧重试
      */
     private boolean ensureFlipPipeline() {
         if (flipCompileFailed) {
@@ -777,6 +780,16 @@ public class RenderpearlVramPipeline implements VideoPipeline {
     }
 
     private void cleanupResources() {
+        //? if renderpearl_era {
+        // 编译缓存先于显存资源释放
+        if (this.flipCache != null) {
+            try {
+                this.flipCache.close();
+            } catch (Throwable ignored) {
+            }
+            this.flipCache = null;
+        }
+        //? }
         if (vulkanDevice != null && vulkanDevice.graphicsQueue() != null) {
             try {
                 vulkanDevice.graphicsQueue().waitIdle();
@@ -849,12 +862,6 @@ public class RenderpearlVramPipeline implements VideoPipeline {
 
     @Override
     public void close() {
-        //? if renderpearl_era {
-        if (this.flipCache != null) {
-            this.flipCache.close();
-            this.flipCache = null;
-        }
-        //? }
         cleanupResources();
     }
 }
