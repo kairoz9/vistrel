@@ -41,7 +41,9 @@ use cudarc::driver::{CudaContext, CudaStream};
 #[cfg(test)]
 use crate::encode::encoder::BackendStageTimings;
 use crate::encode::encoder::{EncodeBackendKind, VideoEncodeBackend};
-use crate::encode::hardware::slots::{ActorStage, SlotStateBlock, SlotTable, VramSlotDescriptor};
+use crate::encode::hardware::slots::{
+    ActorStage, SlotStateBlock, SlotTable, VramSlotDescriptor, ensure_batch_geometry,
+};
 use crate::encode::pool::{HOST_SLOT_BYTES, HostBlock, POOL_DEPTH};
 use crate::encode::{FramePayload, StreamingProfile};
 
@@ -316,6 +318,11 @@ impl VideoEncodeBackend for NvencBackend {
         if descriptors.is_empty() {
             return Err("待导入显存描述符列表为空".to_string());
         }
+
+        // 几何核验先于任何状态变更：不符批次整批拒绝时既有槽位表原样保留，
+        // 与 import_all 的全成全败同层
+        let profile = self.session.profile();
+        ensure_batch_geometry(descriptors, profile.width() as u32, profile.height() as u32)?;
 
         // 阶段零：整表清空——注册句柄先归还再释放 CUarray，否则驱动会拿着已销毁的
         // 显存去注销。只清槽位：系统内存输入缓冲不经注册表，不受影响。

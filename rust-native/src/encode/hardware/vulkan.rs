@@ -23,7 +23,9 @@ mod vram_slot;
 #[cfg(test)]
 use crate::encode::encoder::BackendStageTimings;
 use crate::encode::encoder::{EncodeBackendKind, VideoEncodeBackend};
-use crate::encode::hardware::slots::{SlotStateBlock, SlotTable, VramSlotDescriptor};
+use crate::encode::hardware::slots::{
+    SlotStateBlock, SlotTable, VramSlotDescriptor, ensure_batch_geometry,
+};
 use crate::encode::pool::{HOST_SLOT_BYTES, HostBlock, POOL_DEPTH};
 use crate::encode::{FramePayload, StreamingProfile, display_nv12_len};
 
@@ -302,15 +304,7 @@ impl VideoEncodeBackend for VulkanVideoBackend {
         // 会越界读显存。这里在注册期一次拦下，让采集侧直接降级到 CPU 回读，而不是逐帧
         // 失败 30 次后被断路器踢掉——后者会让第一秒的画面白丢
         let extent = self.encoder.extent();
-        if let Some(desc) = descriptors
-            .iter()
-            .find(|d| d.width != extent.width || d.height != extent.height)
-        {
-            return Err(format!(
-                "槽位 {} 尺寸 {}x{} 与编码尺寸 {}x{} 不一致：生产侧需按 coded 尺寸建纹理",
-                desc.slot_idx, desc.width, desc.height, extent.width, extent.height
-            ));
-        }
+        ensure_batch_geometry(descriptors, extent.width, extent.height)?;
         // 先克隆句柄再借 slots：`VideoDevice` 只是 Arc 计数 +1，两个字段的借用因此不重叠
         let device = self.device.clone();
         self.slots

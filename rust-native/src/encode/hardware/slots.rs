@@ -118,6 +118,30 @@ impl Drop for VramSlotDescriptor {
     }
 }
 
+/// 显存槽位导入的公共不变量：整批纹理几何必须与编码器输入尺寸一致
+///
+/// 各后端在导入期以自己的参照尺寸调用本函数，并在任何状态变更之前整批拒绝
+/// 不符批次，让尺寸不符在注册期即以逐槽可诊断的错误拦下，而不是等到逐帧
+/// 编码时才失败。参照尺寸由后端自供——NVENC 为会话显示尺寸（无设备粒度
+/// 对齐），Vulkan 为 coded extent（纵向可能按对齐填充，如 1080 建成 1088）。
+pub(crate) fn ensure_batch_geometry(
+    descriptors: &[VramSlotDescriptor],
+    expected_width: u32,
+    expected_height: u32,
+) -> Result<(), String> {
+    if let Some(desc) = descriptors
+        .iter()
+        .find(|d| d.width != expected_width || d.height != expected_height)
+    {
+        return Err(format!(
+            "槽位 {} 尺寸 {}x{} 与编码器输入尺寸 {}x{} 不一致：\
+             显存直通要求生产侧按编码器输入尺寸建纹理",
+            desc.slot_idx, desc.width, desc.height, expected_width, expected_height
+        ));
+    }
+    Ok(())
+}
+
 /// 专为显存槽位设计的轻量事务容器 (All-or-Nothing Transactional Registry)
 ///
 /// 槽位索引是连续的小整数，直接按下标存进 `Vec<Option<S>>`：省掉 HashMap 的哈希开销，
@@ -362,6 +386,34 @@ mod tests {
         assert_eq!(batch[0].height, 1080);
         assert_eq!(batch[0].size_bytes, 3110400);
         assert_eq!(batch[0].offset, 0);
+    }
+
+    fn geo_desc(slot_idx: u32, width: u32, height: u32) -> VramSlotDescriptor {
+        VramSlotDescriptor {
+            slot_idx,
+            mem_handle: -1,
+            sem_handle: -1,
+            width,
+            height,
+            size_bytes: 0,
+            offset: 0,
+            handles_taken: true,
+        }
+    }
+
+    /// 几何不变量：相符整批放行、任一不符整批拒绝且错误指认首个不符槽位、
+    /// 空批放行（空批由调用方的空检查拒绝，不归本函数管）
+    #[test]
+    fn test_ensure_batch_geometry() {
+        assert!(ensure_batch_geometry(&[], 1920, 1080).is_ok());
+
+        let ok = vec![geo_desc(0, 1920, 1080), geo_desc(1, 1920, 1080)];
+        assert!(ensure_batch_geometry(&ok, 1920, 1080).is_ok());
+
+        let bad = vec![geo_desc(0, 1920, 1080), geo_desc(2, 1280, 720)];
+        let err = ensure_batch_geometry(&bad, 1920, 1080).unwrap_err();
+        assert!(err.contains("槽位 2"), "错误必须指认首个不符槽位: {err}");
+        assert!(err.contains("1280x720") && err.contains("1920x1080"));
     }
 
     #[test]
