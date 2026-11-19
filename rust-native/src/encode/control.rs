@@ -6,6 +6,7 @@
 //! 管线死亡时通过 Channel Drop 实现 0ms fail-closed 应答。
 
 use crate::encode::StreamingProfile;
+use crate::encode::encoder::EncodeBackendKind;
 use crate::encode::hardware::slots::VramSlotDescriptor;
 use std::sync::Arc;
 use std::sync::mpsc::{RecvTimeoutError, SyncSender};
@@ -60,16 +61,20 @@ pub(crate) enum ControlCommand {
     Shutdown,
     /// 设置跟随码率
     BitrateChange(usize),
-    /// 重配档位，回送实际生效的档位或拒绝原因
+    /// 重配档位，回送实际生效的档位与当时后端身份或拒绝原因；
+    /// 后端 None 表示编码器尚未就绪的纯采纳态（会话建立前不可达）
     ProfileChange {
         profile: StreamingProfile,
-        reply: tokio::sync::oneshot::Sender<Result<StreamingProfile, ControlStatus>>,
+        reply: tokio::sync::oneshot::Sender<
+            Result<(StreamingProfile, Option<EncodeBackendKind>), ControlStatus>,
+        >,
     },
-    /// 按已确立的档位与后端偏好配好编码器
+    /// 按已确立的档位与后端偏好配好编码器，回送实际后端身份或拒绝原因——
+    /// 偏好硬编但构建失败静默回退软编时，Ok 携带的是软编而非偏好值
     PrepareEncoder {
         profile: StreamingProfile,
         prefer_hardware: bool,
-        reply: tokio::sync::oneshot::Sender<ControlStatus>,
+        reply: tokio::sync::oneshot::Sender<Result<EncodeBackendKind, ControlStatus>>,
     },
     /// 导入显存直通槽位
     ImportVramSlots {
@@ -138,13 +143,14 @@ impl ControlSender {
 
     /// 请求重配档位（ask）
     ///
-    /// `Ok` 是 Actor **实际生效**的档位：调用方提交 Actor 说的准，而不是「成功就假定请求
-    /// 生效、失败就回读旧值」这套两阶段推断。`Err(ReconfigureFailed)` 表示 Actor 拒绝了
-    /// 这次重配、维持原档位；其余错误码表示命令没送达或应答超时，调用方同样维持已知档位。
+    /// `Ok` 是 Actor **实际生效**的档位与当时后端身份：调用方提交 Actor 说的准，而不是
+    /// 「成功就假定请求生效、失败就回读旧值」这套两阶段推断。后端 `None` 表示编码器
+    /// 尚未就绪的纯采纳态。`Err(ReconfigureFailed)` 表示 Actor 拒绝了这次重配、维持
+    /// 原档位；其余错误码表示命令没送达或应答超时，调用方同样维持已知档位。
     pub(crate) async fn change_profile(
         &self,
         profile: StreamingProfile,
-    ) -> Result<StreamingProfile, ControlStatus> {
+    ) -> Result<(StreamingProfile, Option<EncodeBackendKind>), ControlStatus> {
         let (reply, wait) = tokio::sync::oneshot::channel();
         self.send(ControlCommand::ProfileChange { profile, reply })
             .map_err(Self::send_error)?;
@@ -158,11 +164,12 @@ impl ControlSender {
     /// 按档位把编码器配好（ask）
     ///
     /// 命令名说的是编码段**自己的**动作：Actor 不知道什么叫会话，新会话接入、顶号、
-    /// 预热都走这一条。`Ok(())` 才代表「编码器已按该档位就绪」，调用方不必靠猜。
+    /// 预热都走这一条。`Ok(kind)` 才代表「编码器已按该档位就绪」，且 kind 是实际建成
+    /// 的后端身份——偏好硬编失败回退软编时携带的是软编，调用方不必靠猜。
     pub(crate) async fn prepare_encoder(
         &self,
         profile: StreamingProfile,
-    ) -> Result<(), ControlStatus> {
+    ) -> Result<EncodeBackendKind, ControlStatus> {
         let (reply, wait) = tokio::sync::oneshot::channel();
         self.send(ControlCommand::PrepareEncoder {
             profile,
@@ -171,7 +178,7 @@ impl ControlSender {
         })
         .map_err(Self::send_error)?;
         match tokio::time::timeout(self.ack_timeout, wait).await {
-            Ok(Ok(code)) => code.into_result(),
+            Ok(Ok(outcome)) => outcome,
             // 应答通道随 Actor 线程一起消失
             Ok(Err(_)) => Err(ControlStatus::ActorDead),
             Err(_) => Err(ControlStatus::AckTimeout),
@@ -278,7 +285,7 @@ mod tests {
             }
             match cmd {
                 ControlCommand::PrepareEncoder { reply, .. } => {
-                    let _ = reply.send(ControlStatus::Ok);
+                    let _ = reply.send(Ok(EncodeBackendKind::Software));
                 }
                 ControlCommand::ImportVramSlots { reply, .. } => {
                     let _ = reply.send(ControlStatus::Ok);
@@ -287,7 +294,7 @@ mod tests {
                     let _ = reply.send(ControlStatus::Ok);
                 }
                 ControlCommand::ProfileChange { reply, .. } => {
-                    let _ = reply.send(Ok(StreamingProfile::default()));
+                    let _ = reply.send(Ok((StreamingProfile::default(), None)));
                 }
                 ControlCommand::Shutdown | ControlCommand::BitrateChange(_) => {}
             }
@@ -391,12 +398,15 @@ mod tests {
             } = cmd
             {
                 let _ = recorded_tx.send(prefer_hardware);
-                let _ = reply.send(ControlStatus::Ok);
+                let _ = reply.send(Ok(EncodeBackendKind::Software));
             }
         });
         let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
         let rt = tokio::runtime::Runtime::new().expect("测试 runtime 必须能建起来");
-        assert_eq!(rt.block_on(sender.prepare_encoder(profile)), Ok(()));
+        assert_eq!(
+            rt.block_on(sender.prepare_encoder(profile)),
+            Ok(EncodeBackendKind::Software)
+        );
         assert!(
             recorded_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             "构造期取到的偏好必须随命令送达 Actor"
@@ -412,18 +422,19 @@ mod tests {
         std::thread::spawn(move || {
             while let Some(cmd) = rx.blocking_recv() {
                 if let ControlCommand::ProfileChange { reply, .. } = cmd {
-                    let _ = reply.send(Ok(applied));
+                    let _ = reply.send(Ok((applied, Some(EncodeBackendKind::Nvenc))));
                 }
             }
         });
 
         let requested = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
-        let got = ControlSender::new(tx, bell, true)
+        let (got, backend) = ControlSender::new(tx, bell, true)
             .change_profile(requested)
             .await
             .expect("假 Actor 应答过，必须拿到值");
         assert_ne!(got, requested, "应答不得是请求值的回显");
         assert_eq!(got, applied, "应答必须是 Actor 实际生效的档位");
+        assert_eq!(backend, Some(EncodeBackendKind::Nvenc));
     }
 
     /// Actor 拒绝重配时，拒绝原因必须跨过接口，而不是让调用方比对档位去猜

@@ -15,6 +15,7 @@ use arc_swap::ArcSwapOption;
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use webrtc::peer_connection::RTCIceCandidateInit;
 
+use crate::encode::EncodeBackendKind;
 use crate::encode::HardwareProbeResult;
 use crate::encode::StreamingProfile;
 use crate::encode::VideoCodec;
@@ -51,8 +52,9 @@ pub struct StreamingEngine {
 
 /// 档位 ask 的应答（被动数据载体）：只有生效值能被回传
 pub enum ProfileApply {
-    /// 请求已被编码器接受并生效
-    Applied(StreamingProfile),
+    /// 请求已被编码器接受并生效；后端为 None 表示编码器尚未就绪的纯采纳态
+    /// （会话建立前不可达）
+    Applied(StreamingProfile, Option<EncodeBackendKind>),
     /// 请求被拒绝（0 几何 / 0 帧率的暂停信号，或编码器重配失败）；
     /// 旧档位由调用方自己的基线保持
     Rejected,
@@ -167,8 +169,10 @@ impl StreamingEngine {
         height: usize,
         fps: usize,
         bpp: Option<f32>,
-    ) -> Result<(RTCSessionDescription, StreamingProfile), Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<
+        (RTCSessionDescription, StreamingProfile, EncodeBackendKind),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         if width == 0 || height == 0 || fps == 0 {
             // 0×0 是暂停信号，不是需要「修正」的最小档位；协商必须被显式拒绝
             return Err("内容档位为 0（暂停态不应发起协商）".into());
@@ -183,9 +187,13 @@ impl StreamingEngine {
         let probe = crate::encode::hardware_caps();
         let profile = resolve_initial_profile(width, height, fps, bpp, &offer, probe.as_deref());
 
-        if let Err(e) = self.video.prepare_encoder(profile).await {
-            return Err(format!("编码器未能在会话建立前就绪 (code={})", e.code()).into());
-        }
+        // prepare 的 Ok 携带实际建成的后端身份（硬编失败静默回退软编时是软编），
+        // 随应答上抛给 JNI 层写进 offer 应答
+        let backend = self
+            .video
+            .prepare_encoder(profile)
+            .await
+            .map_err(|e| format!("编码器未能在会话建立前就绪 (code={})", e.code()))?;
 
         let handler = self.candidate_handler();
 
@@ -205,7 +213,7 @@ impl StreamingEngine {
             old_session.close().await;
         }
 
-        Ok((answer, profile))
+        Ok((answer, profile, backend))
     }
 
     /// 应用新的画质档位：阻塞 ask，应答见 [`ProfileApply`]
@@ -231,9 +239,9 @@ impl StreamingEngine {
         // 控制面所有权在引擎：ask 直接发起，生效码率回填会话的码率回路；
         // 拒绝路径不经过回路，上界自然保持旧值
         match self.video.control().change_profile(requested).await {
-            Ok(applied) => {
+            Ok((applied, backend)) => {
                 session.commit_bps(applied.bitrate());
-                ProfileApply::Applied(applied)
+                ProfileApply::Applied(applied, backend)
             }
             Err(e) => {
                 log::warn!("档位变更被拒绝（{e:?}），继续沿用旧档位");
@@ -391,12 +399,12 @@ mod tests {
                         let _ = if reject_change {
                             reply.send(Err(ControlStatus::ReconfigureFailed))
                         } else {
-                            reply.send(Ok(profile))
+                            reply.send(Ok((profile, Some(EncodeBackendKind::Software))))
                         };
                         Rec::ChangeProfile
                     }
                     ControlCommand::PrepareEncoder { profile, reply, .. } => {
-                        let _ = reply.send(ControlStatus::Ok);
+                        let _ = reply.send(Ok(EncodeBackendKind::Software));
                         Rec::Prepare(profile)
                     }
                     ControlCommand::ImportVramSlots { reply, .. } => {
@@ -458,7 +466,7 @@ a=rtpmap:102 H264/90000\r\n";
         let (mgr, _rx, _kf) = make_test_engine(false);
         assert!(!mgr.active_session.load().is_some());
 
-        let (answer1, profile1) = mgr
+        let (answer1, profile1, _backend1) = mgr
             .handle_offer(make_test_offer(), 1920, 1080, 60, None)
             .await
             .unwrap();
@@ -469,7 +477,7 @@ a=rtpmap:102 H264/90000\r\n";
         let session1 = mgr.active_session.load_full().expect("应已存在 session1");
 
         // 模拟新会话接入抢占 (Kick-Old)
-        let (answer2, _) = mgr
+        let (answer2, _, _) = mgr
             .handle_offer(make_test_offer(), 1280, 720, 30, None)
             .await
             .unwrap();
@@ -490,7 +498,7 @@ a=rtpmap:102 H264/90000\r\n";
         let (mgr, _rx, _kf) = make_test_engine(false);
         let weak = Arc::downgrade(&mgr);
         {
-            let (session, _answer) = mgr
+            let (session, _answer, _backend) = mgr
                 .handle_offer(make_test_offer(), 1920, 1080, 60, None)
                 .await
                 .unwrap();
@@ -518,7 +526,7 @@ a=rtpmap:102 H264/90000\r\n";
                     ControlCommand::PrepareEncoder { reply, .. } => {
                         let _ = entry_tx.send(());
                         let _ = release_rx.recv();
-                        let _ = reply.send(ControlStatus::Ok);
+                        let _ = reply.send(Ok(EncodeBackendKind::Software));
                     }
                     ControlCommand::Shutdown => break,
                     _ => {}
@@ -627,7 +635,8 @@ a=rtpmap:102 H264/90000\r\n";
             .unwrap();
 
         // 成功路径：假 Actor 回显请求档位，codec 随请求原样带出
-        let ProfileApply::Applied(applied) = mgr.apply_profile(1600, 900, 90, 0.2, codec).await
+        let ProfileApply::Applied(applied, _backend) =
+            mgr.apply_profile(1600, 900, 90, 0.2, codec).await
         else {
             panic!("活跃会话上的合法请求必须生效");
         };

@@ -304,8 +304,7 @@ impl VideoEncoder {
             .coded_extent((align.0 as usize, align.1 as usize))
     }
 
-    /// 后端身份（生命周期用例断言「请求即所得」）
-    #[cfg(test)]
+    /// 后端身份：换档/构建回执如实上报「建成的是哪个后端」的单一事实源
     pub(crate) fn backend_kind(&self) -> EncodeBackendKind {
         self.backend.kind()
     }

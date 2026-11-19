@@ -190,7 +190,7 @@ fn negotiate_offer<'caller>(
         .block_on(async move { engine.handle_offer(offer, w, h, f, initial_bpp).await });
 
     Ok(match res {
-        Ok((answer, profile)) => {
+        Ok((answer, profile, backend)) => {
             let resp_json = serde_json::json!({
                 "type": "answer",
                 "width": profile.width(),
@@ -199,6 +199,7 @@ fn negotiate_offer<'caller>(
                 "bpp": profile.bpp(),
                 "bitrate": profile.bitrate(),
                 "codec": profile.codec().as_str(),
+                "backend": backend.as_str(),
                 "bppMin": encode::MIN_BPP,
                 "bppMax": encode::MAX_BPP,
                 "sdp": answer,
@@ -275,8 +276,8 @@ fn apply_profile<'caller>(
         codec,
     ));
 
-    let profile = match outcome {
-        crate::streaming::ProfileApply::Applied(profile) => profile,
+    let (profile, backend) = match outcome {
+        crate::streaming::ProfileApply::Applied(profile, backend) => (profile, backend),
         crate::streaming::ProfileApply::Rejected | crate::streaming::ProfileApply::NoSession => {
             return Ok(JString::default());
         }
@@ -288,6 +289,8 @@ fn apply_profile<'caller>(
         "bpp": profile.bpp(),
         "bitrate": profile.bitrate(),
         "codec": profile.codec().as_str(),
+        // 后端未就绪的采纳态为 null，Java 按未知处理
+        "backend": backend.map(|b| b.as_str()),
     });
     match env.new_string(resp_json.to_string()) {
         Ok(s) => Ok(s),

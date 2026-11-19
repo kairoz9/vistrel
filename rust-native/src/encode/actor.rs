@@ -19,7 +19,7 @@ use crate::encode::{
     display_nv12_len,
 };
 
-use super::encoder::VideoEncoder;
+use super::encoder::{EncodeBackendKind, VideoEncoder};
 
 /// 硬编后端构建入口：生产固定为真实驱动工厂，测试注入假后端
 type HardwareBuilder = dyn Fn(StreamingProfile, &'static SlotStateBlock) -> Result<(VideoEncoder, Vec<HostBlock>), String>
@@ -188,7 +188,9 @@ impl EncoderActor {
             }
             ControlCommand::ProfileChange { profile, reply } => {
                 let (before, had_table) = self.begin_profile_command();
-                let outcome = self.change_profile(profile);
+                let outcome = self
+                    .change_profile(profile)
+                    .map(|profile| (profile, self.current_backend()));
                 self.end_profile_command(before, had_table);
                 let _ = reply.send(outcome);
             }
@@ -198,9 +200,9 @@ impl EncoderActor {
                 reply,
             } => {
                 let (before, had_table) = self.begin_profile_command();
-                let code = self.prepare_encoder(profile, prefer_hardware);
+                let outcome = self.prepare_encoder(profile, prefer_hardware);
                 self.end_profile_command(before, had_table);
-                let _ = reply.send(code);
+                let _ = reply.send(outcome);
             }
             ControlCommand::ImportVramSlots { slots, reply } => {
                 self.discard_frames_before_rebuild();
@@ -341,12 +343,13 @@ impl EncoderActor {
     }
 
     /// 按给定档位配好编码器：档位与后端必须同进同退
-    /// **后端未变时不重建。**
+    /// **后端未变时不重建。** `Ok` 携带实际建成的后端身份——偏好硬编失败静默回退
+    /// 软编时，身份是软编而非偏好值
     fn prepare_encoder(
         &mut self,
         profile: StreamingProfile,
         prefer_hardware: bool,
-    ) -> ControlStatus {
+    ) -> Result<EncodeBackendKind, ControlStatus> {
         let same_backend = self
             .encoder
             .as_ref()
@@ -375,13 +378,21 @@ impl EncoderActor {
             self.rebuild_encoder(profile, prefer_hardware)
         };
         if code != ControlStatus::Ok {
-            return code;
+            return Err(code);
         }
 
         // 码率复位到**生效档位**的上限
         self.bitrate = self.profile.bitrate();
         Self::apply_bitrate(&mut self.encoder, self.bitrate);
-        ControlStatus::Ok
+        // Ok 即编码器已就绪，身份如实读取；None 意味着「Ok 却无编码器」的不变量
+        // 已破坏，按拒绝收口而不是编造一个后端
+        self.current_backend()
+            .ok_or(ControlStatus::ReconfigureFailed)
+    }
+
+    /// 当前编码器后端身份；编码器尚未就绪时为 `None`（回执层如实呈现为「未定」）
+    fn current_backend(&self) -> Option<EncodeBackendKind> {
+        self.encoder.as_ref().map(|e| e.backend_kind())
     }
 
     /// 重建编码器。会销毁旧编码器的一切：CUcontext、已导入的显存槽位、当前 GOP。
@@ -789,6 +800,49 @@ mod tests {
         assert_eq!(pool.stale_len(), 0, "换域时旧设备块必须已释放");
     }
 
+    /// Ok 必须携带实际建成的后端身份：偏好硬编但构建失败静默回退软编时，回执
+    /// 身份是软编而非偏好值——调用方无需再问「是不是硬编」
+    #[test]
+    fn test_prepare_reports_fallback_backend_identity() {
+        crate::encode::software::init_api_for_tests();
+
+        let keyframe = Arc::new(KeyframeTrigger::new());
+        let bell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
+        let output = test_outbox();
+        let (mut actor, _pool) = test_actor_with_builder(
+            inbox,
+            keyframe,
+            Arc::clone(&output),
+            Arc::new(|_profile, _slot_state| Err("硬编构建失败".to_string())),
+        );
+        let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+
+        assert_eq!(
+            prepare_kind(&mut actor, profile, true),
+            Ok(EncodeBackendKind::Software),
+            "偏好硬编失败回退软编后，Ok 的身份必须是软编"
+        );
+
+        // 软编在跑时的换档回执同样如实携带软编身份
+        let outcome = switch_profile_with_backend(&mut actor, profile);
+        assert_eq!(
+            outcome,
+            Ok((profile, Some(EncodeBackendKind::Software))),
+            "换档回执的身份必须与在跑后端一致"
+        );
+    }
+
+    /// 直接走 Actor 的控制出口换档并取回生效档位与后端身份
+    fn switch_profile_with_backend(
+        actor: &mut EncoderActor,
+        profile: StreamingProfile,
+    ) -> Result<(StreamingProfile, Option<EncodeBackendKind>), ControlStatus> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        assert!(actor.apply(ControlCommand::ProfileChange { profile, reply }));
+        wait_reply(rx)
+    }
+
     /// 所有权位纪律：换代前置收尾不得清在途认领位，全清只属于 drain 成功后的换表命令
     ///
     /// 位承载「GPU 正在读这张纹理」——清早了，渲染线程下次 claim 会与编码器对
@@ -955,6 +1009,18 @@ mod tests {
         profile: StreamingProfile,
         prefer_hardware: bool,
     ) -> ControlStatus {
+        match prepare_kind(actor, profile, prefer_hardware) {
+            Ok(_) => ControlStatus::Ok,
+            Err(code) => code,
+        }
+    }
+
+    /// 直接走 Actor 的控制出口配好编码器并取回实际后端身份
+    fn prepare_kind(
+        actor: &mut EncoderActor,
+        profile: StreamingProfile,
+        prefer_hardware: bool,
+    ) -> Result<EncodeBackendKind, ControlStatus> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         assert!(actor.apply(ControlCommand::PrepareEncoder {
             profile,
@@ -971,7 +1037,7 @@ mod tests {
     ) -> Result<StreamingProfile, ControlStatus> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         assert!(actor.apply(ControlCommand::ProfileChange { profile, reply }));
-        wait_reply(rx)
+        wait_reply(rx).map(|(profile, _)| profile)
     }
 
     /// 直接走 Actor 的控制出口下发跟随码率
@@ -1023,7 +1089,7 @@ mod tests {
             "控制队列必须受理"
         );
         assert_eq!(
-            wait_reply(ack0_rx),
+            wait_reply(ack0_rx).map(|(profile, _)| profile),
             Ok(profile),
             "应答必须是 Actor 实际生效的档位"
         );

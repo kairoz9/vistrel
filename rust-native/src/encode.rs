@@ -16,6 +16,7 @@ pub use audio::{
     AUDIO_CHANNELS, AUDIO_FRAME_DURATION_MS, AUDIO_SAMPLE_RATE, AUDIO_TOTAL_SAMPLES,
     AudioEncodeError, AudioEncoder, DEFAULT_AUDIO_BITRATE_BPS,
 };
+pub use encoder::EncodeBackendKind;
 pub(crate) use frame::FramePayload;
 pub use frame::KeyframeTrigger;
 pub use hardware::{

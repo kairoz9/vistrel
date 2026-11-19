@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 
 use crate::encode::actor::EncoderActor;
 use crate::encode::control::{CONTROL_QUEUE_DEPTH, ControlCommand, ControlSender, ControlStatus};
+use crate::encode::encoder::EncodeBackendKind;
 use crate::encode::frame::{
     FrameInbox, FrameOutbox, FrameOutcome, FramePayload, Mailbox, VideoFrame,
 };
@@ -89,11 +90,11 @@ impl VideoPipeline {
         self.control.import_vram_slots(slots)
     }
 
-    /// 会话建立前把编码器按档位就绪（ask）
+    /// 会话建立前把编码器按档位就绪（ask），`Ok` 携带实际建成的后端身份
     pub(crate) async fn prepare_encoder(
         &self,
         profile: StreamingProfile,
-    ) -> Result<(), ControlStatus> {
+    ) -> Result<EncodeBackendKind, ControlStatus> {
         self.control.prepare_encoder(profile).await
     }
 
