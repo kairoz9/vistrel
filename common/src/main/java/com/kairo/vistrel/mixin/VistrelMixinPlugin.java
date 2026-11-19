@@ -3,6 +3,7 @@ package com.kairo.vistrel.mixin;
 import org.objectweb.asm.tree.ClassNode;
 import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin;
 import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
@@ -41,25 +42,33 @@ public class VistrelMixinPlugin implements IMixinConfigPlugin {
 
     @Override
     public List<String> getMixins() {
+        List<String> mixins = new ArrayList<>();
+        // 采集时机：26.1+ 的限频器独立成类，旧版仍在 RenderSystem 上
+        //? if gpu_device {
+        mixins.add("MixinFramerateLimiter");
+        //? } else {
+        /*mixins.add("MixinRenderSystem");*/
+        //? }
         //? if renderpearl_era {
-        return List.of(
+        mixins.addAll(List.of(
                 "MixinVulkanFeatureSets",
                 "FrontendGpuDeviceAccessor",
                 "VulkanGpuTextureAccessor",
                 "MixinVulkanGpuTexture",
                 "MixinBlaze3D"
-        );
+        ));
         //? } elif vulkan_backend {
-        /*return List.of(
+        /*mixins.addAll(List.of(
                 "MixinVulkanBackend",
                 "GpuDeviceBackendAccessor",
                 "VulkanGpuTextureAccessor",
                 "MixinVulkanGpuTexture",
                 "MixinUtilOs"
-        );*/
+        ));*/
         //? } else {
-        /*return List.of("MixinUtilOs");*/
+        /*mixins.add("MixinUtilOs");*/
         //? }
+        return mixins;
     }
 
     @Override

@@ -45,6 +45,13 @@ public final class VistrelService {
      */
     private static volatile ServiceContext activeContext = null;
     private static volatile VideoCaptureScheduler activeVideoScheduler = null;
+    /**
+     * 本 tick 是否已取得采集时机（渲染线程独占）
+     *
+     * 帧限频器前采集与 runTick 尾部兜底同属一个 tick：限频器被调用时前者先到，
+     * 长睡眠后尾部再跑一次会把同一帧采集两遍，故以此标志二选一
+     */
+    private static boolean captureTakenThisTick = false;
     private static volatile AudioCaptureScheduler activeAudioScheduler = null;
     private static volatile InputInjector activeInputInjector = null;
     static volatile ProfileCoordinator activeProfileCoordinator = null;
@@ -405,6 +412,7 @@ public final class VistrelService {
      * 主渲染循环头部回调（由 MixinMinecraft 触发）
      */
     public static void onRenderFrameHead() {
+        captureTakenThisTick = false;
         InputInjector injector = activeInputInjector;
         if (injector != null) {
             injector.pollAndDispatch();
@@ -440,9 +448,29 @@ public final class VistrelService {
     }
 
     /**
+     * 帧限频器入睡前回调（由 FramerateLimiter / RenderSystem Mixin 触发）
+     *
+     * 限频器在 present 之后调用：此处提交采集，编码与限频睡眠并行，省掉睡眠造成的整段延迟；
+     * framerateLimit >= 260 时限频器不被调用，由 {@link #onRenderFrameTail()} 兜底
+     */
+    public static void onBeforeFrameLimitSleep() {
+        captureTakenThisTick = true;
+        VideoCaptureScheduler scheduler = activeVideoScheduler;
+        if (scheduler != null) {
+            scheduler.capture();
+        }
+    }
+
+    /**
      * 主渲染循环尾部回调（由 MixinMinecraft 触发）
+     *
+     * 仅作限频器未被调用时的兜底；本 tick 已在限频器前采集过则不重复采集
      */
     public static void onRenderFrameTail() {
+        if (captureTakenThisTick) {
+            return;
+        }
+        captureTakenThisTick = true;
         VideoCaptureScheduler scheduler = activeVideoScheduler;
         if (scheduler != null) {
             scheduler.capture();

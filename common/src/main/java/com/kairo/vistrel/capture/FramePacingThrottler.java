@@ -5,7 +5,7 @@ import java.util.function.LongSupplier;
 /**
  * 高精度帧节拍拦截器
  * 用于将 Minecraft 主渲染循环与协商的推流帧率对齐，防止高刷渲染时浪费 GPU DMA 与编码算力。
- * 时钟为构造注入：生产走系统墙钟，测试注入可编程虚拟时间逐帧钉边界
+ * 时钟为构造注入：生产走系统单调时钟，测试注入可编程虚拟时间逐帧钉边界
  */
 public class FramePacingThrottler {
     private final LongSupplier clockNanos;

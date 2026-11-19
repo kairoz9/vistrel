@@ -25,8 +25,8 @@ public class MixinMinecraft {
     }
 
     //? }
-    // runTick 是各版本共同的主循环入口；26.3 的 renderFrame 由它调用，
-    // 额外调用点（加载/Overlay/resize）不承载串流输入与采集语义
+    // runTick 是各版本共同的主循环入口；26.3 的 renderFrame 由它调用。
+    // 输入轮询与采集兜底挂在 runTick；提前采集由限频器 Mixin 触发，额外调用点同样有效
     @Inject(at = @At("HEAD"), method = "runTick")
     private void onRunTickHead(boolean renderLevel, CallbackInfo info) {
         com.kairo.vistrel.VistrelService.onRenderFrameHead();
