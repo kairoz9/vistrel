@@ -291,7 +291,14 @@ impl EncoderActor {
         };
         self.slot_state.set_stage(ActorStage::Drain);
         if let Err(e) = encoder.drain() {
-            log::error!("槽位注销前排空失败，保留导入引用: {e}");
+            // 排空失败即上下文不可信：后端整体弃置（mem::forget 永不析构——
+            // 病态上下文上的释放调用可能同样卡死线程），回退软编打底；
+            // Java 按 ReleaseFailed 保留导出资源
+            if let Some(dead) = self.encoder.take() {
+                std::mem::forget(dead);
+            }
+            self.install_software(Self::software_ceiling_profile(self.profile));
+            log::error!("槽位注销前排空失败，后端弃置回退软编，保留导入引用: {e}");
             return ControlStatus::ReleaseFailed;
         }
         self.slot_state.set_stage(ActorStage::ClearSlots);
@@ -312,7 +319,14 @@ impl EncoderActor {
         // 换表全清前置 drain
         self.slot_state.set_stage(ActorStage::Drain);
         if let Err(e) = encoder.drain() {
-            log::error!("槽位导入前排空失败，整批拒绝: {e}");
+            // 排空失败即上下文不可信：后端整体弃置（mem::forget 永不析构），
+            // 回退软编打底；Java 按 ImportFailed 降级 RAM 采集，主机帧由软编
+            // 继续编码，流不断
+            if let Some(dead) = self.encoder.take() {
+                std::mem::forget(dead);
+            }
+            self.install_software(Self::software_ceiling_profile(self.profile));
+            log::error!("槽位导入前排空失败，后端弃置回退软编，整批拒绝: {e}");
             return ControlStatus::ImportFailed;
         }
         self.slot_state.set_stage(ActorStage::ImportSlots);
@@ -1417,11 +1431,16 @@ mod tests {
     /// 用例 3：导入前排空失败——整批拒绝且窗口不滞留，旧代恢复接收
     #[test]
     fn test_fence_closes_window_when_import_drain_fails() {
+        // 换软编要用真编码器产出：先装测试夹具的 openh264
+        assert!(
+            crate::encode::software::init_api_for_tests(),
+            "openh264 测试夹具应就绪"
+        );
         let keyframe = Arc::new(KeyframeTrigger::new());
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let output = test_outbox();
-        let (mut actor, _pool, _block) =
+        let (mut actor, pool, _block) =
             fence_actor(inbox.clone(), keyframe, output.clone(), false, true);
 
         let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
@@ -1436,12 +1455,22 @@ mod tests {
             "排空失败必须整批拒绝"
         );
         assert!(!actor.rejecting_frames);
+        // 排空失败即硬编后端报废：整体回退软编，降级后是主机帧流
+        let encoder = actor.encoder.as_ref().expect("回退软编必须建出编码器");
+        assert!(!encoder.is_hardware(), "排空失败后必须回退软编");
 
-        inbox.push(vram_frame(0, 7));
-        let frame = inbox.take().expect("帧在收件箱");
+        // 主机帧不受围栏约束，软编继续产出（降级路径的真实帧流）
+        let host = host_payload(&pool, vec![100u8; display_nv12_len(&p720)]);
+        inbox.push(VideoFrame {
+            birth_nanos: 1,
+            payload: host,
+        });
+        let frame = inbox.take().expect("主机帧在收件箱");
         actor.handle_frame(frame);
-        assert!(output.take().is_some(), "导入失败后窗口关闭，帧恢复接收");
-        assert_eq!(inbox.outcomes().count(FrameOutcome::FenceDropped), 0);
+        assert!(
+            output.take().is_some(),
+            "导入失败后窗口关闭，降级软编继续出帧"
+        );
     }
 
     /// 用例 4：清空槽位表后，显存帧拒收直到下一次导入

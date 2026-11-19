@@ -91,7 +91,8 @@ pub(crate) trait VideoEncodeBackend {
     /// 清空槽位表并释放底层显存句柄
     fn clear_vram_slots(&mut self);
 
-    /// 排空后端在途任务并同步 GPU 上下文
+    /// 排空后端在途任务并确认 GPU 上下文可用；等待必须有界，失败即上下文不可信——
+    /// 调用方必须整体弃置实现体（`mem::forget`，不得正常析构、不再使用）
     fn drain(&mut self) -> Result<(), String>;
 
     #[cfg(test)]

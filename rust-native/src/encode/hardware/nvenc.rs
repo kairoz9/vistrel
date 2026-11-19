@@ -34,6 +34,7 @@ use nvfn;
 
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use cudarc::driver::{CudaContext, CudaStream};
@@ -211,6 +212,13 @@ impl Drop for NvencBackend {
         self.slots.clear();
     }
 }
+
+/// 排空等待的超时（2s）：已远超一帧的编码时间，超了就是上下文侧出了问题。
+/// 与 Vulkan 编码路径的等待超时同一纪律——等待必须有界，失败即弃置
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 排空轮询间隔：事件查询是纯状态读取的非阻塞调用，轮询期间 CPU 占用可忽略
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 impl NvencBackend {
     /// 按档位构建（主机帧一律 NV12，行距即宽度）
@@ -457,7 +465,6 @@ impl VideoEncodeBackend for NvencBackend {
             } => {
                 // 编码（含前置校验）无论成败，槽位所有权都在出口归还：纹理要么没被
                 // 碰过（前置失败），要么已被解映射（同步提交，出口即完成）。
-                // 本后端无等待超时毒化，无粘滞例外
                 let result = self.encode_vram_slot(*slot_idx, *sync_value, force_idr, frame_idx);
                 self.slot_state.mark_free(*slot_idx);
                 result?
@@ -466,11 +473,36 @@ impl VideoEncodeBackend for NvencBackend {
         Ok((Bytes::from(nalu), is_key))
     }
 
-    /// 排空并等待 NVENC 硬件与当前 CUDA 上下文中的所有异步任务完成
+    /// 排空：确认本流上的全部在途工作已经完成
+    ///
+    /// 记录事件后轮询到 deadline，健康路径一次查询即返回。超时与错误都成为
+    /// **有界**的失败而不是新的挂死点。失败即上下文不可信：调用方据此整体弃置
+    /// （`mem::forget`，永不析构——病态上下文上的释放调用可能同样卡死线程）
     fn drain(&mut self) -> Result<(), String> {
-        self.cuda_ctx
-            .synchronize()
-            .map_err(|e| format!("cuCtxSynchronize failed: {e}"))
+        let deadline = Instant::now() + DRAIN_TIMEOUT;
+        let event = match self.stream.record_event(None) {
+            Ok(event) => event,
+            Err(e) => return Err(format!("排空事件记录失败: {e}")),
+        };
+        loop {
+            match event.try_is_complete() {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => {
+                    // 上下文粘性错误：事件句柄一并弃置，失败后不再触碰驱动
+                    std::mem::forget(event);
+                    return Err(format!("排空查询失败: {e}"));
+                }
+            }
+            if Instant::now() >= deadline {
+                std::mem::forget(event);
+                return Err(format!(
+                    "排空 {}s 内未完成（上下文可能挂死）",
+                    DRAIN_TIMEOUT.as_secs()
+                ));
+            }
+            std::thread::sleep(DRAIN_POLL_INTERVAL);
+        }
     }
 
     #[cfg(test)]
