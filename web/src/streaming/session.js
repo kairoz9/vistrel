@@ -75,7 +75,7 @@ export class StreamingSession {
         this.listeners = new Map();
         this.status = null;
         this.auth = "pending";
-        this.profile = { width: null, height: null, fps: null, codec: parseCodecToken(urlCodec) };
+        this.profile = { width: null, height: null, fps: null, codec: parseCodecToken(urlCodec), backend: "unknown" };
 
         this.pc = null;
         this.ws = null;
@@ -130,11 +130,13 @@ export class StreamingSession {
         this.emit(SESSION_EVENTS.STATUS, status);
     }
 
-    setProfile(width, height, fps, codec) {
+    setProfile(width, height, fps, codec, backend) {
         width = width || 1920;
         height = height || 1080;
         fps = fps || 60;
-        this.profile = { width, height, fps, codec };
+        // backend 是协商回执如实上报的**实际**后端（能力探测快照回答的是「本机有无硬编」，
+        // 硬编回退软编后两者分叉）；单会话内后端不变，随 answer 一次性落定
+        this.profile = { width, height, fps, codec, backend: backend || "unknown" };
         this.emit(SESSION_EVENTS.PROFILE, this.profile);
     }
 
@@ -259,7 +261,7 @@ export class StreamingSession {
 
                 // SDP 生效后才算认证成功：避免 setRemoteDescription 失败时提前持久化凭据
                 this.setAuth({ ok: true });
-                this.setProfile(msg.width, msg.height, msg.fps, ackCodec);
+                this.setProfile(msg.width, msg.height, msg.fps, ackCodec, msg.backend);
                 console.log(`Vistrel: Negotiation complete: ${msg.width}x${msg.height}@${msg.fps} (${ackCodec})`);
             } else if (msg.type === WS_IN.CANDIDATE && msg.candidate) {
                 if (this.pc && this.pc.remoteDescription) {

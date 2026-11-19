@@ -327,15 +327,16 @@ public final class ProfileCoordinator {
                 }
             }
         }
-        // 请求态：active 位固定 true（规划结果只作为 ask 请求），codec 由 offer 应答决定，
-        // 会话前为 None，不会被 ask 消费
+        // 请求态：active 位固定 true（规划结果只作为 ask 请求），codec 与 backend 由
+        // offer 应答决定，会话前为占位值，不会被 ask 消费
         return new SessionServer.SessionState(
                 SessionServer.SessionState.Phase.STREAMING,
                 width,
                 height,
                 fps,
                 clampBpp(bpp),
-                lastApplied.get().codec()
+                lastApplied.get().codec(),
+                lastApplied.get().backend()
         );
     }
 
@@ -362,7 +363,8 @@ public final class ProfileCoordinator {
                 applied.height(),
                 applied.fps(),
                 clampBpp(requestedBpp),
-                applied.codec()
+                applied.codec(),
+                applied.backend()
         );
         broadcast(applied);
     }
@@ -431,7 +433,8 @@ public final class ProfileCoordinator {
                     applied.height(),
                     applied.fps(),
                     bpp,
-                    applied.codec()
+                    applied.codec(),
+                    applied.backend()
             );
         }
         return plan(viewportWidth, viewportHeight, bpp);
@@ -469,7 +472,8 @@ public final class ProfileCoordinator {
     }
 
     /**
-     * 解析 JNI 应答：字段恒为「仍在生效」的实际档位——拒绝 / 无会话由 Native 回空串，解析失败即 null
+     * 解析 JNI 应答：字段恒为「仍在生效」的实际档位——拒绝 / 无会话由 Native 回空串，
+     * 解析失败即 null。backend 为可选字段：缺失时按未知处理
      */
     private SessionServer.SessionState parseApplied(String json) {
         try {
@@ -479,13 +483,17 @@ public final class ProfileCoordinator {
             int fps = obj.get("fps").getAsInt();
             double bpp = obj.has("bpp") ? obj.get("bpp").getAsDouble() : MIN_BPP;
             String codec = obj.get("codec").getAsString();
+            String backend = obj.has("backend") && !obj.get("backend").isJsonNull()
+                    ? obj.get("backend").getAsString()
+                    : SessionServer.SessionState.BACKEND_UNKNOWN;
             return new SessionServer.SessionState(
                     SessionServer.SessionState.Phase.STREAMING,
                     width,
                     height,
                     fps,
                     bpp,
-                    codec
+                    codec,
+                    backend
             );
         } catch (Exception e) {
             Constants.LOG.warn("档位应答 JSON 解析失败: {}", e.getMessage());

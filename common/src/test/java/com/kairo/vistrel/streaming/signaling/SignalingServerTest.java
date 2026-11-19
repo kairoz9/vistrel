@@ -81,7 +81,7 @@ class SignalingServerTest {
             }
             // 合法 JSON：信令层会把它交给协调器落账（预拆分拼接防格式化器拆坏转义）
             return "{\"width\":1920,\"height\":1080,\"fps\":60,\"bpp\":0.1,"
-                    + "\"bitrate\":4000000,\"codec\":\"H264\"}";
+                    + "\"bitrate\":4000000,\"codec\":\"H264\",\"backend\":\"nvenc\"}";
         }
 
         @Override
@@ -509,11 +509,19 @@ class SignalingServerTest {
         // 快照 Unlimited(260)→240 再被 VSync 夹到 165；视口物理像素 2560×1440 与内容一致不缩放
         Assertions.assertArrayEquals(new int[] {2560, 1440, 165}, target, "几何与帧率必须来自内容侧而非客户端");
         Assertions.assertEquals(0.15, rec.offerBpp.get(), 1e-9, "bpp 原样进入协商");
-        // Answer 落账：委托返回的 fake answer（1920×1080@60）成为生效基线并广播
+        // Answer 落账：委托返回的 fake answer（1920×1080@60，nvenc）成为生效基线并广播
         Assertions.assertEquals(
-                new SessionServer.SessionState(SessionServer.SessionState.Phase.STREAMING, 1920, 1080, 60, 0.1, "H264"),
+                new SessionServer.SessionState(
+                        SessionServer.SessionState.Phase.STREAMING,
+                        1920,
+                        1080,
+                        60,
+                        0.1,
+                        "H264",
+                        "nvenc"
+                ),
                 listener.applied.get(0),
-                "Answer 必须经协调器落账广播初始档位"
+                "Answer 必须经协调器落账广播初始档位（含后端身份透传）"
         );
         ch.finishAndReleaseAll();
     }

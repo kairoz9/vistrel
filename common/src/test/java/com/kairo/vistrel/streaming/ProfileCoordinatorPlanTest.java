@@ -26,7 +26,7 @@ class ProfileCoordinatorPlanTest {
     void testContentFollowsFramebufferWithoutLift() {
         // 800×600 原样串流：服务端绝不放大发假细节
         SessionState t = plan(snapshot(800, 600, 60, false, 0), 0, 0, 0.1);
-        assertEquals(new SessionState(SessionState.Phase.STREAMING, 800, 600, 60, 0.1, "None"), t);
+        assertEquals(new SessionState(SessionState.Phase.STREAMING, 800, 600, 60, 0.1, "None", "unknown"), t);
     }
 
     @Test
@@ -76,7 +76,7 @@ class ProfileCoordinatorPlanTest {
     @Test
     void testEmptySnapshotFallsBackTo1080p60() {
         SessionState t = plan(ContentSnapshot.EMPTY, 0, 0, 0.2);
-        assertEquals(new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.2, "None"), t);
+        assertEquals(new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.2, "None", "unknown"), t);
     }
 
     @Test

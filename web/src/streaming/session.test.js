@@ -196,11 +196,15 @@ describe("信令下行分流", () => {
         session.on("auth", (result) => authEvents.push(result));
         session.on("profile", (profile) => profileEvents.push(profile));
         await session.handleSignalingMessage(
-            JSON.stringify({ type: "answer", sdp: { type: "answer", sdp: "v=0\r\na=rtpmap:96 H265\r\n" } }),
+            JSON.stringify({
+                type: "answer",
+                sdp: { type: "answer", sdp: "v=0\r\na=rtpmap:96 H265\r\n" },
+                backend: "nvenc",
+            }),
         );
         expect(session.pc.setRemoteDescription).toHaveBeenCalledWith({ type: "answer", sdp: expect.any(String) });
         expect(authEvents).toEqual([{ ok: true }]);
-        expect(profileEvents).toEqual([{ width: 1920, height: 1080, fps: 60, codec: "h265" }]);
+        expect(profileEvents).toEqual([{ width: 1920, height: 1080, fps: 60, codec: "h265", backend: "nvenc" }]);
     });
 
     it("answer（字符串形态）与缺省档位回填", async () => {
@@ -210,7 +214,8 @@ describe("信令下行分流", () => {
         session.on("profile", (profile) => profileEvents.push(profile));
         await session.handleSignalingMessage(JSON.stringify({ type: "answer", sdp: "v=0\r\na=rtpmap:96 H264\r\n" }));
         expect(session.pc.setRemoteDescription).toHaveBeenCalledWith({ type: "answer", sdp: expect.any(String) });
-        expect(profileEvents[0]).toEqual({ width: 1920, height: 1080, fps: 60, codec: "h264" });
+        // 应答缺 backend 字段（旧 Native）按未知处理
+        expect(profileEvents[0]).toEqual({ width: 1920, height: 1080, fps: 60, codec: "h264", backend: "unknown" });
     });
 
     it("answer 前到达的候选先存后喂，之后直达", async () => {

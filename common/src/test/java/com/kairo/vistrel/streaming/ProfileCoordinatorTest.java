@@ -38,10 +38,10 @@ class ProfileCoordinatorTest {
     }
 
     /**
-     * 期望的生效状态：ask 应答 JSON 的 bpp 恒为 0.1
+     * 期望的生效状态：ask 应答 JSON 的 bpp 恒为 0.1、backend 恒为 nvenc
      */
     private static SessionState apply(int width, int height, int fps) {
-        return new SessionState(SessionState.Phase.STREAMING, width, height, fps, 0.1, "H264");
+        return new SessionState(SessionState.Phase.STREAMING, width, height, fps, 0.1, "H264", "nvenc");
     }
 
     /**
@@ -54,7 +54,7 @@ class ProfileCoordinatorTest {
                 + height
                 + ",\"fps\":"
                 + fps
-                + ",\"bpp\":0.1,\"bitrate\":5000000,\"codec\":\"H264\",\"rejected\":false}";
+                + ",\"bpp\":0.1,\"bitrate\":5000000,\"codec\":\"H264\",\"backend\":\"nvenc\",\"rejected\":false}";
     }
 
     private static ProfileCoordinator.Applier applierAnswering(

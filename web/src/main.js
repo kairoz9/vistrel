@@ -44,6 +44,9 @@ window.addEventListener("DOMContentLoaded", () => {
         if (profile.codec) {
             ui.setCodec(profile.codec);
         }
+        if (profile.backend) {
+            ui.setBackend(profile.backend);
+        }
     });
     session.on(SESSION_EVENTS.STATS, (stats) => {
         if (stats.rttMs !== null) ui.setRtt(stats.rttMs);

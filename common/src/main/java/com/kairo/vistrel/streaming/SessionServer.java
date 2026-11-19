@@ -69,7 +69,7 @@ public interface SessionServer {
      * <p>宽高为**显示尺寸**（码流声明的 Content Resolution，1080 显示高度即 1080）；
      * 编码补边 (coded_extent) 是 Native 内部细节，不在此字段。
      */
-    record SessionState(Phase phase, int width, int height, int fps, double bpp, String codec) {
+    record SessionState(Phase phase, int width, int height, int fps, double bpp, String codec, String backend) {
         /**
          * 会话相位：STREAMING 内容在流动；PAUSED 会话在线但内容丢失（仅停视频采集）；
          * INACTIVE 无会话
@@ -81,9 +81,14 @@ public interface SessionServer {
         }
 
         /**
+         * 后端身份的「未定」值：无会话或未携带该字段
+         */
+        public static final String BACKEND_UNKNOWN = "unknown";
+        /**
          * 未激活基线：无会话，几何为默认档位，bpp 取前端滑杆下限
          */
-        public static final SessionState INACTIVE = new SessionState(Phase.INACTIVE, 1920, 1080, 60, 0.1, "None");
+        public static final SessionState INACTIVE =
+                new SessionState(Phase.INACTIVE, 1920, 1080, 60, 0.1, "None", BACKEND_UNKNOWN);
 
         public boolean active() {
             return phase == Phase.STREAMING;
@@ -92,10 +97,10 @@ public interface SessionServer {
         /**
          * 内容丢失：会话仍然在线，沿用最近档位只降相位——音频照常，仅视频停采
          *
-         * @return 相位降为 PAUSED、几何 / 帧率 / BPP / codec 均不变的新快照
+         * @return 相位降为 PAUSED、几何 / 帧率 / BPP / codec / 后端 均不变的新快照
          */
         public SessionState paused() {
-            return new SessionState(Phase.PAUSED, width, height, fps, bpp, codec);
+            return new SessionState(Phase.PAUSED, width, height, fps, bpp, codec, backend);
         }
     }
 }

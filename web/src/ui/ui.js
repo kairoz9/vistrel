@@ -53,6 +53,14 @@ function codecLabel(codec) {
     return "未知";
 }
 
+/** 编码后端展示标签 */
+function backendLabel(backend) {
+    if (backend === "nvenc") return "NVENC";
+    if (backend === "vulkan_video") return "Vulkan Video";
+    if (backend === "software") return "软编";
+    return "--";
+}
+
 /**
  * Vistrel Web Client UI 与交互管理
  */
@@ -73,7 +81,8 @@ export class UIManager {
         // 指标行：标签格静态，值由调用方算好推入
         this.metrics = new MetricRow(document.getElementById("hudMetrics"), {
             quality: { label: "画质" },
-            codec: { label: "编码" },
+            codec: { label: "Codec" },
+            backend: { label: "编码后端" },
             rtt: { label: "RTT", value: "-- ms", minCh: 5 },
             fps: { label: "帧率", value: "-- FPS", minCh: 5 },
         });
@@ -309,6 +318,10 @@ export class UIManager {
 
     setCodec(codec) {
         if (codec) this.metrics.codec.set(codecLabel(codec));
+    }
+
+    setBackend(backend) {
+        if (backend) this.metrics.backend.set(backendLabel(backend));
     }
 
     setRtt(rttMs) {
