@@ -23,9 +23,10 @@ import java.util.concurrent.locks.LockSupport;
  *
  * <p>线程模型：
  * <ul>
- *   <li>客户端线程每次 tick 喂 {@link #onContentSnapshot}（规划 + 稳定判定，纯内存算术，无锁无阻塞），
- *       事件落 latest-wins 槽位并唤醒工作线程；暂停事件在客户端线程就地分发。稳定窗状态
- *       （lastSeenAtNanos / seenDirty / paused）只由客户端线程读写</li>
+ *   <li>客户端线程每次 tick 喂内容快照：会话活跃时经 {@link #onContentSnapshot}（规划 + 稳定判定，
+ *       纯内存算术，无锁无阻塞），事件落 latest-wins 槽位并唤醒工作线程；暂停事件在客户端
+ *       线程就地分发。无会话时经 {@link #seedContentSnapshot} 仅更新快照，供 offer 规划使用。
+ *       稳定窗状态（lastSeenAtNanos / seenDirty / paused）只由客户端线程读写</li>
  *   <li>信令线程经三个入口落位会话事件：{@link #noteOfferAnswer}（offer 落账）、
  *       {@link #onClientSettings}（外部偏好变更：视口 / BPP 任一变化立即落槽位）、
  *       {@link #onSessionClosed}（关闭复位）。lastAttempted 的跨线程写只发生在
@@ -205,6 +206,21 @@ public final class ProfileCoordinator {
             return;
         }
         submit(target);
+    }
+
+    /**
+     * 无会话期种子：只更新最新内容快照，不规划、不下发、不广播。
+     *
+     * <p>offer 规划发生在会话建立之前，此时 {@link #onContentSnapshot} 的内容来源尚未开启，
+     * 兜底几何会让接入后按第一份稳定快照再重建一次采集管线。
+     *
+     * @param snapshot 当前内容快照；不得为空
+     */
+    public void seedContentSnapshot(ContentSnapshot snapshot) {
+        if (stopped) {
+            return;
+        }
+        latestSnapshot = Objects.requireNonNull(snapshot, "snapshot 不能为空");
     }
 
     /**

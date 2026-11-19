@@ -168,6 +168,28 @@ class ProfileCoordinatorTest {
     }
 
     @Test
+    void testSeededSnapshotDrivesOfferPlanWithoutAsk() throws Exception {
+        RecordingListener listener = new RecordingListener();
+        AtomicInteger askCount = new AtomicInteger();
+        ProfileCoordinator worker = new ProfileCoordinator((width, height, fps, bpp, codec) -> {
+            askCount.incrementAndGet();
+            return answerJson(width, height, fps);
+        }, listener);
+        worker.start();
+        try {
+            worker.seedContentSnapshot(new ContentSnapshot(856, 480, 120, false, 0));
+            SessionState planned = worker.plan(1156, 650, 0.1);
+            assertEquals(856, planned.width(), "offer 规划必须基于种子快照的宽度");
+            assertEquals(480, planned.height(), "offer 规划必须基于种子快照的高度");
+            assertEquals(120, planned.fps(), "offer 规划必须基于种子快照的帧率");
+            Thread.sleep(100);
+            assertEquals(0, askCount.get(), "种子只更新快照，不得触发 ask");
+        } finally {
+            worker.shutdown();
+        }
+    }
+
+    @Test
     void testBppOnlyAskKeepsAppliedGeometryWhenNoFreshContent() throws Exception {
         RecordingListener listener = new RecordingListener();
         AtomicReference<String> seenRequest = new AtomicReference<>();
