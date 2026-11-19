@@ -230,7 +230,9 @@ impl VideoPipeline {
     /// 关停编码线程：投递 Shutdown 后**有界**等待
     ///
     /// 代价：超时返回后**不再保证 Actor 已退出**，调用方不得再假定显存槽位等资源已释放。
-    /// 该路径只在进程退出时走到，可以接受。
+    /// 进程退出与编码停滞自愈重启都会走到本路径；被弃置的线程携带自己的编码上下文
+    /// 与槽位引用继续存活，槽位状态块的代际隔离（块随引擎实例创建）使其干扰不到
+    /// 后继引擎，泄漏资源随进程退出回收。
     pub fn shutdown(&self) {
         // 只投递不等回复：受理与否只说明命令是否入队，退出与否由下面的有界等待回答
         if !self.control.shutdown() {
@@ -245,7 +247,7 @@ impl VideoPipeline {
         while !handle.is_finished() {
             if Instant::now() >= deadline {
                 log::error!(
-                    "编码线程 {} 秒内未退出，放弃等待（进程退出中，GPU 资源可能泄漏）",
+                    "编码线程 {} 秒内未退出，放弃等待",
                     SHUTDOWN_JOIN_TIMEOUT.as_secs()
                 );
                 return;

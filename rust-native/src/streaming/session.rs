@@ -77,10 +77,14 @@ impl PeerConnectionEventHandler for SessionHandler {
     }
 }
 
+/// 会话关闭总预算：写者排空（500ms，一次在途写之内）+ Peer 关闭收尾余量。
+/// 预算住在 [`StreamingSession::close`]
+const SESSION_CLOSE_BUDGET: Duration = Duration::from_millis(1000);
+
 /// 关闭会话时等待写循环退出的上限：一次在途写（250ms）之内必须收尾
 const WRITER_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// 会话收尾执行体：做异步收尾
+/// 会话收尾执行体：写者先排空、Peer 后关闭
 fn spawn_janitor(
     pc: Arc<dyn PeerConnection>,
     cancel: CancellationToken,
@@ -88,13 +92,13 @@ fn spawn_janitor(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         cancel.cancelled().await;
-        let _ = pc.close().await;
         let deadline = tokio::time::Instant::now() + WRITER_JOIN_TIMEOUT;
         for (name, writer) in writers {
             if tokio::time::timeout_at(deadline, writer).await.is_err() {
                 log::warn!("{name} 写入任务在 {WRITER_JOIN_TIMEOUT:?} 内未退出，已放弃等待");
             }
         }
+        let _ = pc.close().await;
     })
 }
 
@@ -494,15 +498,24 @@ impl StreamingSession {
     }
 
     /// 关闭会话
+    ///
+    /// 取消写者与输入环，并在 [`SESSION_CLOSE_BUDGET`] 内等待收尾执行体完成
+    /// （写者排空 → Peer 关闭 → 端口释放）。超时即告警放行：收尾任务仍在后台
+    /// 继续完成端口释放与写者收编，调用方不阻塞
     pub async fn close(&self) {
         self.state
             .store(RTCPeerConnectionState::Closed as u8, Ordering::Release);
         self.cancel.cancel();
         let janitor = self.janitor.lock().take();
-        if let Some(janitor) = janitor
-            && janitor.await.is_err()
-        {
-            log::error!("会话收尾任务异常退出，端口释放与写者收编未完成");
+        let Some(janitor) = janitor else {
+            return;
+        };
+        match tokio::time::timeout(SESSION_CLOSE_BUDGET, janitor).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => log::error!("会话收尾任务异常退出，端口释放与写者收编未完成"),
+            Err(_) => {
+                log::warn!("会话收尾超出 {SESSION_CLOSE_BUDGET:?} 预算，端口释放与写者收编交还后台")
+            }
         }
     }
 
@@ -890,5 +903,61 @@ a=rtpmap:102 H264/90000\r\n";
             weak.upgrade().is_none(),
             "StreamingSession 应当在 drop 后彻底释放，不存在循环引用导致泄漏"
         );
+    }
+
+    /// 收尾次序不变量：写者先被收编、Peer 后关闭——写者在传输存活期排空在途写，
+    /// Peer 关闭不得抢在写者退出之前。证据取端口重绑：Peer 占住固定端口，
+    /// 端口变为可重绑的最早时刻即 Peer 关闭时刻，须晚于写者退出时刻
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_janitor_joins_writers_before_peer_close() {
+        struct DummyHandler;
+        #[async_trait]
+        impl PeerConnectionEventHandler for DummyHandler {}
+
+        // 借一个空闲端口：绑定读取端口号后立刻释放，交给 Peer 占住
+        let port = {
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let bind_v4 = format!("127.0.0.1:{port}");
+        let pc: Arc<dyn PeerConnection> = Arc::new(
+            PeerConnectionBuilder::<String>::new()
+                .with_handler(Arc::new(DummyHandler))
+                .with_udp_addrs(vec![bind_v4, "[::]:0".to_string()])
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        // 写者故意拖延退出：若次序颠倒，端口会在写者退出前就被释放
+        let writer_done = Arc::new(std::sync::Mutex::new(None));
+        let marker = Arc::clone(&writer_done);
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(WRITER_JOIN_TIMEOUT / 10).await;
+            *marker.lock().unwrap() = Some(std::time::Instant::now());
+        });
+
+        let cancel = CancellationToken::new();
+        let janitor = spawn_janitor(Arc::clone(&pc), cancel.clone(), vec![("video", writer)]);
+        cancel.cancel();
+
+        // 端口变为可重绑的最早时刻即 Peer 关闭时刻
+        let mut freed_at = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while freed_at.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Peer 未在期限内关闭释放媒体端口"
+            );
+            if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+                freed_at = Some(std::time::Instant::now());
+            } else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        janitor.await.unwrap();
+
+        let writer_done = writer_done.lock().unwrap().expect("写者应已退出并被收编");
+        assert!(writer_done < freed_at.unwrap(), "Peer 关闭必须晚于写者收编");
     }
 }

@@ -112,8 +112,18 @@ impl StreamingEngine {
         })))
     }
 
-    /// 主动关闭当前会话与底层 WebRTC Peer 连接
-    pub async fn close(&self) {
+    /// 关停引擎的唯一出口，幂等可重复调用
+    ///
+    /// 次序固定为「先关会话，再停编码线程」。
+    pub async fn stop(&self) {
+        self.close_session().await;
+        self.video.shutdown();
+    }
+
+    /// 关闭当前活跃会话
+    ///
+    /// 只拆会话不拆管线
+    pub async fn close_session(&self) {
         self.session_epoch.fetch_add(1, Ordering::SeqCst);
         let old = self.active_session.swap(None);
         if let Some(session) = old {
@@ -230,14 +240,6 @@ impl StreamingEngine {
                 ProfileApply::Rejected
             }
         }
-    }
-
-    /// 编码管线关停入口：投递 Shutdown 并有界等待编码线程完成确定性级联析构
-    /// （外部显存资源注销并 ACK 后才返回，超时放弃等待并记错误）。
-    /// Java 侧必须在本调用返回后才可销毁 Vulkan 资源；不关闭 WebRTC 会话，
-    /// 那是 [`Self::close`] 的职责。可重复调用
-    pub fn stop(&self) {
-        self.video.shutdown();
     }
 }
 
@@ -478,7 +480,7 @@ a=rtpmap:102 H264/90000\r\n";
         assert!(mgr.active_session.load().is_some());
 
         // 主动关闭会话清理
-        mgr.close().await;
+        mgr.close_session().await;
         assert!(!mgr.active_session.load().is_some());
     }
 
@@ -549,7 +551,7 @@ a=rtpmap:102 H264/90000\r\n";
             .expect("协商必须抵达 prepare ask");
 
         // 插队关闭：纪元换代
-        mgr.close().await;
+        mgr.close_session().await;
         assert!(!mgr.active_session.load().is_some());
 
         // 放行协商：建立照常完成，但安装结算按过期纪元就地自弃

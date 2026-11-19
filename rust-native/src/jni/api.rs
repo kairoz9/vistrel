@@ -17,7 +17,6 @@ use jni::sys::{jfloat, jint, jlong};
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use webrtc::peer_connection::RTCIceCandidateInit;
 
 // JNI 边界护栏：`native_method!` 生成的包装器自带 catch_unwind —— panic 一旦越过
@@ -28,10 +27,6 @@ use webrtc::peer_connection::RTCIceCandidateInit;
 // 例外：`importVramSlots` / `clearVramSlots` 的零值恰是 `ControlStatus::Ok`，按零值
 // 返回会把 panic 伪装成「已导入 / 已注销」，Java 侧据此销毁游戏侧导出资源即显存 UAF；
 // 这两个出口沿用默认的 `ThrowRuntimeExAndDefault` 抛异常，由 Java 按失败走熔断。
-
-/// 会话关闭预算：写者排空上限 500ms + Peer 关闭收尾余量；超时即告警放行，
-/// 端口释放交还后台收尾
-const SESSION_CLOSE_BUDGET: Duration = Duration::from_millis(1000);
 
 const _: jni::NativeMethod = native_method! {
     java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
@@ -134,19 +129,7 @@ fn stop_engine<'caller>(
     let engine = state.streaming_engine.swap(None);
 
     if let Some(engine) = engine {
-        // 主动关闭活跃会话并等到底：写者排空、Peer 关闭完成后 UDP 绑定才放手，
-        // 本函数返回后紧随的重建引擎才能确定性 bind 成功。有界等待，超时交还后台收尾
-        let closing_engine = Arc::clone(&engine);
-        let closed = state.runtime.block_on(async {
-            tokio::time::timeout(SESSION_CLOSE_BUDGET, closing_engine.close()).await
-        });
-        if closed.is_err() {
-            log::warn!("会话关闭超出 {SESSION_CLOSE_BUDGET:?} 预算，UDP 端口释放延后");
-        }
-
-        // 终止 EncoderActor：注销全部外部显存资源并 ACK 后等待（有界，最长 5s），
-        // Java 侧随后才可销毁 Vulkan 资源
-        engine.stop();
+        state.runtime.block_on(engine.stop());
     }
     Ok(())
 }
@@ -362,7 +345,7 @@ fn close_session<'caller>(
     let state = get_global();
     if let Some(engine) = state.streaming_engine.load_full() {
         state.runtime.spawn(async move {
-            engine.close().await;
+            engine.close_session().await;
         });
     }
     Ok(())
