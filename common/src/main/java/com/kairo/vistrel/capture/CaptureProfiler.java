@@ -19,15 +19,21 @@ import java.util.concurrent.atomic.AtomicLongArray;
  * <p>各阶段样本独立计算分位数，不保证跨阶段来自同一帧；分位数不可直接相加做
  * 严格分解。未走到阶段结束点的异常帧只计入 total 与失败计数，不会补造阶段样本。
  *
- * <p>开发环境默认启用，可用 {@code -Dvistrel.capture.profile=false} 关闭；
- * 生产环境恒定关闭。关闭时 {@link #begin()} 返回 0，其余记录方法立即返回。
+ * <p>开发环境默认启用；生产默认关闭，可用 {@code -Dvistrel.capture.profile=true}
+ * 强制开启（诊断用：每 5 秒向 latest.log 输出一次各窗口的活跃采样与计数），
+ * {@code =false} 恒关且优先于 {@code =true}。关闭时 {@link #begin()} 返回 0，
+ * 其余记录方法立即返回。
  *
  * <p>线程模型：{@code end}/{@code count} 只在渲染线程调用，每个阶段单写者；
  * 上报线程只读环形缓冲与原子计数，不与渲染线程同步。
  */
 final class CaptureProfiler {
-    static final boolean ENABLED = Services.PLATFORM.isDevelopmentEnvironment()
-            && !"false".equalsIgnoreCase(System.getProperty("vistrel.capture.profile"));
+    /**
+     * 开关判定只读一次：dev 默认开；生产默认关，显式 =true 强开、=false 恒关优先
+     */
+    private static final String PROP = System.getProperty("vistrel.capture.profile");
+    static final boolean ENABLED = (Services.PLATFORM.isDevelopmentEnvironment() || "true".equalsIgnoreCase(PROP))
+            && !"false".equalsIgnoreCase(PROP);
     /**
      * 每阶段保留的最近样本数：5 秒窗口在 240fps 下约 1200 帧，4096 足够覆盖
      */
