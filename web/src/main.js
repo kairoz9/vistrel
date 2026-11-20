@@ -7,24 +7,21 @@ import { RecordingController } from "./streaming/recorder.js";
 import { ReplayClipController } from "./streaming/recorder.js";
 
 const VISTREL_PASSWORD_KEY = "vistrel_password";
-const URL_CODEC_KEY = "codec";
 
 window.addEventListener("DOMContentLoaded", () => {
     const ui = new UIManager();
-    const urlParams = new URLSearchParams(window.location.search);
-    const urlCodec = urlParams.get(URL_CODEC_KEY);
 
     let currentPassword = (sessionStorage.getItem(VISTREL_PASSWORD_KEY) || "").trim();
 
     let recordingController = null;
     let inputController = null;
 
-    // 建立浏览器侧串流会话：构造只接环境与输入，输出全部走订阅
+    // 建立浏览器侧串流会话：构造只接环境与输入，输出全部走订阅。
+    // 串流偏好束每次建连现读：设置面板的变更在下次连接生效
     const session = new StreamingSession({
         videoElement: ui.video,
         audioElement: ui.audio,
-        urlCodec: urlCodec,
-        getBpp: () => ui.curBpp,
+        getPreferences: () => ui.streamPreferences,
         getViewport: () => ui.videoViewport(),
     });
 
@@ -47,6 +44,10 @@ window.addEventListener("DOMContentLoaded", () => {
         if (profile.backend) {
             ui.setBackend(profile.backend);
         }
+        // 能力清单启用设置面板的编码偏好选择器（可选值由服务端给出）
+        if (profile.backends) {
+            ui.setEncoderOptions(profile.backends);
+        }
     });
     session.on(SESSION_EVENTS.STATS, (stats) => {
         if (stats.rttMs !== null) ui.setRtt(stats.rttMs);
@@ -67,6 +68,8 @@ window.addEventListener("DOMContentLoaded", () => {
         ui.showPasswordModal(result.message);
     });
     session.on(SESSION_EVENTS.KICKED, () => ui.modals.kicked.show());
+    // 服务端信令错误（含编码偏好不可满足的拒绝）必须可见：重连闭环里无声失败最难排查
+    session.on(SESSION_EVENTS.ERROR, (message) => ui.showToast(`连接被拒绝：${message}`));
 
     // 播放流录制控制器：断线时由会话拆除通知触发自动保存
     recordingController = new RecordingController({

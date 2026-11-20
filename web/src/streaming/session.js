@@ -1,5 +1,12 @@
 import { WS_IN, WS_OUT, CONTROL_IN, KICKED_CODE, parseCodecToken } from "./protocol.js";
 
+/** 偏好束读取不可用（UI 层异常等）时的兜底：全部按自动档协商 */
+const DEFAULT_PREFERENCES = Object.freeze({
+    bpp: 0.1,
+    encoder: "auto",
+    codec: "auto",
+});
+
 /**
  * 连接状态
  */
@@ -23,6 +30,8 @@ export const SESSION_EVENTS = Object.freeze({
     AUDIO_TRACK: "audio-track",
     ACTION: "action",
     TORN_DOWN: "torn-down",
+    /** 服务端下发的信令错误（含编码偏好不可满足的拒绝原因），负载为错误文案 */
+    ERROR: "error",
 });
 
 /**
@@ -59,23 +68,31 @@ export class StreamingSession {
      * @param {Object} options
      * @param {HTMLVideoElement} options.videoElement
      * @param {HTMLAudioElement} options.audioElement
-     * @param {() => number} options.getBpp 当前画质档位（0.10 - 0.30）
-     * @param {() => ({width: number, height: number} | null)} options.getViewport
-     *        视频显示区物理像素上限（CSS × DPR 已在 UI 层算好），自动上限输入
-     * @param {string | null} options.urlCodec 用户通过 URL 显式指定的编解码器
+     * @param {() => {bpp: number, encoder: string, codec: string}} options.getPreferences
+     *        串流偏好束（设置面板的持久化选择）的现读快照：每次建连现读，改完偏好在
+     *        下次连接生效。显示适配是纯呈现，不属会话偏好
+     * @param {() => ({width: number, height: number} | null)} [options.getViewport]
+     *        视频显示区物理像素上限（CSS × DPR 已在 UI 层算好）：即时测量非偏好，
+     *        每次发送现读，自动上限输入
      */
-    constructor({ videoElement, audioElement, getBpp, getViewport, urlCodec }) {
+    constructor({ videoElement, audioElement, getPreferences, getViewport }) {
         this.video = videoElement;
         this.audio = audioElement;
-        this.getBpp = getBpp;
-        this.getViewport = getViewport;
-        this.urlCodec = urlCodec;
+        this.getPreferences = getPreferences || (() => DEFAULT_PREFERENCES);
+        this.getViewport = getViewport || (() => null);
 
         // 对外输出全走订阅：状态是会话事实（存字段并发事件），游戏侧动作是边沿
         this.listeners = new Map();
         this.status = null;
         this.auth = "pending";
-        this.profile = { width: null, height: null, fps: null, codec: parseCodecToken(urlCodec), backend: "unknown" };
+        this.profile = {
+            width: null,
+            height: null,
+            fps: null,
+            codec: parseCodecToken(this.readPreferences().codec),
+            backend: "unknown",
+            backends: null,
+        };
 
         this.pc = null;
         this.ws = null;
@@ -130,13 +147,19 @@ export class StreamingSession {
         this.emit(SESSION_EVENTS.STATUS, status);
     }
 
-    setProfile(width, height, fps, codec, backend) {
+    setProfile(width, height, fps, codec, backend, backends) {
         width = width || 1920;
         height = height || 1080;
         fps = fps || 60;
-        // backend 是协商回执如实上报的**实际**后端（能力探测快照回答的是「本机有无硬编」，
-        // 硬编回退软编后两者分叉）；单会话内后端不变，随 answer 一次性落定
-        this.profile = { width, height, fps, codec, backend: backend || "unknown" };
+        // backend/backends 是协商回执的事实（实际建成身份与可选值清单），随 answer 一次性落定
+        this.profile = {
+            width,
+            height,
+            fps,
+            codec,
+            backend: backend || "unknown",
+            backends: Array.isArray(backends) ? backends : null,
+        };
         this.emit(SESSION_EVENTS.PROFILE, this.profile);
     }
 
@@ -209,27 +232,33 @@ export class StreamingSession {
         // 顺序结构下 WS 必已开启，此判断仅防御 onopen 后连接瞬断的窗口
         if (this.ws && this.ws.readyState === WebSocket.OPEN && this.pc && this.pc.localDescription) {
             this.offerSent = true;
-            // 分辨率与帧率是服务端从游戏内容推导的事实：客户端只带画质档位与视口上限，
-            // 绝不上送 width/height/fps
+            // 分辨率与帧率是服务端从游戏内容推导的事实：客户端只带画质档位、视口上限
+            // 与编码偏好，绝不携带 width/height/fps；自动偏好不占字段（缺省即自动）
+            const { bpp, encoder, codec } = this.readPreferences();
             const payload = {
                 type: WS_OUT.OFFER,
                 password: this.currentPassword,
-                bpp: this.getBpp ? this.getBpp() : 0.1,
-                viewport: this.collectViewport(),
+                bpp,
+                viewport: this.getViewport(),
                 sdp: this.pc.localDescription,
             };
+            if (encoder && encoder !== "auto") {
+                payload.backend = encoder;
+            }
+            if (codec && codec !== "auto") {
+                payload.codec = codec;
+            }
             this.ws.send(JSON.stringify(payload));
         }
     }
 
-    /** 读取视频显示区物理像素上限；元素未布局时返回 null（视为无上限） */
-    collectViewport() {
-        if (!this.getViewport) return null;
-        try {
-            return this.getViewport();
-        } catch (_) {
-            return null;
+    /** 现读偏好束：注入方只做字段读取，字段缺省逐项回退默认值 */
+    readPreferences() {
+        const merged = { ...DEFAULT_PREFERENCES };
+        for (const [key, value] of Object.entries(this.getPreferences() ?? {})) {
+            if (value !== undefined) merged[key] = value;
         }
+        return merged;
     }
 
     /**
@@ -239,8 +268,8 @@ export class StreamingSession {
      */
     sendSettings() {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        const payload = { type: WS_OUT.SETTINGS, bpp: this.getBpp ? this.getBpp() : 0.1 };
-        const viewport = this.collectViewport();
+        const payload = { type: WS_OUT.SETTINGS, bpp: this.readPreferences().bpp };
+        const viewport = this.getViewport();
         if (viewport) payload.viewport = viewport;
         this.ws.send(JSON.stringify(payload));
     }
@@ -261,7 +290,7 @@ export class StreamingSession {
 
                 // SDP 生效后才算认证成功：避免 setRemoteDescription 失败时提前持久化凭据
                 this.setAuth({ ok: true });
-                this.setProfile(msg.width, msg.height, msg.fps, ackCodec, msg.backend);
+                this.setProfile(msg.width, msg.height, msg.fps, ackCodec, msg.backend, msg.backends);
                 console.log(`Vistrel: Negotiation complete: ${msg.width}x${msg.height}@${msg.fps} (${ackCodec})`);
             } else if (msg.type === WS_IN.CANDIDATE && msg.candidate) {
                 if (this.pc && this.pc.remoteDescription) {
@@ -279,7 +308,10 @@ export class StreamingSession {
                 this.ws = null;
                 this.setAuth({ ok: false, message: msg.message || "密码错误，请重新输入" });
             } else if (msg.type === WS_IN.ERROR) {
-                console.error("Vistrel: Signaling error from server:", msg.message || "unknown");
+                const message = msg.message || "unknown";
+                console.error("Vistrel: Signaling error from server:", message);
+                // 拒绝原因（如编码偏好不可满足）必须上屏：否则硬拒绝只是无声的重连循环
+                this.emit(SESSION_EVENTS.ERROR, message);
                 this.setStatus(ConnectStatus.DISCONNECTED);
                 // 信令错误视为可恢复：关闭信令连接，走 onclose 的 3 秒重连闭环
                 if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -313,28 +345,8 @@ export class StreamingSession {
         }
         this.pc = new RTCPeerConnection(config);
 
-        // 设置编码首选偏好 (setCodecPreferences)
-        const videoTransceiver = this.pc.addTransceiver("video", { direction: "recvonly" });
-        if ("RTCRtpReceiver" in window && "getCapabilities" in RTCRtpReceiver && videoTransceiver.setCodecPreferences) {
-            const capabilities = RTCRtpReceiver.getCapabilities("video");
-            if (capabilities && capabilities.codecs) {
-                const preferredOrder = this.urlCodec ? [this.urlCodec.toLowerCase()] : ["av1", "h265", "hevc", "h264"];
-
-                const sortedCodecs = [...capabilities.codecs].sort((a, b) => {
-                    const aIdx = preferredOrder.findIndex((c) => a.mimeType.toLowerCase().includes(c));
-                    const bIdx = preferredOrder.findIndex((c) => b.mimeType.toLowerCase().includes(c));
-                    const rankA = aIdx === -1 ? 999 : aIdx;
-                    const rankB = bIdx === -1 ? 999 : bIdx;
-                    return rankA - rankB;
-                });
-                try {
-                    videoTransceiver.setCodecPreferences(sortedCodecs);
-                    console.log("Vistrel: Applied codec preferences via setCodecPreferences:", sortedCodecs);
-                } catch (e) {
-                    console.warn("Vistrel: setCodecPreferences failed:", e);
-                }
-            }
-        }
+        // codec 偏好随 offer 具名字段上行；SDP 载荷序只承载浏览器解码可行性（默认全量提供）
+        this.pc.addTransceiver("video", { direction: "recvonly" });
 
         this.pc.addTransceiver("audio", { direction: "recvonly" });
 

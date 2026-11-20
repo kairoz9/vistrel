@@ -46,6 +46,22 @@
                 <!-- 档位滑条由 DiscreteSlider 生成（档位表来自 protocol.js） -->
                 <div id="qualityControls"></div>
 
+                <!-- 编码偏好选择器：选项由协商回执填充，回执前禁用；变更存偏好、重连生效 -->
+                <div class="settings-block">
+                    <div class="setting-label-row">
+                        <span class="setting-label">编码后端</span>
+                        <select class="setting-select" id="encoderBackendSelect" disabled></select>
+                    </div>
+                    <p class="setting-desc">变更在重新连接后生效。</p>
+                </div>
+                <div class="settings-block">
+                    <div class="setting-label-row">
+                        <span class="setting-label">Codec</span>
+                        <select class="setting-select" id="codecSelect" disabled></select>
+                    </div>
+                    <p class="setting-desc">变更在重新连接后生效。</p>
+                </div>
+
                 <div class="settings-block">
                     <div class="setting-label-row">
                         <span class="setting-label">回放缓冲</span>

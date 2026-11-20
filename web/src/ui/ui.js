@@ -1,16 +1,16 @@
-import { BPP_TIERS, FIT_MODES } from "../streaming/protocol.js";
+import { BPP_TIERS, FIT_MODES, parseCodecToken } from "../streaming/protocol.js";
 import { MetricRow, StatusDot, Modal, DiscreteSlider, Button } from "./components.js";
 import { DraggablePanel } from "./draggable-panel.js";
 import { copyTextWithFallback, openExternalUrl } from "../utils.js";
 import { notice, pin, toast, unpin } from "./notice.js";
 
 const VISTREL_HUD_KEY = "vistrel_hud_pos";
-// 上次的画质档位与显示适配：几何与帧率归服务端内容推导，客户端只保留这两个偏好
+// 上次的画质档位、显示适配与编码偏好：几何与帧率归服务端内容推导，客户端只保留这些偏好
 const VISTREL_PROFILE_KEY = "vistrel_profile";
 // 解锁后的常驻提示文案：常驻槽位归 notice 模块所有，被一次性提示遮蔽后自动放回
 const LOCK_HINT_TEXT = "点击画面锁定鼠标";
 
-/** 读取上次的偏好；旧版含 width/height/fps 的存档只取 bpp，几何字段作废 */
+/** 读取上次的偏好；旧版含 width/height/fps 的存档只取偏好字段 */
 function readProfilePreference() {
     try {
         const raw = localStorage.getItem(VISTREL_PROFILE_KEY);
@@ -19,6 +19,13 @@ function readProfilePreference() {
         const pref = {};
         if (typeof saved.bpp === "number") pref.bpp = saved.bpp;
         if (typeof saved.fitMode === "string") pref.fitMode = saved.fitMode;
+        // 编码偏好按线上词汇形状宽松校验（陈旧值会在收到回执后重置为自动）
+        if (typeof saved.encoder === "string" && /^[a-z0-9_]+$/.test(saved.encoder)) {
+            pref.encoder = saved.encoder;
+        }
+        if (typeof saved.codec === "string" && /^[a-z0-9]+$/.test(saved.codec)) {
+            pref.codec = saved.codec;
+        }
         return Object.keys(pref).length > 0 ? pref : null;
     } catch (_) {
         return null;
@@ -203,6 +210,25 @@ export class UIManager {
             tickLabel: (bpp) => (bpp === BPP_TIERS[0] || bpp === BPP_TIERS[BPP_TIERS.length - 1] ? bpp.toFixed(2) : ""),
             onCommit: () => this.notifyProfileChange(),
         });
+
+        // 编码偏好选择器：选项由协商回执填充，回执前禁用；变更存偏好、重连生效（HUD 徽标为实际值）
+        this.encoderOptions = null;
+        this.encoderPref = "auto";
+        this.codecPref = "auto";
+        this.encoderSelect = this.modals.settings.element.querySelector("#encoderBackendSelect");
+        this.codecSelect = this.modals.settings.element.querySelector("#codecSelect");
+        this.renderEncoderOptions();
+        this.renderCodecOptions();
+        this.encoderSelect.addEventListener("change", () => {
+            this.encoderPref = this.encoderSelect.value;
+            this.renderCodecOptions();
+            this.saveProfilePreference();
+        });
+        this.codecSelect.addEventListener("change", () => {
+            this.codecPref = this.codecSelect.value;
+            this.saveProfilePreference();
+        });
+
         this.restoreProfilePreference();
         this.initHudPanel();
     }
@@ -235,7 +261,7 @@ export class UIManager {
         }
     }
 
-    /** 偏好跨会话保持：只有 BPP 与显示适配属于客户端；协商回执不覆盖它们 */
+    /** 偏好跨会话保持：BPP、显示适配与编码偏好属于客户端；协商回执不覆盖它们 */
     saveProfilePreference() {
         try {
             localStorage.setItem(
@@ -243,6 +269,8 @@ export class UIManager {
                 JSON.stringify({
                     bpp: this.curBpp,
                     fitMode: this.fitMode,
+                    encoder: this.encoderPref,
+                    codec: this.codecPref,
                 }),
             );
         } catch (_) {
@@ -259,7 +287,112 @@ export class UIManager {
             const mode = FIT_MODES.find((m) => m.value === saved.fitMode);
             if (mode) this.fitModeSlider.select(mode);
         }
+        if (typeof saved.encoder === "string") this.encoderPref = saved.encoder;
+        if (typeof saved.codec === "string") this.codecPref = saved.codec;
+        this.renderEncoderOptions();
+        this.renderCodecOptions();
         this.applyFitMode();
+    }
+
+    /* ---------------- 编码偏好选择器 ---------------- */
+
+    /** 编码后端偏好（线上词汇或 "auto"），会话建连时现读 */
+    get encoderPreference() {
+        return this.encoderPref;
+    }
+
+    /** Codec 偏好（token 或 "auto"），现读语义同 encoderPreference */
+    get codecPreference() {
+        return this.codecPref;
+    }
+
+    /** 串流偏好束（设置面板的持久化选择）：offer/settings 载荷的单一来源；
+     *  视口上限与显示适配是即时测量/纯呈现，不属偏好 */
+    get streamPreferences() {
+        return {
+            bpp: this.curBpp,
+            encoder: this.encoderPref,
+            codec: this.codecPref,
+        };
+    }
+
+    /**
+     * 协商回执的能力清单 → 选择器可选值，随后启用；陈旧偏好不在清单内时重置为自动
+     *
+     * @param {Array<{kind: string, codecs: string[]}>} backends answer 携带的能力清单
+     */
+    setEncoderOptions(backends) {
+        if (!Array.isArray(backends)) return;
+        const options = backends.filter(
+            (b) => b && typeof b.kind === "string" && Array.isArray(b.codecs) && b.codecs.length > 0,
+        );
+        if (options.length === 0) return;
+        this.encoderOptions = options;
+        this.renderEncoderOptions();
+        this.renderCodecOptions();
+    }
+
+    /** 编码后端选项表：自动 + 回执清单；回执未到前只有自动且禁用 */
+    renderEncoderOptions() {
+        const options = [{ value: "auto", label: "自动" }];
+        for (const backend of this.encoderOptions ?? []) {
+            options.push({ value: backend.kind, label: backendLabel(backend.kind) });
+        }
+        // 陈旧偏好只在拿到真实清单后校验：回执未到时保持持久化值不动
+        if (this.encoderOptions && this.encoderPref !== "auto"
+            && !this.encoderOptions.some((b) => b.kind === this.encoderPref)) {
+            this.encoderPref = "auto";
+        }
+        this.fillSelect(this.encoderSelect, options, this.encoderPref, !this.encoderOptions);
+    }
+
+    /** Codec 选项表：自动 + 选中后端的能力 ∩ 浏览器解码能力（解不动的直接隐藏） */
+    renderCodecOptions() {
+        const decodable = this.browserDecodableCodecs();
+        const backend = this.encoderOptions?.find((b) => b.kind === this.encoderPref);
+        const seen = new Set();
+        const options = [{ value: "auto", label: "自动" }];
+        for (const wireName of backend?.codecs ?? []) {
+            const token = parseCodecToken(wireName);
+            // 解码能力探测失败按全可解码处理；同一 token（AVC1/h264 等拼写）只留一项
+            if (decodable && !decodable.has(token)) continue;
+            if (seen.has(token)) continue;
+            seen.add(token);
+            options.push({ value: token, label: codecLabel(token) });
+        }
+        if (this.encoderOptions && this.codecPref !== "auto" && !seen.has(this.codecPref)) {
+            this.codecPref = "auto";
+        }
+        this.fillSelect(this.codecSelect, options, this.codecPref, !this.encoderOptions);
+    }
+
+    /** 浏览器可解码 token 集合；RTCRtpReceiver 能力不可用时返回 null（不设限） */
+    browserDecodableCodecs() {
+        try {
+            const caps = RTCRtpReceiver.getCapabilities?.("video");
+            if (!caps?.codecs) return null;
+            const tokens = new Set();
+            for (const codec of caps.codecs) {
+                if (typeof codec.mimeType === "string") tokens.add(parseCodecToken(codec.mimeType));
+            }
+            return tokens;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    /** 填充选项并回挂当前值；disabled 表示「回执未到，暂不可选」 */
+    fillSelect(select, options, current, disabled) {
+        select.replaceChildren(
+            ...options.map((opt) => {
+                const el = document.createElement("option");
+                el.value = opt.value;
+                el.textContent = opt.label;
+                return el;
+            }),
+        );
+        select.value = options.some((opt) => opt.value === current) ? current : "auto";
+        select.disabled = disabled;
     }
 
     /**

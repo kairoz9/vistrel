@@ -974,6 +974,31 @@ video {
     color: var(--text-mute);
 }
 
+/* 编码偏好选择器：原生 select 只做配色与圆角对齐卡片，不替换下拉行为 */
+.setting-select {
+    appearance: none;
+    padding: 4px 22px 4px 10px;
+    font-size: 12px;
+    color: var(--text);
+    background-color: var(--surface);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M1 1l3 3 3-3' fill='none' stroke='%236c6c6a' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+}
+
+.setting-select:disabled {
+    color: var(--text-mute);
+    cursor: not-allowed;
+}
+
+.setting-select option {
+    background-color: var(--surface);
+    color: var(--text);
+}
+
 /* --------------------------------------------------------------------------
    窄屏适配
    -------------------------------------------------------------------------- */

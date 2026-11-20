@@ -76,7 +76,7 @@ function installStubs() {
     vi.stubGlobal("MediaStream", FakeMediaStream);
 }
 
-function makeSession({ noBpp = false, getViewport, urlCodec } = {}) {
+function makeSession({ preferences, getViewport } = {}) {
     const video = document.createElement("video");
     const audio = document.createElement("audio");
     for (const element of [video, audio]) {
@@ -87,9 +87,13 @@ function makeSession({ noBpp = false, getViewport, urlCodec } = {}) {
     const session = new StreamingSession({
         videoElement: video,
         audioElement: audio,
-        getBpp: noBpp ? undefined : () => 0.2,
+        getPreferences: () => ({
+            bpp: 0.2,
+            encoder: "auto",
+            codec: "auto",
+            ...preferences,
+        }),
         getViewport: getViewport === undefined ? () => ({ width: 1920, height: 1080 }) : getViewport,
-        urlCodec: urlCodec ?? null,
     });
     return { session, video, audio };
 }
@@ -156,32 +160,23 @@ describe("会话启动", () => {
         expect(session.offerSent).toBe(true);
     });
 
-    it("显式 URL codec 提前编解码器偏好排序", async () => {
-        vi.stubGlobal("RTCRtpReceiver", {
-            getCapabilities: () => ({
-                codecs: [{ mimeType: "video/H264" }, { mimeType: "video/AV1" }, { mimeType: "video/H265" }],
-            }),
-        });
-        const { pc } = await startSession({ urlCodec: "h265" });
-        expect(pc.transceivers[0].setCodecPreferences).toHaveBeenCalledWith([
-            { mimeType: "video/H265" },
-            { mimeType: "video/H264" },
-            { mimeType: "video/AV1" },
-        ]);
+    it("显式 codec 偏好随 offer 携带，自动时不占字段", async () => {
+        const { ws } = await startSession({ preferences: { codec: "h265" } });
+        expect(JSON.parse(ws.sent[0]).codec).toBe("h265");
+
+        const { ws: autoWs } = await startSession();
+        expect(JSON.parse(autoWs.sent[0])).not.toHaveProperty("codec");
     });
 
-    it("默认按 av1 > h265 > h264 排序编解码器偏好", async () => {
+    it("SDP 载荷序不再承载偏好：不调用 setCodecPreferences", async () => {
         vi.stubGlobal("RTCRtpReceiver", {
             getCapabilities: () => ({
                 codecs: [{ mimeType: "video/H264" }, { mimeType: "video/AV1" }, { mimeType: "video/H265" }],
             }),
         });
-        const { pc } = await startSession();
-        expect(pc.transceivers[0].setCodecPreferences).toHaveBeenCalledWith([
-            { mimeType: "video/AV1" },
-            { mimeType: "video/H265" },
-            { mimeType: "video/H264" },
-        ]);
+        const { pc } = await startSession({ preferences: { codec: "h265" } });
+        expect(pc.addTransceiver).toHaveBeenCalledWith("video", { direction: "recvonly" });
+        expect(pc.transceivers[0].setCodecPreferences).not.toHaveBeenCalled();
     });
 });
 
@@ -204,7 +199,38 @@ describe("信令下行分流", () => {
         );
         expect(session.pc.setRemoteDescription).toHaveBeenCalledWith({ type: "answer", sdp: expect.any(String) });
         expect(authEvents).toEqual([{ ok: true }]);
-        expect(profileEvents).toEqual([{ width: 1920, height: 1080, fps: 60, codec: "h265", backend: "nvenc" }]);
+        expect(profileEvents).toEqual([
+            { width: 1920, height: 1080, fps: 60, codec: "h265", backend: "nvenc", backends: null },
+        ]);
+    });
+
+    it("answer 携带的能力清单原样进入协商档案", async () => {
+        const { session } = makeSession();
+        session.pc = new FakeRTCPeerConnection({});
+        const profileEvents = [];
+        session.on("profile", (profile) => profileEvents.push(profile));
+        await session.handleSignalingMessage(
+            JSON.stringify({
+                type: "answer",
+                sdp: "v=0\r\na=rtpmap:96 H264\r\n",
+                backend: "software",
+                backends: [
+                    { kind: "nvenc", codecs: ["H264", "H265", "AV1"] },
+                    { kind: "software", codecs: ["H264"] },
+                ],
+            }),
+        );
+        expect(profileEvents[0]).toEqual({
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            codec: "h264",
+            backend: "software",
+            backends: [
+                { kind: "nvenc", codecs: ["H264", "H265", "AV1"] },
+                { kind: "software", codecs: ["H264"] },
+            ],
+        });
     });
 
     it("answer（字符串形态）与缺省档位回填", async () => {
@@ -215,7 +241,14 @@ describe("信令下行分流", () => {
         await session.handleSignalingMessage(JSON.stringify({ type: "answer", sdp: "v=0\r\na=rtpmap:96 H264\r\n" }));
         expect(session.pc.setRemoteDescription).toHaveBeenCalledWith({ type: "answer", sdp: expect.any(String) });
         // 应答缺 backend 字段（旧 Native）按未知处理
-        expect(profileEvents[0]).toEqual({ width: 1920, height: 1080, fps: 60, codec: "h264", backend: "unknown" });
+        expect(profileEvents[0]).toEqual({
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            codec: "h264",
+            backend: "unknown",
+            backends: null,
+        });
     });
 
     it("answer 前到达的候选先存后喂，之后直达", async () => {
@@ -251,15 +284,20 @@ describe("信令下行分流", () => {
         expect(FakeWebSocket.instances).toHaveLength(1);
     });
 
-    it("信令 error 视为可恢复：转 DISCONNECTED 并关闭信令连接", async () => {
+    it("信令 error 视为可恢复：拒绝原因上事件、转 DISCONNECTED 并关闭信令连接", async () => {
         const { session } = makeSession();
         // 与 main.js 一致：先订阅再启动，首批状态事件不丢
         const statuses = [];
+        const errors = [];
         session.on("status", (status) => statuses.push(status));
+        session.on("error", (message) => errors.push(message));
         session.start("");
         const ws = session.ws;
         ws.readyState = FakeWebSocket.OPEN;
-        await session.handleSignalingMessage(JSON.stringify({ type: "error", message: "boom" }));
+        await session.handleSignalingMessage(
+            JSON.stringify({ type: "error", message: "指定的 codec 不可行" }),
+        );
+        expect(errors).toEqual(["指定的 codec 不可行"]);
         expect(statuses).toEqual([ConnectStatus.CONNECTING, ConnectStatus.DISCONNECTED]);
         expect(ws.closeCalls).toBe(1);
     });
@@ -302,6 +340,14 @@ describe("上行消息", () => {
         expect(ws.sent).toHaveLength(1);
     });
 
+    it("非自动的后端偏好随 offer 携带，自动时不占字段", async () => {
+        const { ws } = await startSession({ preferences: { encoder: "nvenc" } });
+        expect(JSON.parse(ws.sent[0]).backend).toBe("nvenc");
+
+        const { ws: autoWs } = await startSession();
+        expect(JSON.parse(autoWs.sent[0])).not.toHaveProperty("backend");
+    });
+
     it("sendSettings 携带 bpp 与视口上限，视口为空则省略", async () => {
         const { session, ws } = await startSession();
         session.sendSettings();
@@ -316,8 +362,11 @@ describe("上行消息", () => {
         expect(payload).not.toHaveProperty("viewport");
     });
 
-    it("未注入 getBpp 时 settings 回退 0.1", async () => {
-        const { session, ws } = await startSession({ noBpp: true });
+    it("偏好束缺 bpp 时 settings 回退 0.1", async () => {
+        const { session, ws } = await startSession({
+            // 缺键不覆盖：readPreferences 的 DEFAULT 合并兜出 0.1
+            preferences: { bpp: undefined },
+        });
         session.sendSettings();
         expect(JSON.parse(ws.sent.at(-1)).bpp).toBe(0.1);
     });

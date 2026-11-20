@@ -29,7 +29,8 @@ export const WS_OUT = {
 
 // 信令下行词汇表——Java 侧对端：SignalingServer 的 TextSignal 帧（candidate /
 // auth_failed / error 由其直接下发）；answer 帧负载是 NativeBridge.negotiateOffer
-// 的应答 JSON，字段形状 width/height/fps/bpp/bitrate/codec/backend/sdp
+// 的应答 JSON，字段形状 width/height/fps/bpp/bitrate/codec/backend/backends/sdp，
+// 其中 backends 是编码能力清单 [{kind, codecs}]（硬编按服务端优先级序，软件编码收尾）
 export const WS_IN = {
     ANSWER: "answer",
     CANDIDATE: "candidate",
