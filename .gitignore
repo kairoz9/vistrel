@@ -15,9 +15,7 @@ out
 !.idea/scopes
 
 # gradle
-build/
 **/build/
-.gradle/
 **/.gradle/
 **/.kotlin/
 
@@ -46,16 +44,11 @@ lerna-debug.log*
 *.njsproj
 *.sln
 *.sw?
-versions/
 **/versions/
-eclipse
-run
-runs
-logs/
 **/logs/
+**/runs/
 .agents/
 .codegraph/
 .vscode/
 .zed/
-
-
+.ua/
