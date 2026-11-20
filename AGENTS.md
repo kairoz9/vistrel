@@ -117,6 +117,13 @@ cd rust-native && cargo build --release
 # 单独校验/修复 Java 源码格式 (Spotless)
 ./gradlew spotlessCheck
 ./gradlew spotlessApply
+
+# 7. 发布（release.yml：push tag v* 自动触发；CI 亦可手动 dispatch，支持 dry_run）
+#    tag 必须与 gradle.properties / rust-native/Cargo.toml / web/package.json 三处版本一致（workflow 自动校验）
+#    产物：GitHub Release（10 个玩家 jar + SHA256SUMS）；CurseForge 上传在配置
+#    vars.CURSEFORGE_PROJECT_ID 与 secrets.CURSEFORGE_TOKEN 后自动生效，未配置则跳过
+#    注意：annotation 即 Release 正文，须加 --cleanup=whitespace，否则默认清理会剥掉 # 开头的 Markdown 标题
+git tag -a v0.1.0 --cleanup=whitespace -m "发布说明" && git push origin v0.1.0
 ```
 
 ---

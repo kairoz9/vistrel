@@ -1,0 +1,196 @@
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要发布的 tag（v 前缀；留空时取当前 ref）
+        type: string
+        required: false
+      dry_run:
+        description: 只构建并生成 SHA256SUMS，不创建 Release、不上传 CurseForge
+        type: boolean
+        required: false
+        default: false
+
+# tag 推送与手动重跑同 ref 只保留最新一次运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Verify Release Tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - name: Resolve and validate tag
+        id: tag
+        # tag 经环境变量传入而非直接内插，杜绝 workflow_dispatch 输入的脚本注入
+        env:
+          TAG_INPUT: ${{ inputs.tag || github.ref_name }}
+        run: |
+          tag="$TAG_INPUT"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag 必须形如 v<major>.<minor>.<patch>，当前为 '$tag'"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository at tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Verify version consistency across the three sources
+        # 版本三事实源必须与 tag 一致：gradle.properties（mod）/ Cargo.toml（rust）/ package.json（web），
+        # 仓库无自动同步机制，发布前在此统一兜底
+        run: |
+          version="${{ steps.tag.outputs.version }}"
+          grep -qx "version=$version" gradle.properties \
+            || { echo "::error::gradle.properties 缺少 'version=$version'"; exit 1; }
+          grep -qx "version = \"$version\"" rust-native/Cargo.toml \
+            || { echo "::error::rust-native/Cargo.toml 缺少 'version = \"$version\"'"; exit 1; }
+          grep -q "\"version\": \"$version\"" web/package.json \
+            || { echo "::error::web/package.json 版本 ≠ $version"; exit 1; }
+
+      - name: Extract release body from tag message
+        # annotated tag 的 annotation 即 Release 正文与 CurseForge changelog；
+        # 轻量 tag 没有 annotation，回退到默认正文
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          version="${tag#v}"
+          if [ "$(git for-each-ref "refs/tags/$tag" --format='%(objecttype)')" = "tag" ]; then
+            git for-each-ref "refs/tags/$tag" --format='%(contents)' | sed -e 's/[[:space:]]*$//' > release-body.md
+          else
+            cat > release-body.md <<EOF
+          ## Vistrel ${version}
+
+          WebRTC 像素流串流 mod：远程玩家浏览器零安装，直连游玩本地 Minecraft 客户端。
+
+          ### 支持矩阵
+          | MC 版本 | 加载器 | Java |
+          | --- | --- | --- |
+          | 1.20 | Fabric / Forge | 17 |
+          | 1.21 ~ 1.21.11 | Fabric / NeoForge | 21 |
+          | 26.1 ~ 26.3 | Fabric / NeoForge | 25 |
+
+          ### 安全提示
+          首次启动后 mod 在本机 30808 端口开启 HTTP/WebSocket 信令服务（即浏览器访问入口）；请仅在局域网或可信网络使用，勿暴露到公网。
+
+          NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.
+          EOF
+          fi
+
+      - name: Upload release metadata
+        uses: actions/upload-artifact@v5
+        with:
+          name: release-meta
+          path: release-body.md
+          if-no-files-found: error
+
+  build:
+    name: Build Release Jars
+    needs: guard
+    # 同仓可复用工作流：检出即 26.3 基准视图，natives/web 经 artifact 落到 gradle 默认路径
+    uses: ./.github/workflows/build.yml
+    with:
+      upload_jars: true
+
+  release:
+    name: Create GitHub Release
+    needs: [guard, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release metadata
+        uses: actions/download-artifact@v8
+        with:
+          name: release-meta
+          path: meta
+
+      - name: Download distributable jars
+        uses: actions/download-artifact@v8
+        with:
+          name: distributable-jars
+          path: dist
+
+      - name: Generate and verify SHA256SUMS
+        # 校验和文件内只含文件名（扁平），玩家下载后可直接 sha256sum -c SHA256SUMS
+        run: |
+          cd dist
+          sha256sum *.jar > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: Create GitHub Release
+        if: inputs.dry_run != true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.guard.outputs.tag }}
+          body_path: meta/release-body.md
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true
+
+  publish-cf:
+    name: Publish to CurseForge (${{ matrix.loader }} ${{ matrix.mc }})
+    needs: [guard, build]
+    # CF 项目未建 / 未配置凭据时整组跳过，GitHub Release 链路不受影响
+    if: vars.CURSEFORGE_PROJECT_ID != '' && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # game-versions 用 Maven 区间语法，逐字对应 stonecutter.properties.toml 各线 minecraft.version_range
+      # （mc-publish 运行时对 CF 官方版本列表展开，默认 game-version-filter 只收稳定正式版，
+      #   排除快照/beta/RC——jar 依赖区间内存在哪些正式版就打哪些，无需随 CF 补丁版本手动维护）
+      # glob 以 -<MC>- 锚定版本号边界，防止前缀重合的版本互相误配
+      matrix:
+        include:
+          - { mc: '1.20',   loader: fabric,   file: 'vistrel-fabric-1.20-*.jar',     game-versions: '[1.20,1.20.2)',   java: 17 }
+          - { mc: '1.20',   loader: forge,    file: 'vistrel-forge-1.20-*.jar',      game-versions: '[1.20,1.20.2)',   java: 17 }
+          - { mc: '1.21',   loader: fabric,   file: 'vistrel-fabric-1.21-*.jar',     game-versions: '[1.21,1.21.12)',  java: 21 }
+          - { mc: '1.21',   loader: neoforge, file: 'vistrel-neoforge-1.21-*.jar',   game-versions: '[1.21,1.21.12)',  java: 21 }
+          - { mc: '26.1',   loader: fabric,   file: 'vistrel-fabric-26.1-*.jar',     game-versions: '[26.1,26.2)',     java: 25 }
+          - { mc: '26.1',   loader: neoforge, file: 'vistrel-neoforge-26.1-*.jar',   game-versions: '[26.1,26.2)',     java: 25 }
+          - { mc: '26.2',   loader: fabric,   file: 'vistrel-fabric-26.2-*.jar',     game-versions: '[26.2,26.3)',     java: 25 }
+          - { mc: '26.2',   loader: neoforge, file: 'vistrel-neoforge-26.2-*.jar',   game-versions: '[26.2,26.3)',     java: 25 }
+          - { mc: '26.3',   loader: fabric,   file: 'vistrel-fabric-26.3-*.jar',     game-versions: '[26.3,26.4)',     java: 25 }
+          - { mc: '26.3',   loader: neoforge, file: 'vistrel-neoforge-26.3-*.jar',   game-versions: '[26.3,26.4)',     java: 25 }
+    steps:
+      - name: Download distributable jars
+        uses: actions/download-artifact@v8
+        with:
+          name: distributable-jars
+          path: dist
+
+      - name: Download release metadata
+        uses: actions/download-artifact@v8
+        with:
+          name: release-meta
+          path: meta
+
+      - name: Publish to CurseForge
+        # environment 显式 client：fabric.mod.json 为 "*" 不做推断，按发布决策 CF 文件只打 Client 环境标签
+        # name 置空 = 交给 CF 自命名（展示名即上传的 jar 文件名）；mc-publish 缺省取"触发 release 的标题"，
+        # 在本 tag-push 拓扑下（publish 与建 Release 平行）不可预期
+        uses: Kira-NT/mc-publish@v3
+        with:
+          curseforge-id: ${{ vars.CURSEFORGE_PROJECT_ID }}
+          curseforge-token: ${{ secrets.CURSEFORGE_TOKEN }}
+          files: dist/${{ matrix.file }}
+          name: ''
+          version-type: release
+          game-versions: ${{ matrix.game-versions }}
+          loaders: ${{ matrix.loader }}
+          environment: client
+          java: ${{ matrix.java }}
+          changelog-file: meta/release-body.md
