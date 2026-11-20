@@ -138,9 +138,11 @@ const _: jni::NativeMethod = native_method! {
     java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
     export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_negotiateOffer",
     error_policy = LogErrorAndDefault,
-    static fn negotiate_offer(offer_json: JString, width: jint, height: jint, fps: jint, bpp: jfloat) -> JString,
+    static fn negotiate_offer(offer_json: JString, width: jint, height: jint, fps: jint, bpp: jfloat, codec: JString, backend: JString) -> JString,
 };
 
+// 参数表是 Java native 方法的镜像，由 JNI ABI 定死，不归本侧的参数预算管
+#[allow(clippy::too_many_arguments)]
 fn negotiate_offer<'caller>(
     env: &mut Env<'caller>,
     _class: JClass<'caller>,
@@ -149,6 +151,8 @@ fn negotiate_offer<'caller>(
     height: jint,
     fps: jint,
     bpp: jfloat,
+    codec: JString<'caller>,
+    backend: JString<'caller>,
 ) -> jni::errors::Result<JString<'caller>> {
     if offer_json.is_null() {
         return Ok(JString::default());
@@ -157,11 +161,29 @@ fn negotiate_offer<'caller>(
         Ok(s) => s,
         Err(_) => return Ok(JString::default()),
     };
+    let codec_token = if codec.is_null() {
+        None
+    } else {
+        codec.try_to_string(env).ok()
+    };
+    let backend_token = if backend.is_null() {
+        None
+    } else {
+        backend.try_to_string(env).ok()
+    };
     let state = get_global();
     let is_running = state.is_running.load(Ordering::SeqCst);
     let engine = state.streaming_engine.load_full();
     let answer = state.runtime.block_on(handle_negotiate_offer(
-        engine, is_running, &offer_str, width, height, fps, bpp,
+        engine,
+        is_running,
+        &offer_str,
+        width,
+        height,
+        fps,
+        bpp,
+        codec_token.as_deref(),
+        backend_token.as_deref(),
     ));
     let Some(resp_str) = answer else {
         return Ok(JString::default());
@@ -175,8 +197,12 @@ fn negotiate_offer<'caller>(
     }
 }
 
-/// negotiateOffer 线上请求的处理函数：存活守卫、offer 反序列化、几何透传与应答
-/// 整形都在这里，出口只做 JString/Env 搬运，测试不经 Env 直接驱动本函数钉住线契约。
+/// negotiateOffer 线上请求的处理函数：存活守卫、offer 反序列化、几何与编码偏好
+/// 透传、应答整形；出口只做 JString/Env 搬运，测试直接驱动本函数钉线契约。
+/// `codec_token` / `backend_token` 缺省按自动；词表外令牌与不可行的偏好一律拒绝
+/// （无应答 = Java 回错误帧），偏好从不静默降级
+// 参数表与 JNI 包装层一一对应（后者由 Java native 签名定死），不归本侧的参数预算管
+#[allow(clippy::too_many_arguments)]
 async fn handle_negotiate_offer(
     engine: Option<Arc<StreamingEngine>>,
     is_running: bool,
@@ -185,6 +211,8 @@ async fn handle_negotiate_offer(
     height: i32,
     fps: i32,
     bpp: f32,
+    codec_token: Option<&str>,
+    backend_token: Option<&str>,
 ) -> Option<String> {
     if !is_running {
         return None;
@@ -211,8 +239,42 @@ async fn handle_negotiate_offer(
     } else {
         None
     };
+    // 词表外的偏好令牌 = 契约漂移：显式拒绝协商，不做静默降级
+    let preferred_codec = match codec_token {
+        None => None,
+        Some(token) => match encode::VideoCodec::from_token(token) {
+            Some(codec) => Some(codec),
+            None => {
+                log::warn!("negotiateOffer 的 codec 偏好 {token:?} 无法识别，协商拒绝");
+                return None;
+            }
+        },
+    };
+    let preferred_backend = match backend_token {
+        None => None,
+        Some(token) => match encode::EncodeBackendKind::from_token(token) {
+            Some(kind) => Some(kind),
+            None => {
+                log::warn!("negotiateOffer 的后端偏好 {token:?} 无法识别，协商拒绝");
+                return None;
+            }
+        },
+    };
 
-    let (answer, profile, backend) = match engine.handle_offer(offer, w, h, f, initial_bpp).await {
+    let (answer, profile, backend) = match engine
+        .handle_offer(
+            offer,
+            w,
+            h,
+            f,
+            initial_bpp,
+            crate::streaming::EncodePreferences {
+                backend: preferred_backend,
+                codec: preferred_codec,
+            },
+        )
+        .await
+    {
         Ok(parts) => parts,
         Err(e) => {
             log::error!("WebRTC Offer 协商失败: {e}");
@@ -229,6 +291,16 @@ async fn handle_negotiate_offer(
             "bitrate": profile.bitrate(),
             "codec": profile.codec().as_str(),
             "backend": backend.as_str(),
+            // 可选值清单：硬编按探测优先级序，软件编码恒收尾；远程玩家设置面板据此渲染
+            "backends": encode::encoder_caps_options()
+                .iter()
+                .map(|(kind, codecs)| {
+                    serde_json::json!({
+                        "kind": kind.as_str(),
+                        "codecs": codecs.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>(),
             "bppMin": encode::MIN_BPP,
             "bppMax": encode::MAX_BPP,
             "sdp": answer,
@@ -729,6 +801,8 @@ mod tests {
                 geometry.1,
                 geometry.2,
                 1.0,
+                None,
+                None,
             )
             .await;
             assert!(
@@ -742,17 +816,36 @@ mod tests {
     #[tokio::test]
     async fn test_negotiate_refuses_while_shutting_down() {
         let (engine, _rx) = make_test_engine(false);
-        let answer =
-            handle_negotiate_offer(Some(engine), false, &offer_wire_json(), 1920, 1080, 60, 1.0)
-                .await;
+        let answer = handle_negotiate_offer(
+            Some(engine),
+            false,
+            &offer_wire_json(),
+            1920,
+            1080,
+            60,
+            1.0,
+            None,
+            None,
+        )
+        .await;
         assert!(answer.is_none(), "关停期协商必须无应答");
     }
 
     /// 引擎未启动 = 无应答，不是 panic 也不是错误应答
     #[tokio::test]
     async fn test_negotiate_without_engine_returns_no_answer() {
-        let answer =
-            handle_negotiate_offer(None, true, &offer_wire_json(), 1920, 1080, 60, 1.0).await;
+        let answer = handle_negotiate_offer(
+            None,
+            true,
+            &offer_wire_json(),
+            1920,
+            1080,
+            60,
+            1.0,
+            None,
+            None,
+        )
+        .await;
         assert!(answer.is_none(), "无引擎协商必须无应答");
     }
 
@@ -774,7 +867,8 @@ mod tests {
     }
 
     /// 全线往返：协商建会话 → 档位生效 → 0 几何档位被拒。应答 JSON 的键集是 Java
-    /// 解析器锚定的线契约，多键少键都算漂移
+    /// 解析器锚定的线契约，多键少键都算漂移。指定的 codec 走规范令牌（大小写不敏感），
+    /// 能力清单在未探测环境只含软件编码
     #[tokio::test]
     async fn test_negotiate_then_apply_roundtrip_pin_line_contract() {
         let (engine, _rx) = make_test_engine(false);
@@ -787,6 +881,8 @@ mod tests {
             1080,
             60,
             1.0,
+            Some("H264"),
+            None,
         )
         .await;
         let Some(answer_json) = answer else {
@@ -801,11 +897,20 @@ mod tests {
         assert_eq!(answer["sdp"]["type"], "answer");
         assert!(!answer["sdp"]["sdp"].as_str().unwrap_or_default().is_empty());
         for key in [
-            "width", "height", "fps", "bpp", "bitrate", "codec", "backend", "bppMin", "bppMax",
-            "sdp",
+            "width", "height", "fps", "bpp", "bitrate", "codec", "backend", "backends", "bppMin",
+            "bppMax", "sdp",
         ] {
             assert!(answer.get(key).is_some(), "offer 应答缺 {key} 键");
         }
+        assert_eq!(
+            answer["backend"], "software",
+            "回执后端是假 Actor 实际建成的身份，不是偏好值"
+        );
+        assert_eq!(
+            answer["backends"],
+            serde_json::json!([{ "kind": "software", "codecs": ["H264"] }]),
+            "未探测环境的能力清单只含软件编码（软件编码恒收尾）"
+        );
 
         let applied =
             handle_apply_profile(Some(Arc::clone(&engine)), Some("h264"), 1600, 900, 90, 0.2).await;
@@ -828,5 +933,76 @@ mod tests {
                 .is_none(),
             "0 几何档位必须按暂停信号契约被拒"
         );
+    }
+
+    /// 编码偏好的硬约束契约：词表外令牌、清单外后端、本机无法满足的 codec 一律协商
+    /// 拒绝（无应答 = Java 回错误帧），绝不静默降级——「无法满足即报错」
+    #[tokio::test]
+    async fn test_negotiate_rejects_unhonorable_preferences() {
+        let (engine, _rx) = make_test_engine(false);
+
+        // 词表外的令牌：契约漂移，拒绝
+        let answer = handle_negotiate_offer(
+            Some(Arc::clone(&engine)),
+            true,
+            &offer_wire_json(),
+            1920,
+            1080,
+            60,
+            1.0,
+            Some("wmv"),
+            None,
+        )
+        .await;
+        assert!(answer.is_none(), "词表外 codec 必须显式拒绝");
+
+        // 可识别但不可行：单测无探测快照（等价离线软编机），指定硬编必须拒绝
+        let answer = handle_negotiate_offer(
+            Some(Arc::clone(&engine)),
+            true,
+            &offer_wire_json(),
+            1920,
+            1080,
+            60,
+            1.0,
+            None,
+            Some("Vulkan_Video"),
+        )
+        .await;
+        assert!(answer.is_none(), "清单外后端必须显式拒绝");
+
+        // 可识别但不可行：软编机指定 AV1——「没有 AV1 的机器上远程玩家指定 AV1 就返回错误」
+        let answer = handle_negotiate_offer(
+            Some(Arc::clone(&engine)),
+            true,
+            &offer_wire_json(),
+            1920,
+            1080,
+            60,
+            1.0,
+            Some("AV1"),
+            None,
+        )
+        .await;
+        assert!(answer.is_none(), "软编机指定 AV1 必须显式拒绝");
+
+        // 指定软编在能力清单内（软件编码恒可选）：照常协商成功，回执如实携带软编身份
+        let answer = handle_negotiate_offer(
+            Some(Arc::clone(&engine)),
+            true,
+            &offer_wire_json(),
+            1920,
+            1080,
+            60,
+            1.0,
+            None,
+            Some("software"),
+        )
+        .await;
+        let Some(answer_json) = answer else {
+            panic!("能力清单内的软编偏好必须被满足");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&answer_json).unwrap();
+        assert_eq!(parsed["backend"], "software");
     }
 }

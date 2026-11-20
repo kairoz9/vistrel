@@ -629,7 +629,7 @@ impl StreamingSession {
         let state = Arc::new(AtomicU8::new(RTCPeerConnectionState::Connected as u8));
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let doorbell = Arc::new(tokio::sync::Notify::new());
-        let control = crate::encode::control::ControlSender::new(tx, Arc::clone(&doorbell), false);
+        let control = crate::encode::control::ControlSender::new(tx, Arc::clone(&doorbell));
         let throttle = KeyframeThrottle::new(control.clone());
         let pipeline = Arc::new(crate::encode::VideoPipeline::assemble(
             control,
@@ -672,7 +672,7 @@ mod tests {
     /// 死控制面：Actor 侧无接收者，ask 走 Err(ActorDead) 兜底
     fn dead_control() -> ControlSender {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        ControlSender::new(tx, Arc::new(tokio::sync::Notify::new()), false)
+        ControlSender::new(tx, Arc::new(tokio::sync::Notify::new()))
     }
 
     /// 测试用引擎：假控制面 + 空管线（不起编码线程），只提供会话建立所需的部件

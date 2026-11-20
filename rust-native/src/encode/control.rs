@@ -72,12 +72,13 @@ pub(crate) enum ControlCommand {
             Result<(StreamingProfile, Option<EncodeBackendKind>), ControlStatus>,
         >,
     },
-    /// 按已确立的档位与后端偏好配好编码器，回送实际后端身份或拒绝原因——
-    /// 偏好硬编但构建失败静默回退软编时，Ok 携带的是软编而非偏好值
+    /// 按档位与后端偏好配好编码器，回送实际生效的档位与后端身份（硬编建败回退软编如实上报）
     PrepareEncoder {
         profile: StreamingProfile,
-        prefer_hardware: bool,
-        reply: tokio::sync::oneshot::Sender<Result<EncodeBackendKind, ControlStatus>>,
+        preferred_backend: Option<EncodeBackendKind>,
+        reply: tokio::sync::oneshot::Sender<
+            Result<(StreamingProfile, EncodeBackendKind), ControlStatus>,
+        >,
     },
     /// 导入显存直通槽位
     ImportVramSlots {
@@ -96,27 +97,16 @@ pub(crate) enum ControlCommand {
 pub(crate) struct ControlSender {
     tx: Sender<ControlCommand>,
     doorbell: Arc<Notify>,
-    /// 后端偏好：由组合根在建管线时取一次（能力探测的产物缓存复用），不随每次
-    /// [`Self::prepare_encoder`] 现场算，也不由调用方传入
-    prefer_hardware: bool,
     /// ACK 等待上限，生产固定为 [`ACK_TIMEOUT`]
     ack_timeout: Duration,
 }
 
 impl ControlSender {
     /// 构造发送端
-    ///
-    /// `prefer_hardware` 为真时优先硬编，建不起来自动回退软编：是**偏好**而非保证，
-    /// 所以不叫 `activate_hardware` —— 那个名字承诺了代码做不到的事。
-    pub(crate) fn new(
-        tx: Sender<ControlCommand>,
-        doorbell: Arc<Notify>,
-        prefer_hardware: bool,
-    ) -> Self {
+    pub(crate) fn new(tx: Sender<ControlCommand>, doorbell: Arc<Notify>) -> Self {
         Self {
             tx,
             doorbell,
-            prefer_hardware,
             ack_timeout: ACK_TIMEOUT,
         }
     }
@@ -169,19 +159,19 @@ impl ControlSender {
         }
     }
 
-    /// 按档位把编码器配好（ask）
+    /// 按档位把编码器配好（ask）：新会话接入、顶号、预热都走这一条
     ///
-    /// 命令名说的是编码段**自己的**动作：Actor 不知道什么叫会话，新会话接入、顶号、
-    /// 预热都走这一条。`Ok(kind)` 才代表「编码器已按该档位就绪」，且 kind 是实际建成
-    /// 的后端身份——偏好硬编失败回退软编时携带的是软编，调用方不必靠猜。
+    /// 后端偏好随命令携带（`None` = 自动，按能力快照默认胜者）；`Ok` 才代表已就绪，
+    /// 档位与后端都是实际生效值——硬编建败回退软编时如实携带回退值，调用方不必靠猜
     pub(crate) async fn prepare_encoder(
         &self,
         profile: StreamingProfile,
-    ) -> Result<EncodeBackendKind, ControlStatus> {
+        preferred_backend: Option<EncodeBackendKind>,
+    ) -> Result<(StreamingProfile, EncodeBackendKind), ControlStatus> {
         let (reply, wait) = tokio::sync::oneshot::channel();
         self.send(ControlCommand::PrepareEncoder {
             profile,
-            prefer_hardware: self.prefer_hardware,
+            preferred_backend,
             reply,
         })
         .map_err(Self::send_error)?;
@@ -281,7 +271,7 @@ mod tests {
                 script(cmd);
             }
         });
-        ControlSender::new(tx, bell, true)
+        ControlSender::new(tx, bell)
     }
 
     /// 只回 `Ok`、并把命令名转发出来的假 Actor
@@ -293,7 +283,10 @@ mod tests {
             }
             match cmd {
                 ControlCommand::PrepareEncoder { reply, .. } => {
-                    let _ = reply.send(Ok(EncodeBackendKind::Software));
+                    let _ = reply.send(Ok((
+                        StreamingProfile::default(),
+                        EncodeBackendKind::Software,
+                    )));
                 }
                 ControlCommand::ImportVramSlots { reply, .. } => {
                     let _ = reply.send(ControlStatus::Ok);
@@ -340,7 +333,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<ControlCommand>(CONTROL_QUEUE_DEPTH);
         let bell = Arc::new(Notify::new());
         drop(rx);
-        let sender = ControlSender::new(tx, bell, true);
+        let sender = ControlSender::new(tx, bell);
         assert_eq!(
             sender.clear_vram_slots(),
             Err(ControlStatus::ActorDead),
@@ -356,7 +349,7 @@ mod tests {
                 .expect("预热控制队列必须成功");
         }
         let bell = Arc::new(Notify::new());
-        let sender = ControlSender::new(tx, bell, true);
+        let sender = ControlSender::new(tx, bell);
         let start = Instant::now();
         assert_eq!(sender.clear_vram_slots(), Err(ControlStatus::QueueFull));
         assert!(
@@ -397,30 +390,34 @@ mod tests {
         drop(held);
     }
 
-    /// 后端偏好是构造期状态，但必须真的送达 Actor，否则「优先硬编」只是注释
+    /// 后端偏好随命令逐次携带：偏好值必须真的送达 Actor，否则「指定后端」只是注释
     #[test]
-    fn test_prepare_encoder_carries_construction_preference() {
+    fn test_prepare_encoder_carries_backend_preference() {
         let (recorded_tx, recorded_rx) = std::sync::mpsc::channel();
         let sender = fake_actor(move |cmd| {
             if let ControlCommand::PrepareEncoder {
-                prefer_hardware,
+                preferred_backend,
                 reply,
                 ..
             } = cmd
             {
-                let _ = recorded_tx.send(prefer_hardware);
-                let _ = reply.send(Ok(EncodeBackendKind::Software));
+                let _ = recorded_tx.send(preferred_backend);
+                let _ = reply.send(Ok((
+                    StreamingProfile::default(),
+                    EncodeBackendKind::Software,
+                )));
             }
         });
         let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
         let rt = tokio::runtime::Runtime::new().expect("测试 runtime 必须能建起来");
         assert_eq!(
-            rt.block_on(sender.prepare_encoder(profile)),
-            Ok(EncodeBackendKind::Software)
+            rt.block_on(sender.prepare_encoder(profile, Some(EncodeBackendKind::Nvenc))),
+            Ok((StreamingProfile::default(), EncodeBackendKind::Software))
         );
-        assert!(
+        assert_eq!(
             recorded_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            "构造期取到的偏好必须随命令送达 Actor"
+            Some(EncodeBackendKind::Nvenc),
+            "随命令携带的后端偏好必须送达 Actor"
         );
     }
 
@@ -439,7 +436,7 @@ mod tests {
         });
 
         let requested = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
-        let (got, backend) = ControlSender::new(tx, bell, true)
+        let (got, backend) = ControlSender::new(tx, bell)
             .change_profile(requested)
             .await
             .expect("假 Actor 应答过，必须拿到值");
@@ -461,7 +458,7 @@ mod tests {
             }
         });
 
-        let err = ControlSender::new(tx, bell, true)
+        let err = ControlSender::new(tx, bell)
             .change_profile(StreamingProfile::new(1280, 720, 60, VideoCodec::H264))
             .await
             .expect_err("拒绝必须原样上报，不得折成「维持原档位」让调用方自己推断");

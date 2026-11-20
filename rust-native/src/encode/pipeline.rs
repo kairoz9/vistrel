@@ -24,9 +24,7 @@ use crate::encode::frame::{
 };
 use crate::encode::hardware::slots::SlotStateBlock;
 use crate::encode::pool::FramePool;
-use crate::encode::{
-    StreamingProfile, bootstrap_hardware_caps, hardware_caps, is_hardware_caps_bootstrapped,
-};
+use crate::encode::{StreamingProfile, bootstrap_hardware_caps, is_hardware_caps_bootstrapped};
 /// 关停等待编码线程的上限
 ///
 /// 见 `VideoPipeline::shutdown`：设备销毁后 GPU 调用可能长时间不返回，无界等待会拖死渲染线程。
@@ -82,12 +80,15 @@ impl VideoPipeline {
         self.control.import_vram_slots(slots)
     }
 
-    /// 会话建立前把编码器按档位就绪（ask），`Ok` 携带实际建成的后端身份
+    /// 会话建立前把编码器按档位就绪（ask），`Ok` 携带**实际生效**的档位与后端身份
     pub(crate) async fn prepare_encoder(
         &self,
         profile: StreamingProfile,
-    ) -> Result<EncodeBackendKind, ControlStatus> {
-        self.control.prepare_encoder(profile).await
+        preferred_backend: Option<EncodeBackendKind>,
+    ) -> Result<(StreamingProfile, EncodeBackendKind), ControlStatus> {
+        self.control
+            .prepare_encoder(profile, preferred_backend)
+            .await
     }
 
     /// 释放显存槽位表（ask，阻塞式）
@@ -134,18 +135,15 @@ impl VideoPipeline {
             })
             .expect("Failed to spawn vistrel-encoder-actor thread");
 
-        // 后端偏好只在这里定一次：本机能否硬编是启动期探测的产物，此后不随每次
-        // 配编码器变化。探测尚未发生时不能默认按「无硬编」锁死——那会让本机永久跑软编且无人察觉，
-        // 所以先补一次探测（正常路径上 `jni/api.rs` 已探测过，这里只读一次快照）
+        // 自动后端以能力快照为依据：未探测时补一次启动期探测（正常路径上 `jni/api.rs` 已探测过）
         if !is_hardware_caps_bootstrapped() {
             log::warn!("起编码管线时硬件能力尚未探测，就地补一次启动期探测");
             bootstrap_hardware_caps();
         }
-        let prefer_hardware = hardware_caps().is_some();
 
         Arc::new(Self {
             inbox,
-            control: ControlSender::new(control_tx, Arc::clone(&doorbell), prefer_hardware),
+            control: ControlSender::new(control_tx, Arc::clone(&doorbell)),
             pool,
             slot_state,
             output,

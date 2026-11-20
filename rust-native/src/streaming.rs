@@ -50,6 +50,15 @@ pub struct StreamingEngine {
     candidate_sink: ArcSwapOption<IceCandidateSink>,
 }
 
+/// 远程玩家随 offer 携带的编码偏好：缺省为自动；指定的值必须可满足，否则协商拒绝
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EncodePreferences {
+    /// 编码后端偏好（线上词汇 `nvenc` / `vulkan_video` / `software`；`None` 为自动）
+    pub backend: Option<EncodeBackendKind>,
+    /// Codec 偏好（`VideoCodec` 线上令牌；`None` 为自动）
+    pub codec: Option<VideoCodec>,
+}
+
 /// 档位 ask 的应答（被动数据载体）：只有生效值能被回传
 pub enum ProfileApply {
     /// 请求已被编码器接受并生效；后端为 None 表示编码器尚未就绪的纯采纳态
@@ -160,8 +169,8 @@ impl StreamingEngine {
 
     /// 一步到位协商 Profile 与 WebRTC SDP，并拉起会话生命周期任务
     ///
-    /// 几何与帧率来自游戏内容快照（Java 侧已合并视口上限），bpp 来自浏览器；会话对
-    /// Java 的启停通知已删除，offer 成功即 Java 信令层自持的「活跃」起点。
+    /// 几何与帧率来自游戏内容快照（Java 侧已合并视口上限），bpp 与编码偏好来自
+    /// 浏览器端；offer 成功即 Java 信令层自持的「活跃」起点。
     pub async fn handle_offer(
         self: &Arc<Self>,
         offer: RTCSessionDescription,
@@ -169,6 +178,7 @@ impl StreamingEngine {
         height: usize,
         fps: usize,
         bpp: Option<f32>,
+        preferences: EncodePreferences,
     ) -> Result<
         (RTCSessionDescription, StreamingProfile, EncodeBackendKind),
         Box<dyn std::error::Error + Send + Sync>,
@@ -184,21 +194,68 @@ impl StreamingEngine {
             self.audio.detach();
         }
 
-        let probe = crate::encode::hardware_caps();
-        let profile = resolve_initial_profile(width, height, fps, bpp, &offer, probe.as_deref());
+        // 指定的后端必须落在能力清单（协商应答回给选择器的同一份可选值）内，无法满足即拒绝
+        let backends = crate::encode::hardware_backends();
+        let preferred = match preferences.backend {
+            None => None,
+            Some(kind) => {
+                let selectable = crate::encode::encoder_caps_options();
+                if !selectable.iter().any(|(k, _)| *k == kind) {
+                    return Err(
+                        format!("指定的编码后端 {kind:?} 不在本机能力清单内，协商拒绝").into(),
+                    );
+                }
+                Some(kind)
+            }
+        };
+        // codec 解析对准指定后端的 codec 表，而不是默认胜者的；
+        // 软编域没有探测条目——无条目即仅 H.264 可行 + 几何顶格，正是软编的可行域
+        let caps_entry = match preferred.as_ref() {
+            Some(EncodeBackendKind::Software) => None,
+            Some(kind) => backends
+                .as_deref()
+                .and_then(|list| list.iter().find(|p| &p.backend_type == kind)),
+            None => backends.as_deref().and_then(|list| list.first()),
+        };
+        let profile = resolve_initial_profile(
+            width,
+            height,
+            fps,
+            bpp,
+            &offer,
+            caps_entry,
+            preferences.codec,
+        )
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
-        // prepare 的 Ok 携带实际建成的后端身份（硬编失败静默回退软编时是软编），
-        // 随应答上抛给 JNI 层写进 offer 应答
-        let backend = self
+        // prepare 回执携带实际生效档位与后端身份；指定维度被替换（建败回退）在此拒绝
+        let (effective, backend) = self
             .video
-            .prepare_encoder(profile)
+            .prepare_encoder(profile, preferred)
             .await
             .map_err(|e| format!("编码器未能在会话建立前就绪 (code={})", e.code()))?;
+        if let Some(kind) = preferred
+            && backend != kind
+        {
+            return Err(format!(
+                "指定的编码后端 {kind:?} 未能就绪（实际建成 {backend:?}），协商拒绝"
+            )
+            .into());
+        }
+        if let Some(codec) = preferences.codec
+            && effective.codec() != codec
+        {
+            return Err(format!(
+                "指定的 codec {codec:?} 未能就绪（实际建成 {:?}），协商拒绝",
+                effective.codec()
+            )
+            .into());
+        }
 
         let handler = self.candidate_handler();
 
         let (session, answer) =
-            StreamingSession::establish(self.as_ref(), offer, profile, handler).await?;
+            StreamingSession::establish(self.as_ref(), offer, effective, handler).await?;
 
         // 安装结算：先落账再复核纪元
         let old_session = self.active_session.swap(Some(Arc::clone(&session)));
@@ -213,7 +270,7 @@ impl StreamingEngine {
             old_session.close().await;
         }
 
-        Ok((answer, profile, backend))
+        Ok((answer, effective, backend))
     }
 
     /// 应用新的画质档位：阻塞 ask，应答见 [`ProfileApply`]
@@ -251,22 +308,23 @@ impl StreamingEngine {
     }
 }
 
-/// 结合 SDP 格式支持、内容快照与硬件探测协商初始 Profile
+/// 结合内容快照、硬件探测与远程玩家偏好协商初始 Profile
 ///
-/// 探测快照由调用方注入：生产路径读全局快照，单测注入假结果，避免触碰真实驱动。
-/// 无探测快照即软编：内容驱动档位退化为 `min(Content Resolution, 1080p) @ 60`，
-/// 只缩不放——把 800×600 抬到 1080p 发的是假细节。
+/// 探测条目由调用方注入（生产读全局快照，单测注入假结果）；无条目即软编：
+/// 档位退化为 `min(Content Resolution, 1080p) @ 60` 只缩不放——放大发的是假细节
+/// 指定的 codec 偏好不可行时返回 `Err`：协商显式拒绝，绝不静默替换
 fn resolve_initial_profile(
     width: usize,
     height: usize,
     fps: usize,
     bpp: Option<f32>,
     offer: &RTCSessionDescription,
-    probe: Option<&HardwareProbeResult>,
-) -> StreamingProfile {
-    let codec = resolve_codec(Some(offer), probe);
+    caps_entry: Option<&HardwareProbeResult>,
+    preferred_codec: Option<VideoCodec>,
+) -> Result<StreamingProfile, String> {
+    let codec = resolve_codec(Some(offer), caps_entry, preferred_codec)?;
     let profile = StreamingProfile::new_with_bpp(width, height, fps, bpp, codec);
-    if probe.is_none() {
+    if caps_entry.is_none() {
         let (w, h, f) = crate::encode::clamp_to_software_ceiling(
             profile.width(),
             profile.height(),
@@ -275,13 +333,20 @@ fn resolve_initial_profile(
         if (w, h, f) != (profile.width(), profile.height(), profile.fps()) {
             log::warn!("软编回退：初始档位钳制为 {w}x{h}@{f}");
         }
-        return StreamingProfile::new_with_bpp(w, h, f, Some(profile.bpp()), codec);
+        return Ok(StreamingProfile::new_with_bpp(
+            w,
+            h,
+            f,
+            Some(profile.bpp()),
+            codec,
+        ));
     }
-    profile
+    Ok(profile)
 }
 
-/// 从 RTCSessionDescription 实例直接解析客户端偏好的视频编解码器列表
-fn parse_sdp_codec_preferences(offer: &RTCSessionDescription) -> Option<Vec<VideoCodec>> {
+/// 收集 offer 实际提供的 codec 集合（rtpmap 识别）：offer 载荷列表承载浏览器解码
+/// 可行性而非偏好，本集合是指定偏好可行性校验的依据
+fn parse_sdp_offered_codecs(offer: &RTCSessionDescription) -> Option<Vec<VideoCodec>> {
     let desc = offer.unmarshal().ok()?;
     // 只取第一个 video 媒体行
     let media = desc
@@ -289,8 +354,7 @@ fn parse_sdp_codec_preferences(offer: &RTCSessionDescription) -> Option<Vec<Vide
         .into_iter()
         .find(|m| m.media_name.media == "video")?;
 
-    // pt 顺序即浏览器偏好顺序
-    let preferred_pts = media.media_name.formats;
+    let offered_pts = media.media_name.formats;
 
     // 构建 pt -> codec 映射
     let pt_to_codec: HashMap<String, VideoCodec> = media
@@ -313,47 +377,56 @@ fn parse_sdp_codec_preferences(offer: &RTCSessionDescription) -> Option<Vec<Vide
         })
         .collect();
 
-    // 按 pt 顺序去重
+    // 按 pt 顺序去重（顺序无语义，仅为去重稳定）
     let mut seen = HashSet::new();
-    let preferences: Vec<VideoCodec> = preferred_pts
+    let offered: Vec<VideoCodec> = offered_pts
         .into_iter()
         .filter_map(|pt| pt_to_codec.get(&pt).copied())
         .filter(|codec| seen.insert(*codec))
         .collect();
 
-    (!preferences.is_empty()).then_some(preferences)
+    (!offered.is_empty()).then_some(offered)
 }
 
-/// 根据硬件支持列表及 RTCSessionDescription 实例中的偏好顺序协商出编解码器
+/// 协商 codec：指定的偏好是硬约束——必须在「offer 实际提供 ∩ 服务端支持」内可满足，
+/// 无法满足即 `Err` 拒绝，绝不静默替换；auto 按服务端默认档 AV1 > H265 > H264 取第一条
+/// 可行项，兜底 H.264。SDP 载荷序只承载浏览器解码可行性，不参与判定
 fn resolve_codec(
     offer: Option<&RTCSessionDescription>,
-    probe: Option<&HardwareProbeResult>,
-) -> VideoCodec {
-    let has_hw = probe.is_some();
-    let supported_codecs = probe.map(|p| p.supported_codecs.as_slice()).unwrap_or(&[]);
+    caps_entry: Option<&HardwareProbeResult>,
+    preferred: Option<VideoCodec>,
+) -> Result<VideoCodec, String> {
+    let supported_codecs = caps_entry
+        .map(|p| p.supported_codecs.as_slice())
+        .unwrap_or(&[]);
 
-    // 无硬件编码器时，恒回退至软编支持的 H.264
-    if !has_hw {
-        return VideoCodec::H264;
-    }
-
-    let default_preferences = vec![VideoCodec::Av1, VideoCodec::H265, VideoCodec::H264];
-    // 从 RTCSessionDescription 提取客户端偏好顺序列表
-    let client_preferences = if let Some(offer) = offer {
-        parse_sdp_codec_preferences(offer).unwrap_or(default_preferences)
-    } else {
-        default_preferences
+    // 浏览器实际提供的 codec 集合；解析不出时不设限（SDP 本身损坏会在建 answer 时暴露）
+    let offered = offer.and_then(parse_sdp_offered_codecs);
+    let feasible = |codec: VideoCodec| -> bool {
+        let offered_ok = offered
+            .as_ref()
+            .map(|set| set.contains(&codec))
+            .unwrap_or(true);
+        offered_ok && (codec == VideoCodec::H264 || supported_codecs.contains(&codec))
     };
 
-    // 按照客户端从高到低的偏好，找到第一个被服务端硬件所支持的编解码器
-    for candidate in client_preferences {
-        if candidate == VideoCodec::H264 || supported_codecs.contains(&candidate) {
-            return candidate;
+    // 指定的偏好不可行（浏览器未提供或服务端无法编码）→ 协商显式拒绝
+    if let Some(codec) = preferred {
+        if feasible(codec) {
+            return Ok(codec);
         }
+        return Err(format!(
+            "指定的 codec {codec:?} 不可行：浏览器未提供或服务端无法编码"
+        ));
     }
 
-    // 兜底回退
-    VideoCodec::H264
+    // auto：服务端默认档位取第一条可行项，兜底 H.264
+    for candidate in [VideoCodec::Av1, VideoCodec::H265, VideoCodec::H264] {
+        if feasible(candidate) {
+            return Ok(candidate);
+        }
+    }
+    Ok(VideoCodec::H264)
 }
 
 /// 引擎级测试基建，供本模块与 `jni` 层的线契约用例共用：jni 缝测试驱动同一批假后端，
@@ -366,10 +439,11 @@ pub(crate) mod test_support {
     use crate::encode::frame::FrameInbox;
     use tokio::sync::Notify;
 
-    /// 假 Actor 转发出来的命令摘要：只保留断言要看的两个事实，避免用字符串当命令名
+    /// 假 Actor 转发出来的命令摘要：只保留断言要看的几个事实，避免用字符串当命令名
     #[derive(Debug, Clone, Copy)]
     pub(crate) enum Rec {
-        Prepare(StreamingProfile),
+        /// PrepareEncoder：请求档位（codec 偏好已在 resolve 阶段落进档位）与后端偏好
+        Prepare(StreamingProfile, Option<EncodeBackendKind>),
         ChangeProfile,
         SetBitrate,
         RequestKeyframe,
@@ -400,9 +474,14 @@ pub(crate) mod test_support {
                         };
                         Rec::ChangeProfile
                     }
-                    ControlCommand::PrepareEncoder { profile, reply, .. } => {
-                        let _ = reply.send(Ok(EncodeBackendKind::Software));
-                        Rec::Prepare(profile)
+                    ControlCommand::PrepareEncoder {
+                        profile,
+                        preferred_backend,
+                        reply,
+                        ..
+                    } => {
+                        let _ = reply.send(Ok((profile, EncodeBackendKind::Software)));
+                        Rec::Prepare(profile, preferred_backend)
                     }
                     ControlCommand::ImportVramSlots { reply, .. } => {
                         let _ = reply.send(ControlStatus::Ok);
@@ -425,10 +504,7 @@ pub(crate) mod test_support {
         let audio = AudioLoopback::new();
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
-        let pipeline = Arc::new(VideoPipeline::assemble(
-            ControlSender::new(tx, bell, true),
-            inbox,
-        ));
+        let pipeline = Arc::new(VideoPipeline::assemble(ControlSender::new(tx, bell), inbox));
         let mgr = Arc::new(StreamingEngine::new(
             pipeline,
             audio,
@@ -474,7 +550,14 @@ mod tests {
         assert!(!mgr.active_session.load().is_some());
 
         let (answer1, profile1, _backend1) = mgr
-            .handle_offer(make_test_offer(), 1920, 1080, 60, None)
+            .handle_offer(
+                make_test_offer(),
+                1920,
+                1080,
+                60,
+                None,
+                EncodePreferences::default(),
+            )
             .await
             .unwrap();
         assert!(!answer1.sdp.is_empty());
@@ -485,7 +568,14 @@ mod tests {
 
         // 模拟新会话接入抢占 (Kick-Old)
         let (answer2, _, _) = mgr
-            .handle_offer(make_test_offer(), 1280, 720, 30, None)
+            .handle_offer(
+                make_test_offer(),
+                1280,
+                720,
+                30,
+                None,
+                EncodePreferences::default(),
+            )
             .await
             .unwrap();
         assert!(!answer2.sdp.is_empty());
@@ -506,7 +596,14 @@ mod tests {
         let weak = Arc::downgrade(&mgr);
         {
             let (session, _answer, _backend) = mgr
-                .handle_offer(make_test_offer(), 1920, 1080, 60, None)
+                .handle_offer(
+                    make_test_offer(),
+                    1920,
+                    1080,
+                    60,
+                    None,
+                    EncodePreferences::default(),
+                )
                 .await
                 .unwrap();
             assert!(weak.upgrade().is_some(), "协商期间引擎必须存活");
@@ -530,10 +627,10 @@ mod tests {
         std::thread::spawn(move || {
             while let Some(cmd) = rx.blocking_recv() {
                 match cmd {
-                    ControlCommand::PrepareEncoder { reply, .. } => {
+                    ControlCommand::PrepareEncoder { profile, reply, .. } => {
                         let _ = entry_tx.send(());
                         let _ = release_rx.recv();
-                        let _ = reply.send(Ok(EncodeBackendKind::Software));
+                        let _ = reply.send(Ok((profile, EncodeBackendKind::Software)));
                     }
                     ControlCommand::Shutdown => break,
                     _ => {}
@@ -542,10 +639,7 @@ mod tests {
         });
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
-        let pipeline = Arc::new(VideoPipeline::assemble(
-            ControlSender::new(tx, bell, true),
-            inbox,
-        ));
+        let pipeline = Arc::new(VideoPipeline::assemble(ControlSender::new(tx, bell), inbox));
         let mgr = Arc::new(StreamingEngine::new(
             pipeline,
             AudioLoopback::new(),
@@ -555,8 +649,15 @@ mod tests {
         let offer_task = {
             let mgr = Arc::clone(&mgr);
             tokio::spawn(async move {
-                mgr.handle_offer(make_test_offer(), 640, 360, 30, None)
-                    .await
+                mgr.handle_offer(
+                    make_test_offer(),
+                    640,
+                    360,
+                    30,
+                    None,
+                    EncodePreferences::default(),
+                )
+                .await
             })
         };
         // 确定性同步：协商已过入口（纪元已快照）并停在 prepare ask 上
@@ -578,7 +679,8 @@ mod tests {
         assert!(!mgr.active_session.load().is_some(), "自弃路径不得留下会话");
     }
 
-    /// 内容驱动档位：硬件路径按请求档位生效；软编路径退化为 min(Content, 1080p)@60
+    /// 内容驱动档位：硬件路径按请求档位生效；软编路径退化为 min(Content, 1080p)@60。
+    /// codec 由偏好解析（见 `test_resolve_codec_with_sdp`），本用例钉几何/bpp/钳制
     #[test]
     fn test_negotiate_profile_codec_hierarchy() {
         let offer_h264 = RTCSessionDescription::offer(
@@ -593,34 +695,32 @@ mod tests {
             coded_align: (1, 1),
             gpu_name: String::new(),
         };
-        let h264_probe = HardwareProbeResult {
-            supported_codecs: vec![VideoCodec::H264],
-            ..av1_probe.clone()
-        };
 
-        // H.264 offer 不受硬件能力影响
-        let p = resolve_initial_profile(1920, 1080, 60, None, &offer_h264, Some(&av1_probe));
-        assert_eq!(p.codec(), VideoCodec::H264);
-        assert_eq!((p.width(), p.height(), p.fps()), (1920, 1080, 60));
-
-        // 硬件支持 AV1 时 AV1 offer 升为 AV1
-        let p = resolve_initial_profile(1920, 1080, 60, None, &offer_av1, Some(&av1_probe));
+        // 硬件路径按内容档位生效（offer 提供 AV1 且硬件支持 → auto 首选 AV1）
+        let p = resolve_initial_profile(1920, 1080, 60, None, &offer_av1, Some(&av1_probe), None)
+            .expect("可行偏好必须成功");
         assert_eq!(p.codec(), VideoCodec::Av1);
-
-        // 硬件不支持 AV1 或无硬件时回退 H.264
-        let p = resolve_initial_profile(1280, 720, 30, None, &offer_av1, Some(&h264_probe));
-        assert_eq!(p.codec(), VideoCodec::H264);
-        let p = resolve_initial_profile(1280, 720, 30, None, &offer_av1, None);
-        assert_eq!(p.codec(), VideoCodec::H264);
+        assert_eq!((p.width(), p.height(), p.fps()), (1920, 1080, 60));
 
         // 软编钳制只缩不放：大内容缩进 1080p，小内容原样保留
-        let p = resolve_initial_profile(3840, 2160, 240, None, &offer_av1, None);
+        let p = resolve_initial_profile(3840, 2160, 240, None, &offer_av1, None, None)
+            .expect("auto 协商必须成功");
         assert_eq!((p.width(), p.height(), p.fps()), (1920, 1080, 60));
-        let p = resolve_initial_profile(800, 600, 90, None, &offer_av1, None);
+        let p = resolve_initial_profile(800, 600, 90, None, &offer_av1, None, None)
+            .expect("auto 协商必须成功");
         assert_eq!((p.width(), p.height(), p.fps()), (800, 600, 60));
 
         // offer 携带的 bpp 进入档位
-        let p = resolve_initial_profile(1920, 1080, 60, Some(0.2), &offer_h264, Some(&av1_probe));
+        let p = resolve_initial_profile(
+            1920,
+            1080,
+            60,
+            Some(0.2),
+            &offer_h264,
+            Some(&av1_probe),
+            None,
+        )
+        .expect("可行偏好必须成功");
         assert_eq!(p.bpp(), 0.2);
     }
 
@@ -636,9 +736,16 @@ mod tests {
             ProfileApply::NoSession
         ));
 
-        mgr.handle_offer(make_test_offer(), 1920, 1080, 60, None)
-            .await
-            .unwrap();
+        mgr.handle_offer(
+            make_test_offer(),
+            1920,
+            1080,
+            60,
+            None,
+            EncodePreferences::default(),
+        )
+        .await
+        .unwrap();
 
         // 成功路径：假 Actor 回显请求档位，codec 随请求原样带出
         let ProfileApply::Applied(applied, _backend) =
@@ -665,6 +772,9 @@ mod tests {
         ));
     }
 
+    /// codec 协商语义：指定的偏好是硬约束，必须在「offer 实际提供 ∩ 服务端支持」内
+    /// 满足，不可行显式拒绝；auto 的档位序（AV1 > H265 > H264）由服务端定死，与
+    /// 浏览器载荷序无关
     #[test]
     fn test_resolve_codec_with_sdp() {
         use crate::encode::HardwareProbeResult;
@@ -674,6 +784,10 @@ mod tests {
             supported_codecs: vec![VideoCodec::Av1, VideoCodec::H265, VideoCodec::H264],
             coded_align: (1, 1),
             gpu_name: String::new(),
+        };
+        let h264_only_probe = HardwareProbeResult {
+            supported_codecs: vec![VideoCodec::H264],
+            ..fake_probe.clone()
         };
 
         let make_offer = |sdp: &str| -> RTCSessionDescription {
@@ -688,41 +802,61 @@ mod tests {
             RTCSessionDescription::offer(full_sdp).unwrap()
         };
 
-        // 1. 无硬件时，恒回退 H.264
-        let offer_av1_only = make_offer("m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 AV1/90000");
-        assert_eq!(resolve_codec(Some(&offer_av1_only), None), VideoCodec::H264);
-
-        // 2. 客户端偏好首选 AV1 (PT 96 优先)，且硬件支持 AV1 -> 胜出 AV1
-        let offer_prefer_av1 = make_offer(
-            "m=video 9 UDP/TLS/RTP/SAVPF 96 102\r\na=rtpmap:96 AV1/90000\r\na=rtpmap:102 H264/90000",
-        );
-        assert_eq!(
-            resolve_codec(Some(&offer_prefer_av1), Some(&fake_probe)),
-            VideoCodec::Av1
-        );
-
-        // 3. 客户端偏好首选 H264 (PT 102 优先)，即使硬件支持 AV1，也严格按偏好选 H.264
-        let offer_prefer_h264 = make_offer(
-            "m=video 9 UDP/TLS/RTP/SAVPF 102 96\r\na=rtpmap:102 H264/90000\r\na=rtpmap:96 AV1/90000",
-        );
-        assert_eq!(
-            resolve_codec(Some(&offer_prefer_h264), Some(&fake_probe)),
-            VideoCodec::H264
-        );
-
-        // 4. 客户端偏好首选 AV1，但服务端硬件仅支持 H264/H265 (不支持 AV1) -> 顺位回退至其第二个偏好 H.265
-        let fake_probe_no_av1 = HardwareProbeResult {
-            backend_type: EncodeBackendKind::Nvenc,
-            supported_codecs: vec![VideoCodec::H265, VideoCodec::H264],
-            coded_align: (1, 1),
-            gpu_name: String::new(),
-        };
-        let offer_av1_then_h265 = make_offer(
+        // 1. 无硬件 + auto：软编唯一可行域是 H.264
+        let offer_all = make_offer(
             "m=video 9 UDP/TLS/RTP/SAVPF 96 104 102\r\na=rtpmap:96 AV1/90000\r\na=rtpmap:104 H265/90000\r\na=rtpmap:102 H264/90000",
         );
         assert_eq!(
-            resolve_codec(Some(&offer_av1_then_h265), Some(&fake_probe_no_av1)),
-            VideoCodec::H265
+            resolve_codec(Some(&offer_all), None, None),
+            Ok(VideoCodec::H264)
+        );
+
+        // 2. 无硬件 + 指定 AV1：软编机无法满足就显式拒绝，绝不悄悄换 H.264
+        assert!(resolve_codec(Some(&offer_all), None, Some(VideoCodec::Av1)).is_err());
+        // 指定 H.264 在软编机上可行，照常采纳
+        assert_eq!(
+            resolve_codec(Some(&offer_all), None, Some(VideoCodec::H264)),
+            Ok(VideoCodec::H264)
+        );
+
+        // 3. auto：默认档位按可行性取首个，浏览器全提供时首选 AV1
+        assert_eq!(
+            resolve_codec(Some(&offer_all), Some(&fake_probe), None),
+            Ok(VideoCodec::Av1)
+        );
+
+        // 4. auto：浏览器只提供 H.264（老浏览器解不动 AV1/H.265）→ 默认档位跳过不可行项
+        let offer_h264_only =
+            make_offer("m=video 9 UDP/TLS/RTP/SAVPF 102\r\na=rtpmap:102 H264/90000");
+        assert_eq!(
+            resolve_codec(Some(&offer_h264_only), Some(&fake_probe), None),
+            Ok(VideoCodec::H264)
+        );
+
+        // 5. 显式偏好可行：offer 提供 + 硬件支持 → 直接采纳（即使不是默认档首选）
+        assert_eq!(
+            resolve_codec(Some(&offer_all), Some(&fake_probe), Some(VideoCodec::H265)),
+            Ok(VideoCodec::H265)
+        );
+
+        // 6. 显式偏好在浏览器侧不可行（offer 未提供 AV1）→ 显式拒绝
+        assert!(
+            resolve_codec(
+                Some(&offer_h264_only),
+                Some(&fake_probe),
+                Some(VideoCodec::Av1)
+            )
+            .is_err()
+        );
+
+        // 7. 显式偏好在硬件侧不可行（硬件不支持 AV1）→ 显式拒绝
+        assert!(
+            resolve_codec(
+                Some(&offer_all),
+                Some(&h264_only_probe),
+                Some(VideoCodec::Av1)
+            )
+            .is_err()
         );
     }
 
@@ -733,10 +867,7 @@ mod tests {
         let mut audio_rx = audio.attach_with_capacity(16);
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
-        let pipeline = Arc::new(VideoPipeline::assemble(
-            ControlSender::new(tx, bell, true),
-            inbox,
-        ));
+        let pipeline = Arc::new(VideoPipeline::assemble(ControlSender::new(tx, bell), inbox));
         let engine = Arc::new(StreamingEngine::new(
             pipeline,
             audio,
@@ -763,10 +894,7 @@ mod tests {
         let mut audio_rx = audio.attach_with_capacity(2);
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
-        let pipeline = Arc::new(VideoPipeline::assemble(
-            ControlSender::new(tx, bell, true),
-            inbox,
-        ));
+        let pipeline = Arc::new(VideoPipeline::assemble(ControlSender::new(tx, bell), inbox));
         let mgr = Arc::new(StreamingEngine::new(
             pipeline,
             audio,
@@ -790,7 +918,14 @@ mod tests {
     async fn test_handle_offer_leaves_keyframe_arming_to_session() {
         let (mgr, rx) = make_test_engine(false);
         let _ = mgr
-            .handle_offer(make_test_offer(), 1920, 1080, 60, None)
+            .handle_offer(
+                make_test_offer(),
+                1920,
+                1080,
+                60,
+                None,
+                EncodePreferences::default(),
+            )
             .await
             .unwrap();
         // 引擎不替会话请求关键帧：waiting 自愈归会话写循环的节流路径。
@@ -813,17 +948,25 @@ mod tests {
     async fn test_new_session_dispatches_single_prepare_encoder() {
         let (mgr, rx) = make_test_engine(false);
         let _ = mgr
-            .handle_offer(make_test_offer(), 1920, 1080, 60, None)
+            .handle_offer(
+                make_test_offer(),
+                1920,
+                1080,
+                60,
+                None,
+                EncodePreferences::default(),
+            )
             .await
             .unwrap();
 
         let mut prepare_count = 0;
         while let Ok(rec) = rx.try_recv() {
             match rec {
-                Rec::Prepare(profile) => {
+                Rec::Prepare(profile, preferred) => {
                     assert_eq!(profile.width(), 1920);
                     assert_eq!(profile.height(), 1080);
                     assert_eq!(profile.fps(), 60);
+                    assert_eq!(preferred, None, "本用例不带后端偏好，缝上必须按无偏好送达");
                     prepare_count += 1;
                 }
                 // 建立路径上不该再出现任何零散命令：档位与初始码率都由

@@ -219,8 +219,8 @@ enum HardwareCaps {
     Unknown,
     /// 已探测：本机没有可用的硬件编码器
     Unavailable,
-    /// 已探测：可用
-    Available(Arc<HardwareProbeResult>),
+    /// 已探测：全部探测成功的硬编后端，按厂商优先级排序，[0] 为默认胜者
+    Available(Arc<[HardwareProbeResult]>),
 }
 
 /// 硬件能力快照：由 `bootstrap_hardware_caps` 在引擎启动路径上写入
@@ -234,16 +234,26 @@ enum HardwareCaps {
 static HARDWARE_CAPS: LazyLock<ArcSwap<HardwareCaps>> =
     LazyLock::new(|| ArcSwap::from_pointee(HardwareCaps::Unknown));
 
-/// 当前硬件能力快照
+/// 当前默认胜者的硬件能力快照
 ///
 /// `None` 表示尚未 bootstrap，或本机确实没有硬件编码器——两者在能力上是同一件事
-/// （都不能硬编）。需要区分二者时用 [`is_hardware_caps_bootstrapped`]。
+/// （都不能硬编）。需要区分二者时用 [`is_hardware_caps_bootstrapped`]；需要全部
+/// 候选后端时用 [`hardware_backends`]。
 pub fn hardware_caps() -> Option<Arc<HardwareProbeResult>> {
     // `load_full` 多克隆一次外层 Arc（引用计数 +1），换来的是 `&*caps` 上无歧义的解引用：
     // `Guard<Arc<T>>` 的 Deref 目标在不同版本里容易读错，这里不赌。
     let caps = HARDWARE_CAPS.load_full();
     match &*caps {
-        HardwareCaps::Available(probe) => Some(Arc::clone(probe)),
+        HardwareCaps::Available(list) => list.first().cloned().map(Arc::new),
+        HardwareCaps::Unknown | HardwareCaps::Unavailable => None,
+    }
+}
+
+/// 全部已探测的硬编后端清单（厂商优先级序，首元素即 [`hardware_caps`] 的默认胜者）
+pub fn hardware_backends() -> Option<Arc<[HardwareProbeResult]>> {
+    let caps = HARDWARE_CAPS.load_full();
+    match &*caps {
+        HardwareCaps::Available(list) => Some(Arc::clone(list)),
         HardwareCaps::Unknown | HardwareCaps::Unavailable => None,
     }
 }
@@ -283,8 +293,14 @@ fn format_caps_summary(
 pub fn encoder_caps_summary() -> String {
     let caps = HARDWARE_CAPS.load_full();
     match &*caps {
-        HardwareCaps::Available(probe) => {
-            format_caps_summary(probe.backend_type, &probe.supported_codecs, &probe.gpu_name)
+        HardwareCaps::Available(list) => {
+            // Available 清单恒非空（首元素即胜者），由探测写入点保证
+            let winner = list.first().expect("Available 快照的清单不得为空");
+            format_caps_summary(
+                winner.backend_type,
+                &winner.supported_codecs,
+                &winner.gpu_name,
+            )
         }
         HardwareCaps::Unavailable => "software|H264".to_string(),
         HardwareCaps::Unknown => "unknown".to_string(),
@@ -301,25 +317,51 @@ pub fn coded_align() -> (usize, usize) {
         .unwrap_or((16, 16))
 }
 
-/// 用**实际建成**的后端校正能力快照
-///
-/// 探测结果与实际后端可能不是同一个
+/// 协商回执能力清单（纯函数）：探测清单原序映射，软件编码恒以 H264 收尾；
+/// 空探测清单产出仅含软件编码的单元素清单
+fn caps_options_from(entries: &[HardwareProbeResult]) -> Vec<(EncodeBackendKind, Vec<VideoCodec>)> {
+    let mut options: Vec<_> = entries
+        .iter()
+        .map(|p| (p.backend_type, p.supported_codecs.clone()))
+        .collect();
+    options.push((EncodeBackendKind::Software, vec![VideoCodec::H264]));
+    options
+}
+
+/// 协商回执的编码能力清单：硬编按优先级序在前、软件编码恒收尾
+/// （远程玩家设置面板「编码后端 / Codec」的可选值来源）
+pub fn encoder_caps_options() -> Vec<(EncodeBackendKind, Vec<VideoCodec>)> {
+    match &*HARDWARE_CAPS.load_full() {
+        HardwareCaps::Available(list) => caps_options_from(list),
+        HardwareCaps::Unavailable | HardwareCaps::Unknown => caps_options_from(&[]),
+    }
+}
+
+/// 用实际建成的编码器校正快照：驱动声明的对齐粒度与建成值可能不一致，建成值才是
+/// 采集侧出帧的真相。按后端身份对号入座；清单外后端无从校正（协商层会拒绝指定
+/// 清单外后端），保持快照不动。
 pub(crate) fn publish_actual_backend(backend_type: EncodeBackendKind, coded_align: (u32, u32)) {
     // 软编不进硬件能力快照：快照只承载硬件后端，软编构造时无快照可校正
     if matches!(backend_type, EncodeBackendKind::Software) {
         return;
     }
     let caps = HARDWARE_CAPS.load_full();
-    let HardwareCaps::Available(probe) = &*caps else {
+    let HardwareCaps::Available(list) = &*caps else {
         return;
     };
-    if probe.backend_type == backend_type && probe.coded_align == coded_align {
+    if list
+        .iter()
+        .all(|p| p.backend_type != backend_type || p.coded_align == coded_align)
+    {
         return;
     }
-    let mut corrected = (**probe).clone();
-    corrected.backend_type = backend_type;
-    corrected.coded_align = coded_align;
-    HARDWARE_CAPS.store(Arc::new(HardwareCaps::Available(Arc::new(corrected))));
+    let mut corrected = list.as_ref().to_vec();
+    let entry = corrected
+        .iter_mut()
+        .find(|p| p.backend_type == backend_type)
+        .expect("存在性已由上面的 all 检查确认");
+    entry.coded_align = coded_align;
+    HARDWARE_CAPS.store(Arc::new(HardwareCaps::Available(corrected.into())));
 }
 
 /// 探测并发布硬件能力快照——**唯一写入点**，由引擎启动路径调用
@@ -330,61 +372,59 @@ pub(crate) fn publish_actual_backend(backend_type: EncodeBackendKind, coded_alig
 /// 引用计数配平且全部销毁调用成功仍复现，已在测试中实证）；而硬件能力在
 /// 进程生命周期内不会变化，重探唯一换来的只是踩中该限制的风险。
 ///
-/// 默认 Auto 模式下按厂商优先级
-/// (NVIDIA 优先 NVENC 其次 Vulkan Video；AMD/Intel 探测 Vulkan Video)。
+/// 探测按 Vulkan 主设备厂商圈定候选：NVIDIA 上 NVENC 与 Vulkan Video 都试，
+/// NVENC 优先（Tier 1）；AMD/Intel 探测 Vulkan Video；无 Vulkan 环境兜底探测
+/// NVENC。全部成功的后端进入清单，优先序即清单序。
 pub fn bootstrap_hardware_caps() -> Option<Arc<HardwareProbeResult>> {
     // 首探之后快照常驻：只有尚未探测（Unknown）才走真实探测流程
     {
         let existing = HARDWARE_CAPS.load_full();
         match &*existing {
-            HardwareCaps::Available(probe) => return Some(Arc::clone(probe)),
+            HardwareCaps::Available(list) => {
+                return list.first().cloned().map(Arc::new);
+            }
             HardwareCaps::Unavailable => return None,
             HardwareCaps::Unknown => {}
         }
     }
 
-    let override_mode = std::env::var("VISTREL_HARDWARE_ENCODER")
-        .ok()
-        .map(|mode| mode.to_lowercase());
-
-    let detected = match override_mode.as_deref() {
-        // 环境变量显式覆盖
-        Some("nvenc") => probe_nvenc_internal(),
-        Some("vulkan_video") | Some("vulkan") => probe_vulkan_video_internal(),
-        Some("software") | Some("cpu") => None,
-        // 默认 Auto 策略：按 Vulkan 主设备厂商决定探测顺序
-        _ => match vulkan::context::VulkanInstance::new("Vistrel") {
-            // NVIDIA：优先 NVENC (Tier 1)，失败回退 Vulkan Video (Tier 2)
-            Ok(ctx) if ctx.properties().vendor_id == 0x10DE => {
-                probe_nvenc_internal().or_else(probe_vulkan_video_internal)
+    let detected: Vec<HardwareProbeResult> = match vulkan::context::VulkanInstance::new("Vistrel") {
+        // NVIDIA：NVENC (Tier 1) 与 Vulkan Video (Tier 2) 都进候选清单
+        Ok(ctx) if ctx.properties().vendor_id == 0x10DE => {
+            let mut found = Vec::new();
+            if let Some(probe) = probe_nvenc_internal() {
+                found.push(probe);
             }
-            // AMD (0x1002) / Intel (0x8086) / 其他：直接探测 Vulkan Video
-            Ok(_) => probe_vulkan_video_internal(),
-            // 无 Vulkan 环境兜底探测 NVENC
-            Err(_) => probe_nvenc_internal(),
-        },
+            if let Some(probe) = probe_vulkan_video_internal() {
+                found.push(probe);
+            }
+            found
+        }
+        // AMD (0x1002) / Intel (0x8086) / 其他：探测 Vulkan Video
+        Ok(_) => probe_vulkan_video_internal().into_iter().collect(),
+        // 无 Vulkan 环境兜底探测 NVENC
+        Err(_) => probe_nvenc_internal().into_iter().collect(),
     };
 
-    let probe = detected.map(Arc::new);
-    let snapshot = match &probe {
-        Some(probe) => {
-            log::info!(
-                "硬件编码能力快照: backend={:?} codecs={:?}",
-                probe.backend_type,
-                probe.supported_codecs
-            );
-            HardwareCaps::Available(Arc::clone(probe))
-        }
-        None => {
-            log::warn!("未探测到硬件编码器，本引擎生命周期内将使用软件编码");
-            HardwareCaps::Unavailable
-        }
+    let snapshot = if detected.is_empty() {
+        log::warn!("未探测到硬件编码器，本引擎生命周期内将使用软件编码");
+        HardwareCaps::Unavailable
+    } else {
+        log::info!(
+            "硬件编码能力快照: {}",
+            detected
+                .iter()
+                .map(|p| format!("{:?} codecs={:?}", p.backend_type, p.supported_codecs))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        HardwareCaps::Available(detected.into())
     };
 
     // 一次 store 同时发布「已探测」与探测结果
     HARDWARE_CAPS.store(Arc::new(snapshot));
 
-    probe
+    hardware_caps()
 }
 
 #[cfg(test)]
@@ -430,6 +470,41 @@ mod tests {
         assert_eq!(
             format_caps_summary(EncodeBackendKind::Software, &[VideoCodec::H264], ""),
             "software|H264"
+        );
+    }
+
+    /// 协商回执能力清单的构造规则：探测清单原序保留，软件编码恒以 H264 收尾；
+    /// 空清单（未探测/无硬件）产出仅含软件编码的单元素清单
+    #[test]
+    fn test_caps_options_appends_software_tail() {
+        let nvenc = HardwareProbeResult {
+            backend_type: EncodeBackendKind::Nvenc,
+            supported_codecs: vec![VideoCodec::Av1, VideoCodec::H265, VideoCodec::H264],
+            coded_align: (1, 1),
+            gpu_name: "RTX".to_string(),
+        };
+        let vulkan = HardwareProbeResult {
+            backend_type: EncodeBackendKind::VulkanVideo,
+            supported_codecs: vec![VideoCodec::H264],
+            coded_align: (64, 16),
+            gpu_name: String::new(),
+        };
+
+        let options = caps_options_from(&[nvenc.clone(), vulkan.clone()]);
+        assert_eq!(
+            options,
+            vec![
+                (
+                    EncodeBackendKind::Nvenc,
+                    vec![VideoCodec::Av1, VideoCodec::H265, VideoCodec::H264]
+                ),
+                (EncodeBackendKind::VulkanVideo, vec![VideoCodec::H264]),
+                (EncodeBackendKind::Software, vec![VideoCodec::H264]),
+            ]
+        );
+        assert_eq!(
+            caps_options_from(&[]),
+            vec![(EncodeBackendKind::Software, vec![VideoCodec::H264])]
         );
     }
 

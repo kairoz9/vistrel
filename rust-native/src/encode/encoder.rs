@@ -8,8 +8,8 @@
 use bytes::Bytes;
 
 use super::hardware::nvenc::NvencBackend;
+use super::hardware::publish_actual_backend;
 use super::hardware::vulkan::VulkanVideoBackend;
-use super::hardware::{hardware_caps, publish_actual_backend};
 use super::software::SoftwareBackend;
 use crate::encode::hardware::slots::{SlotStateBlock, VramSlotDescriptor};
 use crate::encode::pool::{HostBlock, heap_blocks};
@@ -42,12 +42,23 @@ pub enum EncodeBackendKind {
 }
 
 impl EncodeBackendKind {
-    /// 控制面摘要用的稳定线格式名，与 `VISTREL_HARDWARE_ENCODER` 覆盖值同一词汇
+    /// 线上词汇：协商后端偏好的请求值、能力清单与控制面摘要共用这一套稳定拼写
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Nvenc => "nvenc",
             Self::VulkanVideo => "vulkan_video",
             Self::Software => "software",
+        }
+    }
+
+    /// 线上词汇 → 后端身份：与 [`Self::as_str`] 同词汇的解析端，大小写不敏感、无别名；
+    /// 识别不出返回 `None`
+    pub(crate) fn from_token(token: &str) -> Option<Self> {
+        match token.trim().to_lowercase().as_str() {
+            "nvenc" => Some(Self::Nvenc),
+            "vulkan_video" => Some(Self::VulkanVideo),
+            "software" => Some(Self::Software),
+            _ => None,
         }
     }
 }
@@ -113,21 +124,6 @@ pub(crate) struct VideoEncoder {
 }
 
 impl VideoEncoder {
-    /// 探测驱动的硬件入口（生产路径：按能力快照选后端）
-    ///
-    /// 连同后端在自己设备上分配的帧块一并返回；调用方负责把块装进帧池。
-    /// 硬编后端需要槽位所有权块（编码出口归还位），与 Actor 同代。
-    pub(crate) fn new_hardware(
-        profile: StreamingProfile,
-        slot_state: &'static SlotStateBlock,
-    ) -> Result<(Self, Vec<HostBlock>), String> {
-        if let Some(probe) = hardware_caps() {
-            Self::build(profile, probe.backend_type, Some(slot_state))
-        } else {
-            Err("硬件编码不可用".to_string())
-        }
-    }
-
     /// 软编入口：OpenH264 + 堆帧块，无硬件依赖、随时就绪（系统默认底座）
     ///
     /// 连同新分配的堆块一并返回，调用方负责装进帧池；软编不进硬件能力快照，
@@ -330,6 +326,30 @@ mod tests {
         let mut frame = pool.acquire().expect("池里必须有余量");
         frame.write(&vec![color; bytes]).expect("写入必须成功");
         FramePayload::Host { frame }
+    }
+
+    /// 线上词汇解析端与 as_str 互为镜像：规范拼写（大小写不敏感）全可解析，
+    /// 别名与噪声一律 None——偏好的词汇纪律不允许「差不多就算」
+    #[test]
+    fn test_backend_kind_token_roundtrip() {
+        for kind in [
+            EncodeBackendKind::Nvenc,
+            EncodeBackendKind::VulkanVideo,
+            EncodeBackendKind::Software,
+        ] {
+            assert_eq!(EncodeBackendKind::from_token(kind.as_str()), Some(kind));
+        }
+        assert_eq!(
+            EncodeBackendKind::from_token(" NVENC "),
+            Some(EncodeBackendKind::Nvenc)
+        );
+        for noise in ["", "auto", "vulkan", "cuda", "硬编"] {
+            assert_eq!(
+                EncodeBackendKind::from_token(noise),
+                None,
+                "词汇无别名: {noise:?}"
+            );
+        }
     }
 
     #[test]

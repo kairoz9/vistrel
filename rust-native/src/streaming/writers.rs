@@ -349,7 +349,6 @@ mod tests {
             KeyframeThrottle::new(crate::encode::control::ControlSender::new(
                 tx,
                 Arc::new(tokio::sync::Notify::new()),
-                false,
             )),
             Arc::new(Mailbox::new(Arc::new(FrameOutcomes::new()))),
             CancellationToken::new(),

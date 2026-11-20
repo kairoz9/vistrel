@@ -435,7 +435,7 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         (
-            ControlSender::new(tx, Arc::new(tokio::sync::Notify::new()), false),
+            ControlSender::new(tx, Arc::new(tokio::sync::Notify::new())),
             rx,
         )
     }
