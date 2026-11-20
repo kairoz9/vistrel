@@ -278,6 +278,20 @@ public class OpenGlRamPipeline implements VideoPipeline {
             return CaptureOutcome.Failed;
         }
         CaptureProfiler.end(CaptureProfiler.Stage.RAM_PREP, prepStart);
+        // 单飞闸门：上一帧 DMA 未完成时整帧跳过——围栏保留待下帧重探，不做任何 blit 与新拷贝入队。
+        // 闸门把在途拷贝恒压到 1，采集节奏自动收敛到真实完成速率，被丢帧不再白做 GPU 工作
+        int gateReadIndex = 1 - currentPboIndex;
+        long gateFence = readFences[gateReadIndex];
+        if (gateFence != 0) {
+            long fenceStart = CaptureProfiler.begin();
+            int status = GL32.glClientWaitSync(gateFence, 0, 0);
+            CaptureProfiler.end(CaptureProfiler.Stage.RAM_FENCE, fenceStart);
+            if (status != GL32.GL_ALREADY_SIGNALED && status != GL32.GL_CONDITION_SATISFIED) {
+                return CaptureOutcome.Dropped;
+            }
+            GL32.glDeleteSync(gateFence);
+            readFences[gateReadIndex] = 0;
+        }
         long stateSaveStart = CaptureProfiler.begin();
         // 本管线绕过 GlStateManager 直改全局绑定，而游戏对 VAO/Program/Texture 均有「相同即跳过重绑」
         // 的状态缓存：离开时必须把每个动过的绑定恢复原值，否则游戏后续绘制会跳过重绑，
@@ -374,23 +388,14 @@ public class OpenGlRamPipeline implements VideoPipeline {
             GL11.glReadPixels(0, 0, width / 2, height / 2, GL30.GL_RG, GL11.GL_UNSIGNED_BYTE, (long) width * height);
             // 围栏标记本次 DMA 提交点，供下一帧无等待探询是否已完成
             readFences[cur] = GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            // 立刻提交本批次：否则围栏要等到下一帧 present 才提交，交付延迟多一整帧且闸门频繁误判未完成
+            GL11.glFlush();
             CaptureProfiler.end(CaptureProfiler.Stage.RAM_READBACK, readbackStart);
 
-            // 4. 读取并映射上一个 PBO (已完成 DMA 传输)，投递至 Channel 后就地 unmap
+            // 4. 映射上一个 PBO（其 DMA 完成已在方法开头闸门确认并注销围栏），投递至 Channel 后就地 unmap
             int readPboIndex = 1 - cur;
             boolean delivered = false;
-            // 传输未完成就 map 会把渲染线程阻塞到 DMA 结束：先做零超时围栏探询，未就绪按主动丢帧处理
-            boolean transferDone = true;
-            long fence = readFences[readPboIndex];
-            if (fence != 0) {
-                long fenceStart = CaptureProfiler.begin();
-                int status = GL32.glClientWaitSync(fence, 0, 0);
-                GL32.glDeleteSync(fence);
-                readFences[readPboIndex] = 0;
-                transferDone = status == GL32.GL_ALREADY_SIGNALED || status == GL32.GL_CONDITION_SATISFIED;
-                CaptureProfiler.end(CaptureProfiler.Stage.RAM_FENCE, fenceStart);
-            }
-            if (hasPreviousFrame && transferDone) {
+            if (hasPreviousFrame) {
                 int readPbo = pboIds[readPboIndex];
                 GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, readPbo);
                 long mapStart = CaptureProfiler.begin();
