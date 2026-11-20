@@ -331,7 +331,13 @@ public class SignalingServer {
     private sealed interface Inbound permits Offer, Candidate, TextInput, Settings {
     }
 
-    private record Offer(String password, JsonElement sdp, Double bpp, Viewport viewport) implements Inbound {}
+    /**
+     * Offer 载荷：密码随 offer 认证；sdp 原样透传；bpp 与 viewport 是串流偏好；
+     * codec 与 backend 是编码偏好（线上词汇，缺省表示无偏好，能否满足由 Native 决定）
+     */
+    private record Offer(String password, JsonElement sdp, Double bpp, Viewport viewport, String codec, String backend)
+            implements Inbound
+    {}
 
     private record Candidate(JsonElement candidate) implements Inbound {}
 
@@ -720,12 +726,21 @@ public class SignalingServer {
                 viewportWidth = profileCoordinator.viewportWidth();
                 viewportHeight = profileCoordinator.viewportHeight();
             }
-            // BPP 原始请求值透传：缺省与钳制都在协调器 / Native 内完成，信令不加工
+            // BPP 与编码偏好均为原始请求值透传：缺省与判定都在协调器 / Native 内完成，信令不加工
             double bpp = msg.bpp() != null ? msg.bpp() : ProfileCoordinator.MIN_BPP;
             String sdpJson = msg.sdp() != null ? msg.sdp().toString() : "{}";
             // 快照与内部状态同源：worker 内部持有渲染线程喂入的最新快照
             SessionServer.SessionState target = profileCoordinator.plan(viewportWidth, viewportHeight, bpp);
-            String answerJson = delegate.onOffer(sdpJson, target.width(), target.height(), target.fps(), bpp);
+            String answerJson =
+                    delegate.onOffer(
+                            sdpJson,
+                            target.width(),
+                            target.height(),
+                            target.fps(),
+                            bpp,
+                            msg.codec(),
+                            msg.backend()
+            );
             if (answerJson != null && !answerJson.isEmpty()) {
                 // Answer 落账进协调器：种入基线并经 listener 广播初始档位（管线落地/接入提示）
                 profileCoordinator.noteOfferAnswer(answerJson, bpp);

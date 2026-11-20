@@ -14,8 +14,16 @@ public final class NativeSessionServer implements SessionServer {
     private final com.kairo.vistrel.streaming.signaling.SignalingServer signalingServer = new com.kairo.vistrel.streaming.signaling.SignalingServer(
             new com.kairo.vistrel.streaming.signaling.SignalingDelegate() {
                 @Override
-                public String onOffer(String offerSdpJson, int width, int height, int fps, double bpp) {
-                    return NativeBridge.negotiateOffer(offerSdpJson, width, height, fps, bpp);
+                public String onOffer(
+                        String offerSdpJson,
+                        int width,
+                        int height,
+                        int fps,
+                        double bpp,
+                        String codec,
+                        String backend
+                ) {
+                    return NativeBridge.negotiateOffer(offerSdpJson, width, height, fps, bpp, codec, backend);
                 }
 
                 @Override

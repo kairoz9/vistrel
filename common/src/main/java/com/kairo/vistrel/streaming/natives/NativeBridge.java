@@ -173,9 +173,22 @@ public class NativeBridge {
      * @param height       目标高度
      * @param fps          目标帧率
      * @param bpp          客户端画质档位
-     * @return Answer JSON 字符串 (包含实际生效的分辨率、帧率、bpp、码率、codec 与 Answer SDP)
+     * @param codec        客户端 Codec 偏好（线上令牌 {@code h264}/{@code h265}/{@code av1}；
+     *                     {@code null} 表示无偏好；无法识别或浏览器未提供时协商被拒绝）
+     * @param backend      客户端编码后端偏好（线上词汇 {@code nvenc}/{@code vulkan_video}/{@code software}；
+     *                     {@code null} 表示无偏好；无法识别或不在本机探测清单内时协商被拒绝）
+     * @return Answer JSON 字符串 (包含实际生效的分辨率、帧率、bpp、码率、codec、后端、
+     *         可选值清单 {@code backends} 与 Answer SDP)
      */
-    public static native String negotiateOffer(String offerSdpJson, int width, int height, int fps, double bpp);
+    public static native String negotiateOffer(
+            String offerSdpJson,
+            int width,
+            int height,
+            int fps,
+            double bpp,
+            String codec,
+            String backend
+    );
 
     /**
      * 阻塞应用新的画质档位

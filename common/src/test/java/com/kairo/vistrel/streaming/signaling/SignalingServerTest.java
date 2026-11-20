@@ -60,6 +60,8 @@ class SignalingServerTest {
         final AtomicReference<String> offerSdp = new AtomicReference<>(null);
         final AtomicReference<int[]> offerTarget = new AtomicReference<>(null);
         final AtomicReference<Double> offerBpp = new AtomicReference<>(null);
+        final AtomicReference<String> offerCodec = new AtomicReference<>(null);
+        final AtomicReference<String> offerBackend = new AtomicReference<>(null);
         final List<int[]> offerTargets = new CopyOnWriteArrayList<>();
         final CountDownLatch offerLatch = new CountDownLatch(1);
         final java.util.concurrent.atomic.AtomicInteger closeCount = new java.util.concurrent.atomic.AtomicInteger();
@@ -69,11 +71,21 @@ class SignalingServerTest {
         volatile boolean failNextOffer;
 
         @Override
-        public String onOffer(String offerSdpJson, int width, int height, int fps, double bpp) {
+        public String onOffer(
+                String offerSdpJson,
+                int width,
+                int height,
+                int fps,
+                double bpp,
+                String codec,
+                String backend
+        ) {
             offerSdp.set(offerSdpJson);
             offerTarget.set(new int[] {width, height, fps});
             offerTargets.add(new int[] {width, height, fps});
             offerBpp.set(bpp);
+            offerCodec.set(codec);
+            offerBackend.set(backend);
             offerLatch.countDown();
             if (failNextOffer) {
                 failNextOffer = false;
@@ -132,7 +144,15 @@ class SignalingServerTest {
     }
 
     private static void sendOffer(EmbeddedChannel ch, String password) {
-        String offer = "{\"type\":\"offer\",\"password\":\"" + password + "\",\"bpp\":0.15,\"sdp\":{}}";
+        sendOffer(ch, password, null);
+    }
+
+    private static void sendOffer(EmbeddedChannel ch, String password, String backend) {
+        String offer = "{\"type\":\"offer\",\"password\":\""
+                + password
+                + "\",\"bpp\":0.15,\"sdp\":{}"
+                + (backend != null ? ",\"backend\":\"" + backend + "\"" : "")
+                + "}";
         ch.writeInbound(Unpooled.wrappedBuffer(maskedTextFrame(offer)));
     }
 
@@ -498,7 +518,7 @@ class SignalingServerTest {
         EmbeddedChannel ch = openWebSocket(server);
         String offer =
                 "{\"type\":\"offer\",\"password\":\"pass123\",\"bpp\":0.15,"
-                + "\"viewport\":{\"width\":2560,\"height\":1440},\"sdp\":{}}";
+                + "\"viewport\":{\"width\":2560,\"height\":1440},\"codec\":\"av1\",\"backend\":\"vulkan_video\",\"sdp\":{}}";
         ch.writeInbound(Unpooled.wrappedBuffer(maskedTextFrame(offer)));
         ByteBuf answer = ch.readOutbound();
         Assertions.assertNotNull(answer, "合法 offer 应收到 answer");
@@ -509,6 +529,8 @@ class SignalingServerTest {
         // 快照 Unlimited(260)→240 再被 VSync 夹到 165；视口物理像素 2560×1440 与内容一致不缩放
         Assertions.assertArrayEquals(new int[] {2560, 1440, 165}, target, "几何与帧率必须来自内容侧而非客户端");
         Assertions.assertEquals(0.15, rec.offerBpp.get(), 1e-9, "bpp 原样进入协商");
+        Assertions.assertEquals("av1", rec.offerCodec.get(), "codec 偏好原样进入协商");
+        Assertions.assertEquals("vulkan_video", rec.offerBackend.get(), "后端偏好原样进入协商");
         // Answer 落账：委托返回的 fake answer（1920×1080@60，nvenc）成为生效基线并广播
         Assertions.assertEquals(
                 new SessionServer.SessionState(
