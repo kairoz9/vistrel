@@ -103,7 +103,8 @@ public class CaptureCascadeTest {
      * 可控时钟替身
      */
     private static final class FakeClock implements LongSupplier {
-        long nanos = 0;
+        // 原点取 1s：节流器以 lastNanos == 0 判首帧未锚定，时钟不得从 0 起步
+        long nanos = 1_000_000_000L;
 
         @Override
         public long getAsLong() {
