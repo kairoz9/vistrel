@@ -9,8 +9,6 @@
   "client": [
     "MixinMinecraft",
     "MixinMouseHandler",
-    "MouseHandlerAccessor",
-    "KeyboardHandlerAccessor",
     "MixinKeyboardHandler",
     "MixinLibrary"
   ],

@@ -11,7 +11,7 @@
 ### 核心设计原则 (Guiding Principles)
 1. **浏览器零插件即点即玩 (Zero Client Installation)**: 客户端 100% 运行于标准 HTML5/WebRTC 浏览器环境，无需安装任何客户端软件、Java 运行环境或额外应用。
 2. **跨语言高性能架构 (Java Common Core + Rust Native Engine)**: 游戏逻辑、事件注入与 ModLoader 适配采用现代 Java 25 编写；计算密集的视频硬编码、音频回环与 WebRTC Peer 直连管线全部由底层 Rust 原生动态库（`libvistrel.so` / `vistrel.dll`）接管。
-3. **Stonecutter 统一多版本多加载器架构 (Stonecutter Multi-Version Matrix)**: 采用 Stonecutter 多版本架构与 MultiLoader 分层规范，一套单一源码基准同时覆盖 **1.20** (Java 17 / Forge & Fabric)、**1.21**、**1.21.5** 与 **1.21.9** (Java 21 / NeoForge & Fabric) 以及 **26.3** (Java 25 / NeoForge & Fabric) 主流游戏生态。
+3. **Stonecutter 统一多版本多加载器架构 (Stonecutter Multi-Version Matrix)**: 采用 Stonecutter 多版本架构与 MultiLoader 分层规范，一套单一源码基准同时覆盖 **1.20** (Java 17 / Forge & Fabric)、**1.21 ~ 1.21.11** (Java 21 / NeoForge & Fabric) 以及 **26.3** (Java 25 / NeoForge & Fabric) 主流游戏生态。
 4. **事件级低延迟输入映射 (Event-Driven Raw Input Pass-Through)**: 浏览器端捕获的原始物理键鼠移动量（`movementX`/`movementY`）与键盘事件，通过直连 WebRTC DataChannel 投递至 Minecraft 的 `client.mouse` 与 `KeyMapping`，精准模拟实体硬件操作。
 
 ---
@@ -87,7 +87,7 @@
 # 1. 编译 Rust 原生动态库
 cd rust-native && cargo build --release
 
-# 2. 批量编译并打包全版本全加载器 (1.20 / 1.21 / 1.21.5 / 1.21.9 / 26.3) 的最终 Jar 包
+# 2. 批量编译并打包全版本全加载器 (1.20 / 1.21 / 26.3) 的最终 Jar 包
 #    产物统一归拢到 build/libs/<MC 版本>/（forge 取 -all-srg 重映射发布产物）
 #    消费指定 target 编译产物时注入 -Pvistrel.windowsTriple=<target> / -Pvistrel.linuxTriple=<target>
 ./gradlew buildAndCollect

@@ -109,7 +109,8 @@ public abstract class InputAdapter {
     }
 
     /**
-     * 取平台窗口句柄：版本差异（26.3 {@code handle()} / 旧版 {@code getWindow()}）
+     * 取平台窗口句柄：GLFW 侧为渲染线程当前 GL 上下文的窗口（{@code glfwGetCurrentContext}，
+     * SDL3 侧为 {@code Window#handle()}
      *
      * @param window Minecraft 窗口实例
      * @return 适配器语义的窗口句柄，须回传给本类其余注入方法

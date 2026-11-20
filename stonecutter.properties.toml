@@ -22,18 +22,8 @@ minecraft.version_range = "[26.1, 26.2)"
 java.version = 25
 loomx.obfuscated = false
 
-["1.21.9"]
-minecraft.version_range = "[1.21.9, 1.21.12)"
-java.version = 21
-loomx.obfuscated = true
-
-["1.21.5"]
-minecraft.version_range = "[1.21.5, 1.21.9)"
-java.version = 21
-loomx.obfuscated = true
-
 ["1.21"]
-minecraft.version_range = "[1.21, 1.21.5)"
+minecraft.version_range = "[1.21, 1.21.12)"
 java.version = 21
 loomx.obfuscated = true
 
@@ -55,14 +45,6 @@ deps.loader_version = "0.18.4"
 [fabric."26.1"]
 deps.api_version = "0.144.1+26.1"
 deps.loader_version = "0.18.4"
-
-[fabric."1.21.9"]
-deps.api_version = "0.134.0+1.21.9"
-deps.loader_version = "0.17.0"
-
-[fabric."1.21.5"]
-deps.api_version = "0.119.6+1.21.5"
-deps.loader_version = "0.16.10"
 
 [fabric."1.21"]
 deps.api_version = "0.100.2+1.21"
@@ -86,16 +68,9 @@ deps.api_version = "26.2.0.57"
 [neoforge."26.1"]
 deps.api_version = "26.1.2.71"
 
-# 1.21.9 存活期短，NeoForge 未发稳定版，仅 21.9.x-beta 绑定 1.21.9
-[neoforge."1.21.9"]
-deps.api_version = "21.9.16-beta"
-
-[neoforge."1.21.5"]
-deps.api_version = "21.5.101"
-
-# NeoForge 未发绑定 1.21.0 的产物，本行编译下限为 1.21.1
+# NeoForge 21.0 稳定线（143+）与 21.1~21.11 引导层触点均已验兼容，编译与依赖下限取首个稳定版
 [neoforge."1.21"]
-deps.api_version = "21.1.1"
+deps.api_version = "21.0.143"
 
 
 # ========== Forge ==========

@@ -1,11 +1,5 @@
 package com.kairo.vistrel.capture;
 
-//? if <1.21.5 {
-/*import com.mojang.blaze3d.platform.GlStateManager;*/
-//? } elif <26.1 {
-/*import com.mojang.blaze3d.opengl.GlStateManager;
-import com.mojang.blaze3d.opengl.GlTexture;*/
-//? }
 //? if <26.1 {
 /*import com.kairo.vistrel.Constants;
 import com.kairo.vistrel.streaming.EncoderChannel;
@@ -21,6 +15,7 @@ import org.lwjgl.opengl.GL30;
 import org.lwjgl.opengl.GL32;
 import org.lwjgl.opengl.GL33;
 
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 
 // 历史版本 OpenGL 双 PBO 内存回读管道（26.1 起由 GpuDevice 管线接管）
@@ -45,6 +40,9 @@ public class OpenGlRamPipeline implements VideoPipeline {
     private final long[] readFences = new long[2];
     private boolean sourceChecked = false;
     private boolean sourceRejected = false;
+    // 1.21.5 设备化重构后的取源反射桥；null 走编译期直连路径
+    private Method upperColorTextureGetter;
+    private Method upperGlIdGetter;
     private int vaoId = 0;
     private int lumaProgramId = 0;
     private int chromaProgramId = 0;
@@ -304,38 +302,30 @@ public class OpenGlRamPipeline implements VideoPipeline {
         boolean blendWasEnabled = GL11.glIsEnabled(GL11.GL_BLEND);
         boolean cullWasEnabled = GL11.glIsEnabled(GL11.GL_CULL_FACE);
         boolean srgbWasEnabled = GL11.glIsEnabled(GL30.GL_FRAMEBUFFER_SRGB);
-        GlStateManager._disableScissorTest();
-        GlStateManager._disableBlend();
-        GlStateManager._disableCull();
+        GL11.glDisable(GL11.GL_SCISSOR_TEST);
+        GL11.glDisable(GL11.GL_BLEND);
+        GL11.glDisable(GL11.GL_CULL_FACE);
         GL11.glDisable(GL30.GL_FRAMEBUFFER_SRGB);
         CaptureProfiler.end(CaptureProfiler.Stage.RAM_STATE_SAVE, stateSaveStart);
 
         try {
             // 1. 直采主画面颜色纹理：缩放由采样器的线性过滤完成*/
 //? }
-//? if <1.21.5 {
-/*            int mainFbo = mainTarget.frameBufferId;
-            if (mainFbo == 0) return CaptureOutcome.Failed;
-            GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, mainFbo);
-            // 源只接受非整数格式（整数纹理需 isampler2D）。vanilla 主画面
-            // 恒单采样，有多采样源时下方 draw 报 INVALID_OPERATION 走 Failed，日志可定位
-            if (!sourceChecked) {
-                sourceChecked = true;
-                int componentType = GL30.glGetFramebufferAttachmentParameteri(GL30.GL_READ_FRAMEBUFFER, GL30.GL_COLOR_ATTACHMENT0, GL30.GL_FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE);
-                boolean integerFormat = componentType == GL11.GL_UNSIGNED_INT || componentType == GL11.GL_INT;
-                if (integerFormat) {
-                    sourceRejected = true;
-                    Constants.LOG.error("采集源不可用 (组件类型 0x{}): 整数纹理需 isampler2D，本次采集保持关闭",
-                            Integer.toHexString(componentType));
-                }
-            }
+//? if <26.1 {
+/*            // 主画面颜色纹理 id 的取法在 1.21.5 设备化重构处分叉，由首帧金丝雀锁定取法（见 probeSource）
+            if (!sourceChecked) probeSource(mainTarget);
             if (sourceRejected) return CaptureOutcome.Failed;
-            int sourceTexture = mainTarget.getColorTextureId();
-            if (sourceTexture == 0) return CaptureOutcome.Failed;*/
-//? } elif <26.1 {
-/*            // 新版 RenderTarget 不再持有 GL id：纹理 id 经 GlTexture 取，格式由设备侧统一管理
-            if (mainTarget.getColorTexture() == null) return CaptureOutcome.Failed;
-            int sourceTexture = ((GlTexture) mainTarget.getColorTexture()).glId();
+            int sourceTexture;
+            if (upperColorTextureGetter != null) {
+                // 格式由设备侧统一管理，无整数源风险
+                Object colorTexture = upperColorTextureGetter.invoke(mainTarget);
+                if (colorTexture == null) return CaptureOutcome.Failed;
+                sourceTexture = (Integer) upperGlIdGetter.invoke(colorTexture);
+            } else {
+                int mainFbo = mainTarget.frameBufferId;
+                if (mainFbo == 0) return CaptureOutcome.Failed;
+                sourceTexture = mainTarget.getColorTextureId();
+            }
             if (sourceTexture == 0) return CaptureOutcome.Failed;*/
 //? }
 //? if <26.1 {
@@ -434,9 +424,9 @@ public class OpenGlRamPipeline implements VideoPipeline {
             return CaptureOutcome.Failed;
         } finally {
             long restoreStart = CaptureProfiler.begin();
-            if (scissorWasEnabled) GlStateManager._enableScissorTest();
-            if (blendWasEnabled) GlStateManager._enableBlend();
-            if (cullWasEnabled) GlStateManager._enableCull();
+            if (scissorWasEnabled) GL11.glEnable(GL11.GL_SCISSOR_TEST);
+            if (blendWasEnabled) GL11.glEnable(GL11.GL_BLEND);
+            if (cullWasEnabled) GL11.glEnable(GL11.GL_CULL_FACE);
             if (srgbWasEnabled) GL11.glEnable(GL30.GL_FRAMEBUFFER_SRGB);
             GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, prevPackBuffer);
             GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, prevPackAlignment);
@@ -455,6 +445,63 @@ public class OpenGlRamPipeline implements VideoPipeline {
             GL11.glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
             CaptureProfiler.end(CaptureProfiler.Stage.RAM_STATE_RESTORE, restoreStart);
         }
+    }
+
+    // 首帧取源金丝雀：探测当前游戏所处版本并锁定取源方式。
+    // 以 GpuTexture（1.21.5 引入、官方 jar 不混淆）划分半区：
+    // 上半区间按当前命名空间解析颜色纹理与 GL id 的反射桥（Fabric=intermediary、
+    // NeoForge=mojang），任一解析失败即整体拒绝；下半区间保留整数源检查（整数纹理需
+    // isampler2D，无法走固定管线 Blit）。mainFbo 为 0 时不下结论，下帧重探。
+    private void probeSource(RenderTarget mainTarget) {
+        Class<?> gpuTextureClass = tryFindClass("com.mojang.renderpearl.api.textures.GpuTexture");
+        if (gpuTextureClass == null) {
+            int mainFbo = mainTarget.frameBufferId;
+            if (mainFbo == 0) return;
+            sourceChecked = true;
+            GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, mainFbo);
+            int componentType = GL30.glGetFramebufferAttachmentParameteri(GL30.GL_READ_FRAMEBUFFER, GL30.GL_COLOR_ATTACHMENT0, GL30.GL_FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE);
+            boolean integerFormat = componentType == GL11.GL_UNSIGNED_INT || componentType == GL11.GL_INT;
+            if (integerFormat) {
+                sourceRejected = true;
+                Constants.LOG.error("采集源不可用 (组件类型 0x{}): 整数纹理需 isampler2D，本次采集保持关闭",
+                        Integer.toHexString(componentType));
+            }
+            return;
+        }
+        // 上半区间全成全败：颜色纹理与 GL id 两桥都解析成功才提交字段，
+        // 任一失败则永久拒绝（fail-closed），本会话不再重试
+        sourceChecked = true;
+        Class<?> glTextureClass = tryFindClass("com.mojang.blaze3d.opengl.GlTexture");
+        if (glTextureClass == null) glTextureClass = tryFindClass("net.minecraft.class_10868");
+        Method colorGetter = tryGetMethod(mainTarget.getClass(), "method_30277", "getColorTexture");
+        Method glIdGetter = glTextureClass != null ? tryGetMethod(glTextureClass, "method_68427", "glId") : null;
+        if (colorGetter == null || glIdGetter == null) {
+            sourceRejected = true;
+            Constants.LOG.error("取源反射桥解析失败 (RenderTarget={}): 纹理 id 访问不可用，本次采集保持关闭",
+                    mainTarget.getClass().getName());
+            return;
+        }
+        upperColorTextureGetter = colorGetter;
+        upperGlIdGetter = glIdGetter;
+    }
+
+    private Class<?> tryFindClass(String name) {
+        try {
+            return Class.forName(name);
+        } catch (ClassNotFoundException e) {
+            return null;
+        }
+    }
+
+    private Method tryGetMethod(Class<?> owner, String... names) {
+        for (String name : names) {
+            try {
+                return owner.getMethod(name);
+            } catch (NoSuchMethodException ignored) {
+                // 按备选命名继续探测
+            }
+        }
+        return null;
     }
 
     private void cleanupResources() {

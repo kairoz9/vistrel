@@ -8,7 +8,6 @@ import com.kairo.vistrel.input.InputEventDecoder.MouseMove;
 import com.kairo.vistrel.input.InputEventDecoder.MouseScroll;
 import com.mojang.blaze3d.platform.Window;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.player.LocalPlayer;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.List;
@@ -100,9 +99,8 @@ public final class InputInjector {
             return;
         }
 
-        LocalPlayer player = mc.player;
         long windowHandle = adapter.windowHandle(window);
-        dispatch(InputEventDecoder.decode(eventBuffer, count), mc, window, windowHandle, player);
+        dispatch(InputEventDecoder.decode(eventBuffer, count), mc, window, windowHandle);
     }
 
     /**
@@ -160,16 +158,10 @@ public final class InputInjector {
      *
      * <p>包私有只为测试：不涉及 Minecraft 实例的路由逻辑可以在单测里直接调用。
      */
-    void dispatch(
-            List<InputEventDecoder.Event> events,
-            Minecraft mc,
-            Window window,
-            long windowHandle,
-            LocalPlayer player
-    ) {
+    void dispatch(List<InputEventDecoder.Event> events, Minecraft mc, Window window, long windowHandle) {
         for (InputEventDecoder.Event event : events) {
             if (event instanceof MouseMove e) {
-                move(e, mc, window, windowHandle, player);
+                move(e, mc, window, windowHandle);
             } else if (event instanceof MouseButton e) {
                 adapter.injectMouseButton(mc, windowHandle, e.button(), e.action());
             } else if (event instanceof Key e) {
@@ -185,23 +177,17 @@ public final class InputInjector {
     }
 
     /**
-     * 相对位移：光标未抓取时按窗口坐标移动，抓取时按灵敏度转动玩家视角
+     * 相对位移统一走光标回调：未抓取时钳制在窗口内移动虚拟光标；抓取态坐标不钳制（视角虚拟
+     * 坐标无界），灵敏度与 Y 反转由 vanilla 的 onMove→turnPlayer 路径自管，与本地硬件输入同路
      */
-    private void move(MouseMove e, Minecraft mc, Window window, long windowHandle, LocalPlayer player) {
+    private void move(MouseMove e, Minecraft mc, Window window, long windowHandle) {
+        double newX = mc.mouseHandler.xpos() + e.dx();
+        double newY = mc.mouseHandler.ypos() + e.dy();
         if (!mc.mouseHandler.isMouseGrabbed()) {
-            double newX = Math.max(0, Math.min(window.getScreenWidth(), mc.mouseHandler.xpos() + e.dx()));
-            double newY = Math.max(0, Math.min(window.getScreenHeight(), mc.mouseHandler.ypos() + e.dy()));
-            adapter.injectMouseMove(mc, windowHandle, newX, newY, e.dx(), e.dy());
-        } else if (player != null) {
-            double sens = mc.options.sensitivity().get() * 0.6000000238418579d + 0.20000000298023224d;
-            //? if >=1.21.9 {
-            boolean invertY = mc.options.invertMouseY().get();
-            //? } else {
-            /*boolean invertY = mc.options.invertYMouse().get();*/
-            //? }
-            double sensCubed = sens * sens * sens * 8.0d;
-            player.turn(e.dx() * sensCubed, e.dy() * sensCubed * (invertY ? -1.0 : 1.0));
+            newX = Math.max(0, Math.min(window.getScreenWidth(), newX));
+            newY = Math.max(0, Math.min(window.getScreenHeight(), newY));
         }
+        adapter.injectMouseMove(mc, windowHandle, newX, newY, e.dx(), e.dy());
     }
 
     /**

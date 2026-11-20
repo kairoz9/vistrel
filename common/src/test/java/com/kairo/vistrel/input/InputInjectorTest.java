@@ -143,8 +143,7 @@ class InputInjectorTest {
                 ),
                 null,
                 null,
-                12345L,
-                null
+                12345L
         );
 
         Assertions.assertTrue(adapter.logs.contains("Key:26:1"));

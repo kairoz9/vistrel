@@ -2,11 +2,6 @@ package com.kairo.vistrel.input;
 
 import net.minecraft.client.Minecraft;
 
-//? if >=1.21.9 && <26.3 {
-/*import net.minecraft.client.input.CharacterEvent;
-import net.minecraft.client.input.KeyEvent;
-import net.minecraft.client.input.MouseButtonInfo;*/
-//? }
 //? if >=26.3 {
 /**
  * 26.3+ 占位存根 (运行期全面由 Sdl3InputAdapter 接管)
@@ -42,21 +37,39 @@ public class GlfwInputAdapter extends InputAdapter {
 //? } else {
 /*import static org.lwjgl.glfw.GLFW.*;
 
-// GLFW 输入适配器 (适用于 Minecraft 1.20 ~ 1.21.x)
-// 采用 GLFW 传统键码与 5 参数方法签名 (window, key, scancode, action, mods)
+import com.kairo.vistrel.Constants;
+import org.lwjgl.glfw.GLFW;
+import org.lwjgl.glfw.GLFWCharCallback;
+import org.lwjgl.glfw.GLFWCharModsCallback;
+import org.lwjgl.glfw.GLFWCursorPosCallback;
+import org.lwjgl.glfw.GLFWKeyCallback;
+import org.lwjgl.glfw.GLFWMouseButtonCallback;
+import org.lwjgl.glfw.GLFWScrollCallback;
+
+// GLFW 输入适配器（适用于 Minecraft 1.20 ~ 26.2）。
+//
+// 注入机制 = 复调用 MC 注册的 GLFW 回调（取回 → 立即还原 → 按标准签名 invoke）。
+// GLFW 回调 ABI 由 GLFW 定义、库未混淆，任何版本与 loader 的运行时命名都一致。
+//
+// 线程契约：本类全部入口经帧头钩子（FramerateLimiter/RenderSystem 限频点）跑在渲染线程，
+// 与 glfwPollEvents 同线程顺序执行，取回与还原之间不存在轮询交错窗口。
+// 每次注入成对取回/还原（两次 JNI 调用）。
 public class GlfwInputAdapter extends InputAdapter {
+    // 上下文为空时句柄为 0，vanilla 的窗口比对会丢弃全部注入；只提示一次
+    private static boolean reportedEmptyContext;
+
     public GlfwInputAdapter() {
-    }*/
-//? }
-//? if <1.21.9 {
-/*    @Override
+    }
+
+    @Override
     public long windowHandle(com.mojang.blaze3d.platform.Window window) {
-        return window.getWindow();
-    }*/
-//? } elif <26.3 {
-/*    @Override
-    public long windowHandle(com.mojang.blaze3d.platform.Window window) {
-        return window.handle();
+        // 渲染线程上当前 GL 上下文的窗口即 MC 主窗口：绕开 Window 取句柄方法的 1.21.9 改名
+        long handle = GLFW.glfwGetCurrentContext();
+        if (handle == 0 && !reportedEmptyContext) {
+            reportedEmptyContext = true;
+            Constants.LOG.error("GLFW 当前上下文为空：窗口句柄为 0，远程键鼠注入将被全部丢弃");
+        }
+        return handle;
     }*/
 //? }
 //? if <26.3 {
@@ -70,35 +83,49 @@ public class GlfwInputAdapter extends InputAdapter {
             default -> 0;
         };
         applyModifierMask(mask, action);
-    }*/
-//? }
-//? if <1.21.9 {
-/*    @Override
+    }
+
+    @Override
     protected void doInjectKey(Minecraft mc, long windowHandle, int hidCode, int rawAction) {
         int glfwKey = hidToGlfw(hidCode);
-        if (glfwKey == 0) {
-            return;
+        if (glfwKey != 0) {
+            invokeKey(windowHandle, glfwKey, rawAction);
         }
-        if (mc.keyboardHandler != null) {
-            mc.keyboardHandler.keyPress(windowHandle, glfwKey, 0, rawAction, currentModifiers);
-        }
-    }*/
-//? } elif <26.3 {
-/*    @Override
-    protected void doInjectKey(Minecraft mc, long windowHandle, int hidCode, int rawAction) {
-        int glfwKey = hidToGlfw(hidCode);
-        if (glfwKey == 0) {
-            return;
-        }
-        if (mc.keyboardHandler != null) {
-            // 1.21.9 起 keyPress 收归 private 且改收 KeyEvent，经 Invoker 走完整路由
-            ((com.kairo.vistrel.mixin.KeyboardHandlerAccessor) mc.keyboardHandler)
-                    .vistrel$keyPress(windowHandle, rawAction, new KeyEvent(glfwKey, 0, currentModifiers));
-        }
-    }*/
-//? }
-//? if <26.3 {
-/*    private static final int[] HID_TO_GLFW = new int[256];
+    }
+
+    @Override
+    protected void doInjectMouseButton(Minecraft mc, long windowHandle, int jsBtn, int action) {
+        int glfwBtn = switch (jsBtn) {
+            case 0 -> GLFW_MOUSE_BUTTON_LEFT;
+            case 1 -> GLFW_MOUSE_BUTTON_MIDDLE;
+            case 2 -> GLFW_MOUSE_BUTTON_RIGHT;
+            default -> jsBtn;
+        };
+        invokeMouseButton(windowHandle, glfwBtn, action);
+    }
+
+    @Override
+    public void injectMouseMove(Minecraft mc, long windowHandle, double newX, double newY, double dx, double dy) {
+        invokeCursorPos(windowHandle, newX, newY);
+    }
+
+    @Override
+    public void injectMouseScroll(Minecraft mc, long windowHandle, double xOffset, double yOffset) {
+        invokeScroll(windowHandle, xOffset, yOffset);
+    }
+
+    @Override
+    protected void doInjectText(Minecraft mc, long windowHandle, String text) {
+        // GLFW 字符事件本身不携带修饰键；回调包装器如何构造 CharacterEvent / 传 mods 由 MC 决定，
+        // 与真实键盘输入路径一致
+        text.codePoints().forEach(cp -> invokeChar(windowHandle, cp));
+    }
+
+    public static int hidToGlfw(int hid) {
+        return (hid >= 0 && hid < HID_TO_GLFW.length) ? HID_TO_GLFW[hid] : 0;
+    }
+
+    private static final int[] HID_TO_GLFW = new int[256];
 
     static {
         // A..Z (4..29 -> GLFW_KEY_A..Z)
@@ -165,65 +192,54 @@ public class GlfwInputAdapter extends InputAdapter {
         // 查表默认返回 0，并在 doInjectKey 中显式忽略丢弃。
     }
 
-    public static int hidToGlfw(int hid) {
-        return (hid >= 0 && hid < HID_TO_GLFW.length) ? HID_TO_GLFW[hid] : 0;
-    }
-
-    @Override
-    protected void doInjectMouseButton(Minecraft mc, long windowHandle, int jsBtn, int action) {
-        int glfwBtn = switch (jsBtn) {
-            case 0 -> 0; // GLFW_MOUSE_BUTTON_LEFT
-            case 1 -> 2; // GLFW_MOUSE_BUTTON_MIDDLE
-            case 2 -> 1; // GLFW_MOUSE_BUTTON_RIGHT
-            default -> jsBtn;
-        };*/
-//? }
-//? if <1.21.9 {
-/*        if (mc.mouseHandler != null) {
-            ((com.kairo.vistrel.mixin.MouseHandlerAccessor) mc.mouseHandler).vistrel$onPress(windowHandle, glfwBtn, action, currentModifiers);
-        }
-    }*/
-//? } elif <26.3 {
-/*        if (mc.mouseHandler != null) {
-            ((com.kairo.vistrel.mixin.MouseHandlerAccessor) mc.mouseHandler)
-                    .vistrel$onPress(windowHandle, new MouseButtonInfo(glfwBtn, currentModifiers), action);
-        }
-    }*/
-//? }
-//? if <26.3 {
-/*    @Override
-    public void injectMouseMove(Minecraft mc, long windowHandle, double newX, double newY, double dx, double dy) {
-        if (mc.mouseHandler != null) {
-            ((com.kairo.vistrel.mixin.MouseHandlerAccessor) mc.mouseHandler).vistrel$onMove(windowHandle, newX, newY);
+    // 取回 → 立即还原 → 复调用；还原先行使分离窗口缩到两次连续 JNI 调用，
+    // 复调用发生在回调链完整还原之后。回调缺失（未注册）时静默跳过。
+    private void invokeKey(long win, int key, int action) {
+        GLFWKeyCallback cb = GLFW.glfwSetKeyCallback(win, null);
+        GLFW.glfwSetKeyCallback(win, cb);
+        if (cb != null) {
+            cb.invoke(win, key, 0, action, currentModifiers);
         }
     }
 
-    @Override
-    public void injectMouseScroll(Minecraft mc, long windowHandle, double xOffset, double yOffset) {
-        if (mc.mouseHandler != null) {
-            ((com.kairo.vistrel.mixin.MouseHandlerAccessor) mc.mouseHandler).vistrel$onScroll(windowHandle, xOffset, yOffset);
+    private void invokeMouseButton(long win, int btn, int action) {
+        GLFWMouseButtonCallback cb = GLFW.glfwSetMouseButtonCallback(win, null);
+        GLFW.glfwSetMouseButtonCallback(win, cb);
+        if (cb != null) {
+            cb.invoke(win, btn, action, currentModifiers);
         }
     }
 
-    @Override
-    protected void doInjectText(Minecraft mc, long windowHandle, String text) {
-        if (mc.keyboardHandler == null) {
+    private void invokeCursorPos(long win, double xpos, double ypos) {
+        GLFWCursorPosCallback cb = GLFW.glfwSetCursorPosCallback(win, null);
+        GLFW.glfwSetCursorPosCallback(win, cb);
+        if (cb != null) {
+            cb.invoke(win, xpos, ypos);
+        }
+    }
+
+    private void invokeScroll(long win, double xOffset, double yOffset) {
+        GLFWScrollCallback cb = GLFW.glfwSetScrollCallback(win, null);
+        GLFW.glfwSetScrollCallback(win, cb);
+        if (cb != null) {
+            cb.invoke(win, xOffset, yOffset);
+        }
+    }
+
+    private void invokeChar(long win, int codepoint) {
+        // 字符回调注册形态分两代：26.1+ 走标准 char 回调；≤1.21.x 走已废弃的 char-mods 回调
+        // 两条路径只会有其一被注册。
+        GLFWCharCallback cb = GLFW.glfwSetCharCallback(win, null);
+        GLFW.glfwSetCharCallback(win, cb);
+        if (cb != null) {
+            cb.invoke(win, codepoint);
             return;
         }
-        // 旧版 KeyboardHandler 的 charTyped 是 private，经 Invoker 走 vanilla 完整路由
-        com.kairo.vistrel.mixin.KeyboardHandlerAccessor handler =
-                (com.kairo.vistrel.mixin.KeyboardHandlerAccessor) mc.keyboardHandler;*/
-//? }
-//? if <1.21.9 {
-/*        text.codePoints().forEach(cp -> handler.vistrel$charTyped(windowHandle, cp, currentModifiers));
-    }*/
-//? } elif <26.1 {
-/*        text.codePoints().forEach(cp -> handler.vistrel$charTyped(windowHandle, new CharacterEvent(cp, currentModifiers)));
-    }*/
-//? } elif <26.3 {
-/*        text.codePoints().forEach(cp -> handler.vistrel$charTyped(windowHandle, new CharacterEvent(cp)));
-    }*/
-//? }
-//? if <26.3 {
-/*}*/
+        GLFWCharModsCallback modsCb = GLFW.glfwSetCharModsCallback(win, null);
+        GLFW.glfwSetCharModsCallback(win, modsCb);
+        if (modsCb != null) {
+            modsCb.invoke(win, codepoint, currentModifiers);
+        }
+    }
+}*/
 //? }

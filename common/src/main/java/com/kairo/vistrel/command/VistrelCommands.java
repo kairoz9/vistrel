@@ -204,7 +204,7 @@ public final class VistrelCommands {
             );
     }
 
-    //? if >=1.21.5 {
+    //? if >=26.1 {
     private static ClickEvent openUrl(String url) {
         return new ClickEvent.OpenUrl(java.net.URI.create(url));
     }
@@ -219,15 +219,127 @@ public final class VistrelCommands {
 
     //? } else {
     /*private static ClickEvent openUrl(String url) {
-        return new ClickEvent(ClickEvent.Action.OPEN_URL, url);
+        return (ClickEvent) richEvent(ClickEvent.class, "OPEN_URL", url, java.net.URI.create(url));
     }
 
     private static ClickEvent copyText(String text) {
-        return new ClickEvent(ClickEvent.Action.COPY_TO_CLIPBOARD, text);
+        return (ClickEvent) richEvent(ClickEvent.class, "COPY_TO_CLIPBOARD", text);
     }
 
     private static HoverEvent showText(Component text) {
-        return new HoverEvent(HoverEvent.Action.SHOW_TEXT, text);
+        return (HoverEvent) richEvent(HoverEvent.class, "SHOW_TEXT", text);
+    }
+
+    // <26.1 没有 record 子类型：富文本实例只能经 (Action, 值) 通用构造器创建，1.21.5 起才改为 record 子类型。
+    // 构造路径按运行期形态解析：枚举常量按 name() 选取（枚举名字面量在三 loader 原样保留）；
+    // 旧 HoverEvent.Action 是普通类而非枚举（1.20/1.21），其常量经
+    // “零参返回 String 且等于序列化名”的访问器定位
+    private static Object richEvent(Class<?> family, String actionName, Object value) {
+        return richEvent(family, actionName, value, value);
+    }
+
+    private static Object richEvent(Class<?> family, String actionName, Object genericValue, Object recordValue) {
+        for (java.lang.reflect.Constructor<?> constructor : family.getDeclaredConstructors()) {
+            Class<?>[] parameters = constructor.getParameterTypes();
+            if (parameters.length == 2 && parameters[0].isMemberClass() && parameters[1].isInstance(genericValue)) {
+                // 通用构造器直接收目标常量，实例必然携带它，无需再经访问器比对
+                try {
+                    return constructor.newInstance(actionConstant(parameters[0], actionName), genericValue);
+                } catch (ReflectiveOperationException | IllegalArgumentException e) {
+                    throw new IllegalStateException(family.getName() + " 构造失败", e);
+                }
+            }
+        }
+        Class<?> actionType = actionEnum(family);
+        Object action = actionConstant(actionType, actionName);
+        for (Class<?> nested : family.getDeclaredClasses()) {
+            if (!nested.isRecord()) {
+                continue;
+            }
+            for (java.lang.reflect.Constructor<?> constructor : nested.getDeclaredConstructors()) {
+                Class<?>[] parameters = constructor.getParameterTypes();
+                if (parameters.length != 1 || !parameters[0].isInstance(recordValue)) {
+                    continue;
+                }
+                Object candidate;
+                try {
+                    candidate = constructor.newInstance(recordValue);
+                } catch (ReflectiveOperationException | RuntimeException e) {
+                    continue;
+                }
+                if (actionOf(family, actionType, candidate) == action) {
+                    return candidate;
+                }
+            }
+        }
+        throw new IllegalStateException(family.getName() + " 未找到可构造 " + actionName + " 的子类型");
+    }
+
+    private static Class<?> actionEnum(Class<?> family) {
+        for (Class<?> nested : family.getDeclaredClasses()) {
+            if (nested.isEnum()) {
+                return nested;
+            }
+        }
+        throw new IllegalStateException(family.getName() + " 缺少 Action 枚举");
+    }
+
+    private static Object actionConstant(Class<?> actionType, String name) {
+        if (actionType.isEnum()) {
+            for (Object constant : actionType.getEnumConstants()) {
+                if (((Enum<?>) constant).name().equals(name)) {
+                    return constant;
+                }
+            }
+            throw new IllegalStateException(actionType.getName() + " 缺少常量 " + name);
+        }
+        String expected = name.toLowerCase(java.util.Locale.ROOT);
+        for (java.lang.reflect.Field field : actionType.getDeclaredFields()) {
+            if (!java.lang.reflect.Modifier.isStatic(field.getModifiers())
+                    || !actionType.isAssignableFrom(field.getType())) {
+                continue;
+            }
+            Object constant;
+            try {
+                constant = field.get(null);
+            } catch (ReflectiveOperationException e) {
+                continue;
+            }
+            if (constant != null && hasSerializedName(actionType, constant, expected)) {
+                return constant;
+            }
+        }
+        throw new IllegalStateException(actionType.getName() + " 缺少常量 " + name);
+    }
+
+    private static boolean hasSerializedName(Class<?> actionType, Object constant, String expected) {
+        for (java.lang.reflect.Method method : actionType.getDeclaredMethods()) {
+            if (java.lang.reflect.Modifier.isStatic(method.getModifiers()) || method.getParameterCount() != 0
+                    || method.getReturnType() != String.class) {
+                continue;
+            }
+            try {
+                if (expected.equals(method.invoke(constant))) {
+                    return true;
+                }
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                continue;
+            }
+        }
+        return false;
+    }
+
+    private static Object actionOf(Class<?> family, Class<?> actionType, Object instance) {
+        for (java.lang.reflect.Method method : family.getMethods()) {
+            if (method.getParameterCount() == 0 && method.getReturnType() == actionType) {
+                try {
+                    return method.invoke(instance);
+                } catch (ReflectiveOperationException e) {
+                    throw new IllegalStateException(family.getName() + " Action 访问器调用失败", e);
+                }
+            }
+        }
+        throw new IllegalStateException(family.getName() + " 缺少 Action 访问器");
     }*/
     //? }
     /**

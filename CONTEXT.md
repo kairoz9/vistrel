@@ -98,7 +98,7 @@ The off-screen cloud rendering execution mode running on Linux instances without
 _Avoid_: Dedicated server, Console mode
 
 **Stonecutter Active Version**:
-The specific Minecraft version branch actively unpacked and configured in the IDE workspace (e.g. 1.20, 1.21, 1.21.9, or 26.3).
+The specific Minecraft version branch actively unpacked and configured in the IDE workspace (e.g. 1.20, 1.21, or 26.3).
 _Avoid_: Working version, Current branch
 
 **VCS Baseline Version**:
