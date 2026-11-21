@@ -5,9 +5,9 @@
 //! 所以「这条命令该不该等」在类型上就没有歧义。
 //! 管线死亡时通过 Channel Drop 实现 0ms fail-closed 应答。
 
-use crate::encode::StreamingProfile;
 use crate::encode::encoder::EncodeBackendKind;
 use crate::encode::hardware::slots::VramSlotDescriptor;
+use crate::encode::{StreamingProfile, TierRequest, VideoCodec};
 use std::sync::Arc;
 use std::sync::mpsc::{RecvTimeoutError, SyncSender};
 use std::time::Duration;
@@ -50,6 +50,10 @@ pub(crate) enum ControlStatus {
     ReleaseFailed = 8,
 }
 
+/// 重定档回执：Actor 实际生效的档位与 codec，后端 `None` 表示编码器尚未就绪的采纳态
+pub(crate) type RetierReceipt =
+    Result<(StreamingProfile, VideoCodec, Option<EncodeBackendKind>), ControlStatus>;
+
 /// 控制命令
 ///
 /// 形状即纪律：tell 变体不带应答（投递即完成），ask 变体自带一次性应答通道。因此
@@ -64,20 +68,19 @@ pub(crate) enum ControlCommand {
     /// 挂起一次关键帧请求：下一帧以 IDR 编码（tell）
     /// 请求是幂等意图而非逐条事件：重复投递在消费点塌缩成一个挂起标志
     RequestKeyframe,
-    /// 重配档位，回送实际生效的档位与当时后端身份或拒绝原因；
+    /// 按定档请求重定档位，回送实际生效的档位、codec 与当时后端身份或拒绝原因；
     /// 后端 None 表示编码器尚未就绪的纯采纳态（会话建立前不可达）
-    ProfileChange {
-        profile: StreamingProfile,
-        reply: tokio::sync::oneshot::Sender<
-            Result<(StreamingProfile, Option<EncodeBackendKind>), ControlStatus>,
-        >,
+    Retier {
+        request: TierRequest,
+        reply: tokio::sync::oneshot::Sender<RetierReceipt>,
     },
-    /// 按档位与后端偏好配好编码器，回送实际生效的档位与后端身份（硬编建败回退软编如实上报）
+    /// 按定档请求与后端偏好配好编码器，回送实际生效的档位、codec 与后端身份
+    /// （硬编建败回退软编如实上报）
     PrepareEncoder {
-        profile: StreamingProfile,
+        request: TierRequest,
         preferred_backend: Option<EncodeBackendKind>,
         reply: tokio::sync::oneshot::Sender<
-            Result<(StreamingProfile, EncodeBackendKind), ControlStatus>,
+            Result<(StreamingProfile, VideoCodec, EncodeBackendKind), ControlStatus>,
         >,
     },
     /// 导入显存直通槽位
@@ -139,18 +142,15 @@ impl ControlSender {
         let _ = self.send(ControlCommand::RequestKeyframe);
     }
 
-    /// 请求重配档位（ask）
+    /// 请求重定档位（ask）
     ///
-    /// `Ok` 是 Actor **实际生效**的档位与当时后端身份：调用方提交 Actor 说的准，而不是
-    /// 「成功就假定请求生效、失败就回读旧值」这套两阶段推断。后端 `None` 表示编码器
-    /// 尚未就绪的纯采纳态。`Err(ReconfigureFailed)` 表示 Actor 拒绝了这次重配、维持
-    /// 原档位；其余错误码表示命令没送达或应答超时，调用方同样维持已知档位。
-    pub(crate) async fn change_profile(
-        &self,
-        profile: StreamingProfile,
-    ) -> Result<(StreamingProfile, Option<EncodeBackendKind>), ControlStatus> {
+    /// `Ok` 是 Actor **实际生效**的档位、codec 与当时后端身份：调用方提交 Actor 说的准，
+    /// 而不是「成功就假定请求生效、失败就回读旧值」这套两阶段推断。后端 `None` 表示
+    /// 编码器尚未就绪的纯采纳态。`Err(ReconfigureFailed)` 表示 Actor 拒绝了这次重定档、
+    /// 维持原档位；其余错误码表示命令没送达或应答超时，调用方同样维持已知档位。
+    pub(crate) async fn retier(&self, request: TierRequest) -> RetierReceipt {
         let (reply, wait) = tokio::sync::oneshot::channel();
-        self.send(ControlCommand::ProfileChange { profile, reply })
+        self.send(ControlCommand::Retier { request, reply })
             .map_err(Self::send_error)?;
         match tokio::time::timeout(self.ack_timeout, wait).await {
             Ok(Ok(outcome)) => outcome,
@@ -159,18 +159,18 @@ impl ControlSender {
         }
     }
 
-    /// 按档位把编码器配好（ask）：新会话接入、顶号、预热都走这一条
+    /// 按定档请求把编码器配好（ask）：新会话接入、顶号、预热都走这一条
     ///
     /// 后端偏好随命令携带（`None` = 自动，按能力快照默认胜者）；`Ok` 才代表已就绪，
-    /// 档位与后端都是实际生效值——硬编建败回退软编时如实携带回退值，调用方不必靠猜
+    /// 档位、codec 与后端都是实际生效值——硬编建败回退软编时如实携带回退值，调用方不必靠猜
     pub(crate) async fn prepare_encoder(
         &self,
-        profile: StreamingProfile,
+        request: TierRequest,
         preferred_backend: Option<EncodeBackendKind>,
-    ) -> Result<(StreamingProfile, EncodeBackendKind), ControlStatus> {
+    ) -> Result<(StreamingProfile, VideoCodec, EncodeBackendKind), ControlStatus> {
         let (reply, wait) = tokio::sync::oneshot::channel();
         self.send(ControlCommand::PrepareEncoder {
-            profile,
+            request,
             preferred_backend,
             reply,
         })
@@ -285,6 +285,7 @@ mod tests {
                 ControlCommand::PrepareEncoder { reply, .. } => {
                     let _ = reply.send(Ok((
                         StreamingProfile::default(),
+                        VideoCodec::H264,
                         EncodeBackendKind::Software,
                     )));
                 }
@@ -294,8 +295,8 @@ mod tests {
                 ControlCommand::ClearVramSlots { reply } => {
                     let _ = reply.send(ControlStatus::Ok);
                 }
-                ControlCommand::ProfileChange { reply, .. } => {
-                    let _ = reply.send(Ok((StreamingProfile::default(), None)));
+                ControlCommand::Retier { reply, .. } => {
+                    let _ = reply.send(Ok((StreamingProfile::default(), VideoCodec::H264, None)));
                 }
                 ControlCommand::Shutdown
                 | ControlCommand::BitrateChange(_)
@@ -311,7 +312,7 @@ mod tests {
             ControlCommand::Shutdown => "shutdown",
             ControlCommand::BitrateChange(_) => "set_bitrate",
             ControlCommand::RequestKeyframe => "request_keyframe",
-            ControlCommand::ProfileChange { .. } => "change_profile",
+            ControlCommand::Retier { .. } => "retier",
             ControlCommand::PrepareEncoder { .. } => "prepare_encoder",
             ControlCommand::ImportVramSlots { .. } => "import_vram_slots",
             ControlCommand::ClearVramSlots { .. } => "clear_vram_slots",
@@ -404,15 +405,26 @@ mod tests {
                 let _ = recorded_tx.send(preferred_backend);
                 let _ = reply.send(Ok((
                     StreamingProfile::default(),
+                    VideoCodec::H264,
                     EncodeBackendKind::Software,
                 )));
             }
         });
-        let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        let request = TierRequest {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bpp: 0.1,
+            codec: VideoCodec::H264,
+        };
         let rt = tokio::runtime::Runtime::new().expect("测试 runtime 必须能建起来");
         assert_eq!(
-            rt.block_on(sender.prepare_encoder(profile, Some(EncodeBackendKind::Nvenc))),
-            Ok((StreamingProfile::default(), EncodeBackendKind::Software))
+            rt.block_on(sender.prepare_encoder(request, Some(EncodeBackendKind::Nvenc))),
+            Ok((
+                StreamingProfile::default(),
+                VideoCodec::H264,
+                EncodeBackendKind::Software
+            ))
         );
         assert_eq!(
             recorded_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -421,45 +433,62 @@ mod tests {
         );
     }
 
-    /// 数据型应答必须是 Actor 送来的档位，不能被降级成结果码
+    /// 数据型应答必须是 Actor 送来的生效档位，不能被降级成结果码
     #[tokio::test]
-    async fn test_profile_change_returns_applied_profile() {
+    async fn test_retier_returns_applied_tier() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ControlCommand>(CONTROL_QUEUE_DEPTH);
         let bell = Arc::new(Notify::new());
-        let applied = StreamingProfile::new(1024, 768, 48, VideoCodec::H264);
+        let applied = StreamingProfile::new(1024, 768, 48, 2_000_000);
         std::thread::spawn(move || {
             while let Some(cmd) = rx.blocking_recv() {
-                if let ControlCommand::ProfileChange { reply, .. } = cmd {
-                    let _ = reply.send(Ok((applied, Some(EncodeBackendKind::Nvenc))));
+                if let ControlCommand::Retier { reply, .. } = cmd {
+                    let _ = reply.send(Ok((
+                        applied,
+                        VideoCodec::H264,
+                        Some(EncodeBackendKind::Nvenc),
+                    )));
                 }
             }
         });
 
-        let requested = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
-        let (got, backend) = ControlSender::new(tx, bell)
-            .change_profile(requested)
+        let request = TierRequest {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bpp: 0.1,
+            codec: VideoCodec::H264,
+        };
+        let (got, codec, backend) = ControlSender::new(tx, bell)
+            .retier(request)
             .await
             .expect("假 Actor 应答过，必须拿到值");
-        assert_ne!(got, requested, "应答不得是请求值的回显");
+        assert_ne!(got, request.derive(), "应答不得是请求值的回显");
         assert_eq!(got, applied, "应答必须是 Actor 实际生效的档位");
+        assert_eq!(codec, VideoCodec::H264);
         assert_eq!(backend, Some(EncodeBackendKind::Nvenc));
     }
 
-    /// Actor 拒绝重配时，拒绝原因必须跨过接口，而不是让调用方比对档位去猜
+    /// Actor 拒绝重定档时，拒绝原因必须跨过接口，而不是让调用方比对档位去猜
     #[tokio::test]
-    async fn test_profile_change_rejection_is_reported() {
+    async fn test_retier_rejection_is_reported() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ControlCommand>(CONTROL_QUEUE_DEPTH);
         let bell = Arc::new(Notify::new());
         std::thread::spawn(move || {
             while let Some(cmd) = rx.blocking_recv() {
-                if let ControlCommand::ProfileChange { reply, .. } = cmd {
+                if let ControlCommand::Retier { reply, .. } = cmd {
                     let _ = reply.send(Err(ControlStatus::ReconfigureFailed));
                 }
             }
         });
 
         let err = ControlSender::new(tx, bell)
-            .change_profile(StreamingProfile::new(1280, 720, 60, VideoCodec::H264))
+            .retier(TierRequest {
+                width: 1280,
+                height: 720,
+                fps: 60,
+                bpp: 0.1,
+                codec: VideoCodec::H264,
+            })
             .await
             .expect_err("拒绝必须原样上报，不得折成「维持原档位」让调用方自己推断");
         assert_eq!(err, ControlStatus::ReconfigureFailed);

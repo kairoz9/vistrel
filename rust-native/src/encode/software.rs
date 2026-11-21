@@ -19,7 +19,9 @@ use crate::encode::encoder::{EncodeBackendKind, VideoEncodeBackend};
 use crate::encode::frame::FramePayload;
 use crate::encode::hardware::slots::VramSlotDescriptor;
 use crate::encode::pool::HostBlock;
-use crate::encode::{MAX_BPP, StreamingProfile, calculate_dynamic_bitrate, h264_level_idc};
+use crate::encode::{
+    MAX_BPP, StreamingProfile, VideoCodec, calculate_dynamic_bitrate, h264_level_idc,
+};
 
 /// Cisco OpenH264 库的文件系统路径，由 `startEngine` 导出入口在引擎启动前注入。
 /// 游戏侧进程内不变，OnceLock 保留首个注入值；值为解压后的最终库路径。
@@ -100,17 +102,17 @@ pub struct SoftwareBackend {
 }
 
 impl SoftwareBackend {
-    /// 构造软编码器：直接接收 StreamingProfile，由类型不变式担保尺寸与帧率合法性，无需冗余校验
-    pub fn new(profile: StreamingProfile) -> Result<Self, String> {
+    /// 构造软编码器：直接接收 StreamingProfile 与 codec，由类型不变式担保尺寸与
+    /// 帧率合法性，无需冗余校验
+    pub fn new(profile: StreamingProfile, codec: VideoCodec) -> Result<Self, String> {
         let width = profile.width();
         let height = profile.height();
         let n = thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
 
-        let ceiling_bps =
-            calculate_dynamic_bitrate(width, height, profile.fps(), MAX_BPP, profile.codec())
-                .max(profile.bitrate());
+        let ceiling_bps = calculate_dynamic_bitrate(width, height, profile.fps(), MAX_BPP, codec)
+            .max(profile.bitrate());
 
         let config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(profile.bitrate() as u32))
@@ -326,12 +328,17 @@ impl VideoEncodeBackend for SoftwareBackend {
         }
     }
 
-    /// 软编吃堆块，与设备块走同一个池；它不碰设备，重配也不换内存域，故恒返回空批
-    fn reconfigure(&mut self, new_profile: StreamingProfile) -> Result<Vec<HostBlock>, String> {
+    /// 软编吃堆块，与设备块走同一个池；它不碰设备，重配也不换内存域，故恒返回空批。
+    /// codec 不参与几何比对：软编域只出 H264，上游钳制已保证
+    fn reconfigure(
+        &mut self,
+        new_profile: StreamingProfile,
+        new_codec: VideoCodec,
+    ) -> Result<Vec<HostBlock>, String> {
         if self.width == new_profile.width() && self.height == new_profile.height() {
             return Ok(Vec::new());
         }
-        *self = Self::new(new_profile)?;
+        *self = Self::new(new_profile, new_codec)?;
         Ok(Vec::new())
     }
 
@@ -339,7 +346,7 @@ impl VideoEncodeBackend for SoftwareBackend {
     ///
     /// 编码器尚未初始化时只记录不落盘：openh264-rs 是惰性初始化（首次 `encode` 才调
     /// `Initialize`），而 openh264 的 `SetOption` 在未初始化时会直接返回 `cmInitExpected`。
-    /// `ProfileChange` 重建软编后会立刻下发码率，正好落在这一刻，不延后就会变成一次假失败。
+    /// 定档命令重建软编后会立刻下发码率，正好落在这一刻，不延后就会变成一次假失败。
     fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), String> {
         if bitrate_bps == self.applied_bitrate {
             self.pending_bitrate = None;
@@ -437,8 +444,9 @@ mod tests {
             eprintln!("跳过：openh264 测试库不可用");
             return;
         }
-        let p1080 = StreamingProfile::new(1920, 1080, 60, crate::encode::VideoCodec::H264);
-        let mut enc1080 = SoftwareBackend::new(p1080).expect("Should create 1080p encoder");
+        let p1080 = StreamingProfile::new(1920, 1080, 60, 12_400_000);
+        let mut enc1080 = SoftwareBackend::new(p1080, crate::encode::VideoCodec::H264)
+            .expect("Should create 1080p encoder");
         assert_eq!(enc1080.height(), 1080);
         let dummy1080 = vec![128u8; p1080.width() * p1080.height() * 3 / 2];
         let (nalu1080, is_keyframe1080) = enc1080
@@ -447,8 +455,9 @@ mod tests {
         assert!(!nalu1080.is_empty(), "Encoded NALU should not be empty");
         assert!(is_keyframe1080, "OpenH264 首帧必须是 IDR 关键帧");
 
-        let p900 = StreamingProfile::new(1600, 900, 60, crate::encode::VideoCodec::H264);
-        let mut enc900 = SoftwareBackend::new(p900).expect("Should create 900p encoder");
+        let p900 = StreamingProfile::new(1600, 900, 60, 9_600_000);
+        let mut enc900 = SoftwareBackend::new(p900, crate::encode::VideoCodec::H264)
+            .expect("Should create 900p encoder");
         assert_eq!(enc900.width(), 1600);
         assert_eq!(enc900.height(), 900);
         let dummy900 = vec![128u8; p900.width() * p900.height() * 3 / 2];
@@ -458,8 +467,9 @@ mod tests {
         assert!(!nalu900.is_empty(), "Encoded NALU should not be empty");
         assert!(is_keyframe900, "OpenH264 首帧必须是 IDR 关键帧");
 
-        let p720 = StreamingProfile::new(1280, 720, 60, crate::encode::VideoCodec::H264);
-        let mut enc720 = SoftwareBackend::new(p720).expect("Should create 720p encoder");
+        let p720 = StreamingProfile::new(1280, 720, 60, 7_000_000);
+        let mut enc720 = SoftwareBackend::new(p720, crate::encode::VideoCodec::H264)
+            .expect("Should create 720p encoder");
         assert_eq!(enc720.width(), 1280);
         assert_eq!(enc720.height(), 720);
         let dummy720 = vec![128u8; 1280 * 720 * 3 / 2];
@@ -480,11 +490,12 @@ mod tests {
             eprintln!("跳过：openh264 测试库不可用");
             return;
         }
-        let profile = StreamingProfile::new(1280, 720, 60, crate::encode::VideoCodec::H264);
+        let profile = StreamingProfile::new(1280, 720, 60, 7_000_000);
         let initial = profile.bitrate() as u32;
         let raised = initial * 3 / 2;
         let dummy = vec![128u8; 1280 * 720 * 3 / 2];
-        let mut enc = SoftwareBackend::new(profile).expect("Should create encoder");
+        let mut enc = SoftwareBackend::new(profile, crate::encode::VideoCodec::H264)
+            .expect("Should create encoder");
 
         // 首帧之前：底层还没 Initialize，SetOption 只会返回 cmInitExpected，必须挂起
         enc.set_bitrate(raised).expect("首帧前改码率不应报错");

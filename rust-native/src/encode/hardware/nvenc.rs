@@ -46,7 +46,7 @@ use crate::encode::hardware::slots::{
     ActorStage, SlotStateBlock, SlotTable, VramSlotDescriptor, ensure_batch_geometry,
 };
 use crate::encode::pool::{HOST_SLOT_BYTES, HostBlock, POOL_DEPTH};
-use crate::encode::{FramePayload, StreamingProfile};
+use crate::encode::{FramePayload, StreamingProfile, VideoCodec};
 
 pub(crate) use cuda::new_cuda_context;
 use cuda::{PinnedHost, VramSlot, import_cuda_slot, wait_timeline_sem};
@@ -228,6 +228,7 @@ impl NvencBackend {
     /// 装进帧池。分配失败即整体构造失败。
     pub(crate) fn new(
         profile: StreamingProfile,
+        codec: VideoCodec,
         slot_state: &'static SlotStateBlock,
     ) -> Result<(Self, Vec<HostBlock>), String> {
         let driver = NvencDriver::load()?;
@@ -243,6 +244,7 @@ impl NvencBackend {
             driver,
             cuda_ctx.clone(),
             profile,
+            codec,
             &block_ptrs,
             stream.cu_stream(),
         )?;
@@ -402,8 +404,12 @@ impl VideoEncodeBackend for NvencBackend {
     /// 同 codec 的分辨率 / 帧率 / 码率变更全部走会话内 `nvEncReconfigureEncoder`
     /// 只有换 codec 才重建：`NvencSession` 若在重建路径上仍按旧几何持有输入登记，
     /// 旧块仍然有效，因此重配恒返回空批（块绑的是 CUDA 上下文，不是会话）
-    fn reconfigure(&mut self, new_profile: StreamingProfile) -> Result<Vec<HostBlock>, String> {
-        if self.session.profile().codec() == new_profile.codec() {
+    fn reconfigure(
+        &mut self,
+        new_profile: StreamingProfile,
+        new_codec: VideoCodec,
+    ) -> Result<Vec<HostBlock>, String> {
+        if self.session.codec() == new_codec {
             self.session.reconfigure(new_profile)?;
             return Ok(Vec::new());
         }
@@ -416,6 +422,7 @@ impl VideoEncodeBackend for NvencBackend {
             driver,
             self.cuda_ctx.clone(),
             new_profile,
+            new_codec,
             &self.block_ptrs,
             self.stream.cu_stream(),
         )?;
@@ -546,14 +553,15 @@ mod tests {
     #[test]
     #[ignore = "requires GPU"]
     fn test_reconfigure_across_resolutions_yields_idr() {
-        let p1080 = StreamingProfile::new(1920, 1080, 30, VideoCodec::Av1);
-        let (mut backend, blocks) = match NvencBackend::new(p1080, SlotStateBlock::new_leaked()) {
-            Ok(pair) => pair,
-            Err(e) => {
-                println!("硬编不可用（{e}），跳过分辨率重配用例");
-                return;
-            }
-        };
+        let p1080 = StreamingProfile::new(1920, 1080, 30, 3_700_000);
+        let (mut backend, blocks) =
+            match NvencBackend::new(p1080, VideoCodec::Av1, SlotStateBlock::new_leaked()) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    println!("硬编不可用（{e}），跳过分辨率重配用例");
+                    return;
+                }
+            };
         let pool = FramePool::new();
         pool.attach(blocks);
 
@@ -564,8 +572,8 @@ mod tests {
             (2560, 1440),
             (1920, 1080),
         ] {
-            let target = StreamingProfile::new(w, h, 30, VideoCodec::Av1);
-            if let Err(e) = backend.reconfigure(target) {
+            let target = StreamingProfile::new(w, h, 30, 3_700_000);
+            if let Err(e) = backend.reconfigure(target, VideoCodec::Av1) {
                 println!("重配 → {w}x{h}: 失败（{e}）");
                 failures.push((w, h, e));
                 continue;
@@ -735,14 +743,13 @@ mod tests {
         let codecs = [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1];
 
         for codec in codecs {
-            let mut profile = StreamingProfile::new(64, 64, 60, codec);
-            profile.set_bitrate(1_000_000);
+            let profile = StreamingProfile::new(64, 64, 60, 1_000_000);
             // 编码几何的唯一来源是 `session.profile`：64x64 无下限钳制，原样保留，
             // 帧缓冲按档案尺寸分配
             let (width, height) = (profile.width(), profile.height());
 
             let (mut backend, blocks) =
-                match NvencBackend::new(profile, SlotStateBlock::new_leaked()) {
+                match NvencBackend::new(profile, codec, SlotStateBlock::new_leaked()) {
                     Ok(pair) => pair,
                     Err(e) => {
                         println!(
@@ -776,18 +783,18 @@ mod tests {
     #[test]
     #[ignore = "requires GPU"]
     fn test_raw_nvenc_consecutive_encode_recycles_bitstream() {
-        let mut profile = StreamingProfile::new(64, 64, 60, VideoCodec::H264);
-        profile.set_bitrate(1_000_000);
+        let profile = StreamingProfile::new(64, 64, 60, 1_000_000);
         // 几何取自钳制后的 profile，与编码路径的取用点保持一致
         let (width, height) = (profile.width(), profile.height());
 
-        let (mut backend, blocks) = match NvencBackend::new(profile, SlotStateBlock::new_leaked()) {
-            Ok(pair) => pair,
-            Err(e) => {
-                println!("Skipping test: NVENC not available ({})", e);
-                return;
-            }
-        };
+        let (mut backend, blocks) =
+            match NvencBackend::new(profile, VideoCodec::H264, SlotStateBlock::new_leaked()) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    println!("Skipping test: NVENC not available ({})", e);
+                    return;
+                }
+            };
         let pool = FramePool::new();
         pool.attach(blocks);
 

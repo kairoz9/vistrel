@@ -326,14 +326,14 @@ impl FrameEncoder {
         device: &VideoDevice,
         caps: &CodecCaps,
         profile: StreamingProfile,
+        codec: VideoCodec,
         gop_length: u32,
     ) -> Result<Self, String> {
-        // 档位的 codec 必须与能力快照一致：快照按 codec 探测，错位的会话直接判非法
-        if profile.codec() != caps.codec {
+        // 请求的 codec 必须与能力快照一致：快照按 codec 探测，错位的会话直接判非法
+        if codec != caps.codec {
             return Err(format!(
-                "协商档位是 {:?}，能力快照是 {:?}，两者必须一致",
-                profile.codec(),
-                caps.codec
+                "协商 codec 是 {:?}，能力快照是 {:?}，两者必须一致",
+                codec, caps.codec
             ));
         }
         if gop_length < 2 {
@@ -785,12 +785,10 @@ impl Drop for FrameEncoder {
 }
 
 /// 测试档位：1080p60，显式 8 Mbps（绕开动态码率公式，让断言的输入确定）。
-/// codec 从能力快照取——档位与快照本来就同源
+/// codec 不在档位里，由各用例按能力快照单独传给 `FrameEncoder::new`
 #[cfg(test)]
-pub(super) fn test_profile(caps: &CodecCaps) -> StreamingProfile {
-    let mut profile = StreamingProfile::new(1920, 1080, 60, caps.codec);
-    profile.set_bitrate(8_000_000);
-    profile
+pub(super) fn test_profile() -> StreamingProfile {
+    StreamingProfile::new(1920, 1080, 60, 8_000_000)
 }
 
 /// 造一帧 NV12：亮度低频渐变、色度四色块

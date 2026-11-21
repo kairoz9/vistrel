@@ -392,7 +392,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::{StreamingProfile, VideoCodec, display_nv12_len};
+    use crate::encode::{StreamingProfile, display_nv12_len};
 
     /// 归还进当前域后必须能再取到：池深固定，取空即 None
     #[test]
@@ -414,7 +414,8 @@ mod tests {
     /// 容量按 coded 尺寸算而不是 display：GPU 侧 CSC 要读补齐行
     #[test]
     fn test_host_slot_bytes_cover_coded_extent() {
-        let max = StreamingProfile::new(MAX_WIDTH, MAX_HEIGHT, 30, VideoCodec::H264);
+        // 码率与本用例无关（只验几何），占位即可
+        let max = StreamingProfile::new(MAX_WIDTH, MAX_HEIGHT, 30, 4_000_000);
         let coded = max.coded_extent((MAX_CODED_ALIGN, MAX_CODED_ALIGN));
         assert_eq!(
             HOST_SLOT_BYTES,

@@ -137,10 +137,13 @@ type MediaEngineBundle = (
 
 impl StreamingSession {
     /// 建立 WebRTC 传输并初始化完整会话
+    ///
+    /// `codec` 是协商回执的生效值：SDP 载荷与码率上限声明都锚在它上
     pub async fn establish(
         engine: &super::StreamingEngine,
         offer: RTCSessionDescription,
         profile: StreamingProfile,
+        codec: VideoCodec,
         handler: Arc<SessionHandler>,
     ) -> Result<(Arc<Self>, RTCSessionDescription), Box<dyn std::error::Error + Send + Sync>> {
         let state = Arc::new(AtomicU8::new(RTCPeerConnectionState::New as u8));
@@ -160,11 +163,11 @@ impl StreamingSession {
         // 1. 装配 MediaEngine 与音视频编解码规格（档位按值流入，会话不留副本）
         let (media_engine, video_codec, primary_pt, audio_codec, primary_audio_pt) =
             Self::build_media_engine(
-                profile.codec(),
+                codec,
                 crate::encode::MAX_WIDTH,
                 crate::encode::MAX_HEIGHT,
                 crate::encode::sdp_ceiling_fps(),
-                crate::encode::stream_max_bitrate_kbps(profile.codec()),
+                crate::encode::stream_max_bitrate_kbps(codec),
             )?;
 
         // 2. 创建本地发送视频轨与音频轨 (TrackLocalStaticSample)
@@ -183,7 +186,7 @@ impl StreamingSession {
                 pc.clone(),
                 video_track.clone(),
                 audio_track.clone(),
-                profile.codec(),
+                codec,
                 primary_pt,
                 primary_audio_pt,
             )
@@ -719,13 +722,13 @@ a=rtpmap:102 H264/90000\r\n";
     #[tokio::test]
     async fn test_streaming_session_establish_and_close() {
         let offer = test_offer();
-        let initial_profile = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
+        let initial_profile = StreamingProfile::new(1920, 1080, 60, 12_400_000);
 
         let engine = test_engine();
         let handler = Arc::new(SessionHandler::new(Arc::new(|_| {})));
 
         let (session, answer) =
-            StreamingSession::establish(&engine, offer, initial_profile, handler)
+            StreamingSession::establish(&engine, offer, initial_profile, VideoCodec::H264, handler)
                 .await
                 .unwrap();
 
@@ -822,11 +825,16 @@ a=rtpmap:102 H264/90000\r\n";
         };
         let engine = test_engine_with_bind(&format!("127.0.0.1:{port}"));
         let handler = Arc::new(SessionHandler::new(Arc::new(|_| {})));
-        let initial_profile = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
-        let (session, _answer) =
-            StreamingSession::establish(&engine, test_offer(), initial_profile, handler)
-                .await
-                .unwrap();
+        let initial_profile = StreamingProfile::new(1920, 1080, 60, 12_400_000);
+        let (session, _answer) = StreamingSession::establish(
+            &engine,
+            test_offer(),
+            initial_profile,
+            VideoCodec::H264,
+            handler,
+        )
+        .await
+        .unwrap();
 
         // 刻意不调 close：整会话直接丢弃，收尾交给兜底任务
         drop(session);
@@ -882,13 +890,14 @@ a=mid:0\r\n\
 a=sendrecv\r\n\
 a=rtpmap:102 H264/90000\r\n";
         let offer = RTCSessionDescription::offer(sdp.to_string()).unwrap();
-        let profile = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
+        let profile = StreamingProfile::new(1920, 1080, 60, 12_400_000);
         let engine = test_engine();
         let handler = Arc::new(SessionHandler::new(Arc::new(|_| {})));
 
-        let (session, _) = StreamingSession::establish(&engine, offer, profile, handler)
-            .await
-            .expect("establish 应当成功");
+        let (session, _) =
+            StreamingSession::establish(&engine, offer, profile, VideoCodec::H264, handler)
+                .await
+                .expect("establish 应当成功");
 
         let weak = Arc::downgrade(&session);
         // 主动关闭并丢弃 session

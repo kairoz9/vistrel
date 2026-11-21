@@ -14,12 +14,12 @@ use super::session_params::{
     apply_refresh_and_level, build_encoder_config, calculate_dar, open_encoder,
 };
 use super::{BitstreamHandle, EncoderHandle, InputSpec, RegisteredResource};
-use crate::encode::StreamingProfile;
 #[cfg(test)]
 use crate::encode::encoder::BackendStageTimings;
 use crate::encode::hardware::nvenc::nvfn;
 use crate::encode::hardware::nvenc::session_params::build_pic_params;
 use crate::encode::hardware::slots::{ActorStage, SlotStateBlock};
+use crate::encode::{StreamingProfile, VideoCodec};
 
 // ============================================================================
 // 编码器会话 (NVENC Session)
@@ -111,6 +111,7 @@ pub(crate) struct NvencSession {
     /// 主机帧块的登记式输入
     device_inputs: Vec<DeviceInput>,
     profile: StreamingProfile,
+    codec: VideoCodec,
     config: Box<NV_ENC_CONFIG>,
     init_params: NV_ENC_INITIALIZE_PARAMS,
     #[cfg(test)]
@@ -171,6 +172,12 @@ impl NvencSession {
         &self.profile
     }
 
+    /// 会话 codec：构造期定死（换 codec 走会话重建，由 [`NvencBackend`] 判定）
+    #[inline]
+    pub fn codec(&self) -> VideoCodec {
+        self.codec
+    }
+
     /// 会话构造：开会话、建编码参数、把给定池块登记为编码输入资源
     ///
     /// `blocks` 由调用方（帧池）持有：必须是按本档位几何可容纳的锁页内存，且活到
@@ -180,6 +187,7 @@ impl NvencSession {
         driver: NvencDriver,
         cuda_ctx: Arc<CudaContext>,
         profile: StreamingProfile,
+        codec: VideoCodec,
         blocks: &[*const u8],
         io_stream: CUstream,
     ) -> Result<Self, String> {
@@ -189,7 +197,7 @@ impl NvencSession {
 
         let encoder = open_encoder(driver, &cuda_ctx)?;
         let (config, init_params) =
-            build_encoder_config(driver, &encoder, &profile, buffer_format)?;
+            build_encoder_config(driver, &encoder, &profile, codec, buffer_format)?;
 
         // 核心优化点：把专用 CUDA Stream 绑为 NVENC 输入与输出端，建立纯 GPU 硬件时间线。
         // 绑定失败必须 fail-closed：退回 legacy default stream 后编码与流上没有隐式同步。
@@ -248,6 +256,7 @@ impl NvencSession {
             spare_bitstream: None,
             device_inputs,
             profile,
+            codec,
             config,
             init_params,
             #[cfg(test)]
@@ -260,11 +269,9 @@ impl NvencSession {
     ///
     /// 分辨率变更走 Reconfigure API：前提是建会话时声明了
     /// `maxEncodeWidth/maxEncodeHeight`（见 `build_encoder_config`）。
-    /// codec 不可就地变更，必须重建会话。
+    /// 会话 codec 构造期定死、无参数可改——换 codec 走会话重建，
+    /// 由 [`NvencBackend::reconfigure`](super::NvencBackend::reconfigure) 判定。
     pub fn reconfigure(&mut self, profile: StreamingProfile) -> Result<(), String> {
-        if profile.codec() != self.profile.codec() {
-            return Err("nvEncReconfigureEncoder 不支持更换 codec；需重建会话".into());
-        }
         let resolution_changed =
             profile.width() != self.profile.width() || profile.height() != self.profile.height();
 
@@ -279,9 +286,7 @@ impl NvencSession {
         candidate_config.rcParams.vbvBufferSize = frame_size_bits;
         candidate_config.rcParams.vbvInitialDelay = frame_size_bits;
         // Level 与 Intra-Refresh 波次随新档位重算，推导与构造期共用同一处实现。
-        // codec 以会话建立时为准（self.profile）：重配不改 codec，candidate_config
-        // 的 union 活跃成员也由它决定
-        apply_refresh_and_level(self.profile.codec(), &mut candidate_config, fps, bitrate);
+        apply_refresh_and_level(self.codec, &mut candidate_config, fps, bitrate);
 
         // 输入登记参数里的 width/height/pitch 描述缓冲布局：沿用旧值会让驱动按旧行距
         // 读新几何的帧。先按新几何重登，失败则回滚旧几何，会话保持可用

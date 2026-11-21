@@ -13,7 +13,7 @@ use super::hardware::vulkan::VulkanVideoBackend;
 use super::software::SoftwareBackend;
 use crate::encode::hardware::slots::{SlotStateBlock, VramSlotDescriptor};
 use crate::encode::pool::{HostBlock, heap_blocks};
-use crate::encode::{FramePayload, StreamingProfile};
+use crate::encode::{FramePayload, StreamingProfile, VideoCodec};
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -89,9 +89,15 @@ pub(crate) trait VideoEncodeBackend {
 
     /// 重配档位（分辨率/编解码器变化允许内部重建会话）
     ///
+    /// `new_codec` 是本次要编码的 codec：实现体据此判断能否就地重配（codec 不可就地
+    /// 更换的后端在此报错，由门面/调用方转重建）。
     /// 重建可能换设备/上下文，即换了块所在的内存域：实现体换域时把新批块**交回**调用方，
     /// 由它装进帧池；返回空批＝内存域未变，旧块仍然有效。不吃设备帧的后端恒返回空批。
-    fn reconfigure(&mut self, new_profile: StreamingProfile) -> Result<Vec<HostBlock>, String>;
+    fn reconfigure(
+        &mut self,
+        new_profile: StreamingProfile,
+        new_codec: VideoCodec,
+    ) -> Result<Vec<HostBlock>, String>;
 
     /// 跟随 Followed Bitrate 的无状态码率下发
     fn set_bitrate(&mut self, bps: u32) -> Result<(), String>;
@@ -121,6 +127,8 @@ pub(crate) struct VideoEncoder {
     frame_counter: u64,
     force_keyframe: bool,
     profile: StreamingProfile,
+    /// 生效 codec：与档位并列的事实——reconfigure 换 codec 即重建，重配跳过判定用
+    codec: VideoCodec,
 }
 
 impl VideoEncoder {
@@ -130,27 +138,30 @@ impl VideoEncoder {
     /// 构造不产生全局发布副作用
     pub(crate) fn new_software(
         profile: StreamingProfile,
+        codec: VideoCodec,
     ) -> Result<(Self, Vec<HostBlock>), String> {
-        Self::new_backend(profile, EncodeBackendKind::Software, None)
+        Self::new_backend(profile, codec, EncodeBackendKind::Software, None)
     }
 
     /// 按显式后端类型构建
     ///
-    /// 生产路径经 [`Self::new_hardware`]（探测结果）或 [`Self::new_software`] 进入；
-    /// 后端生命周期用例借此直接指定目标后端（请求即所得）。硬编种类必须携带
-    /// 槽位所有权块，缺块直接报错——那是掩码协议的载体，不是可选项
+    /// 生产路径经 [`Self::new_software`] 与 Actor 的硬编工厂进入；后端生命周期用例
+    /// 借此直接指定目标后端（请求即所得）。硬编种类必须携带槽位所有权块，缺块直接
+    /// 报错——那是掩码协议的载体，不是可选项
     pub(crate) fn new_backend(
         profile: StreamingProfile,
+        codec: VideoCodec,
         kind: EncodeBackendKind,
         slot_state: Option<&'static SlotStateBlock>,
     ) -> Result<(Self, Vec<HostBlock>), String> {
-        Self::build(profile, kind, slot_state)
+        Self::build(profile, codec, kind, slot_state)
     }
 
     /// 测试用：绕过探测与全局后端发布，直接用给定后端装配门面
     #[cfg(test)]
     pub(crate) fn from_backend(
         profile: StreamingProfile,
+        codec: VideoCodec,
         backend: Box<dyn VideoEncodeBackend>,
     ) -> Self {
         Self {
@@ -158,11 +169,13 @@ impl VideoEncoder {
             frame_counter: 0,
             force_keyframe: true,
             profile,
+            codec,
         }
     }
 
     fn build(
         profile: StreamingProfile,
+        codec: VideoCodec,
         kind: EncodeBackendKind,
         slot_state: Option<&'static SlotStateBlock>,
     ) -> Result<(Self, Vec<HostBlock>), String> {
@@ -171,17 +184,18 @@ impl VideoEncoder {
         let (backend, blocks): (Box<dyn VideoEncodeBackend>, Vec<HostBlock>) = match kind {
             EncodeBackendKind::Nvenc => {
                 let slot_state = slot_state.ok_or("NVENC 后端缺少槽位所有权块")?;
-                let (backend, blocks) = NvencBackend::new(profile, slot_state)?;
+                let (backend, blocks) = NvencBackend::new(profile, codec, slot_state)?;
                 (Box::new(backend), blocks)
             }
             EncodeBackendKind::VulkanVideo => {
                 let slot_state = slot_state.ok_or("Vulkan Video 后端缺少槽位所有权块")?;
-                let (backend, blocks) = VulkanVideoBackend::new(profile, slot_state)?;
+                let (backend, blocks) = VulkanVideoBackend::new(profile, codec, slot_state)?;
                 (Box::new(backend), blocks)
             }
-            EncodeBackendKind::Software => {
-                (Box::new(SoftwareBackend::new(profile)?), heap_blocks())
-            }
+            EncodeBackendKind::Software => (
+                Box::new(SoftwareBackend::new(profile, codec)?),
+                heap_blocks(),
+            ),
         };
         // 实际建成的后端才是真相：采集侧尺寸与 backend_type() 都按建成值发布，
         // 否则会按探测粒度去建纹理，而编码器按设备粒度消费——两条采集路径同时失效
@@ -196,6 +210,7 @@ impl VideoEncoder {
                 // 初值 true：新编码器首帧必须是 IDR
                 force_keyframe: true,
                 profile,
+                codec,
             },
             blocks,
         ))
@@ -244,24 +259,28 @@ impl VideoEncoder {
         Ok(())
     }
 
-    /// 动态 Profile/分辨率重配
+    /// 动态档位/codec 重配
     ///
     /// 返回空批＝内存域未变；非空则调用方必须把新批装进帧池（旧批已失效）。
     pub(crate) fn reconfigure(
         &mut self,
         new_profile: StreamingProfile,
+        new_codec: VideoCodec,
     ) -> Result<Vec<HostBlock>, String> {
-        if self.profile == new_profile {
+        if self.profile == new_profile && self.codec == new_codec {
             return Ok(Vec::new());
         }
         log::info!(
-            "Streaming profile changed from {:?} to {:?}, reconfiguring encoder session",
+            "Streaming profile changed from {:?} ({:?}) to {:?} ({:?}), reconfiguring encoder session",
             self.profile,
-            new_profile
+            self.codec,
+            new_profile,
+            new_codec
         );
-        let blocks = self.backend.reconfigure(new_profile)?;
+        let blocks = self.backend.reconfigure(new_profile, new_codec)?;
         self.profile = new_profile;
-        // 几何或帧率变了，旧 GOP 的参考帧不再可靠：下一帧必须是 IDR
+        self.codec = new_codec;
+        // 几何或 codec 变了，旧 GOP 的参考帧不再可靠：下一帧必须是 IDR
         self.force_keyframe = true;
         Ok(blocks)
     }
@@ -356,11 +375,11 @@ mod tests {
     fn test_unified_encoder_software() {
         crate::encode::software::init_api_for_tests();
         let (w, h) = (1280usize, 720usize);
-        let profile = StreamingProfile::new(w, h, 60, VideoCodec::H264);
+        let profile = StreamingProfile::new(w, h, 60, 4_000_000);
         let pool = FramePool::new();
         pool.attach(heap_blocks());
         let (mut encoder, _blocks) =
-            VideoEncoder::new_software(profile).expect("软编初始化应当成功");
+            VideoEncoder::new_software(profile, VideoCodec::H264).expect("软编初始化应当成功");
         let payload = host_frame(&pool, w * h * 4, 128);
 
         let (nalu, is_keyframe) = encoder
@@ -374,18 +393,18 @@ mod tests {
     #[test]
     fn test_unified_encoder_reconfigure() {
         crate::encode::software::init_api_for_tests();
-        let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        let profile = StreamingProfile::new(1280, 720, 60, 4_000_000);
         let pool = FramePool::new();
         pool.attach(heap_blocks());
         let (mut encoder, _blocks) =
-            VideoEncoder::new_software(profile).expect("软编初始化应当成功");
+            VideoEncoder::new_software(profile, VideoCodec::H264).expect("软编初始化应当成功");
         let payload = host_frame(&pool, 1280 * 720 * 4, 0);
         let _ = encoder.encode(&payload, false);
 
-        let new_profile = StreamingProfile::new(1600, 900, 30, VideoCodec::H264);
+        let new_profile = StreamingProfile::new(1600, 900, 30, 3_000_000);
         assert!(
             encoder
-                .reconfigure(new_profile)
+                .reconfigure(new_profile, VideoCodec::H264)
                 .expect("软编重配不会换内存域")
                 .is_empty(),
             "软编不碰设备，重配不该交回新批"
@@ -399,11 +418,11 @@ mod tests {
     fn test_software_encoder_accepts_bitrate_change() {
         crate::encode::software::init_api_for_tests();
         let (w, h) = (1280usize, 720usize);
-        let profile = StreamingProfile::new(w, h, 60, VideoCodec::H264);
+        let profile = StreamingProfile::new(w, h, 60, 4_000_000);
         let pool = FramePool::new();
         pool.attach(heap_blocks());
         let (mut encoder, _blocks) =
-            VideoEncoder::new_software(profile).expect("软编初始化应当成功");
+            VideoEncoder::new_software(profile, VideoCodec::H264).expect("软编初始化应当成功");
         let payload = host_frame(&pool, w * h * 4, 0);
         encoder.encode(&payload, true).expect("首帧编码应当成功");
 

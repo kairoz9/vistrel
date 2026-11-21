@@ -1151,7 +1151,7 @@ mod tests {
                 return;
             }
         };
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(&caps), 15) {
+        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), caps.codec, 15) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("AV1 编码器初始化失败: {e}");
@@ -1227,9 +1227,13 @@ mod tests {
         if let (Ok(h264_caps), Ok(h264_device)) = (
             caps::probe_codec(&ctx, VideoCodec::H264),
             VideoDevice::new(&ctx, VideoCodec::H264),
-        ) && let Ok(mut h264) =
-            FrameEncoder::new(&h264_device, &h264_caps, test_profile(&h264_caps), 15)
-        {
+        ) && let Ok(mut h264) = FrameEncoder::new(
+            &h264_device,
+            &h264_caps,
+            test_profile(),
+            h264_caps.codec,
+            15,
+        ) {
             let h264_extent = h264.extent();
             let h264_key = match h264.encode_idr(&make_noisy_frame(h264_extent, 11)) {
                 Ok((bytes, _)) => bytes.len(),
@@ -1350,7 +1354,7 @@ mod tests {
             Some(_) => 4095,
             None => 60,
         };
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(&caps), gop) {
+        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), caps.codec, gop) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("AV1 编码器初始化失败: {e}");

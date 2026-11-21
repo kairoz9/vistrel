@@ -133,25 +133,64 @@ pub const MAX_BPP: f32 = 0.3;
 /// 分辨率缩放指数：0.75 次幂法则 (Power Law for Resolution Scaling)
 const RESOLUTION_POWER: f32 = 0.75;
 
-/// 一档视频档位：显示几何、帧率、画质与码率的不可变快照
+/// 一档视频档位：显示几何、帧率与码率的不可变事实快照
 ///
-/// 字段私有，只能经 [`Self::new`]/[`Self::new_with_bpp`]/`with_*` 构造：分辨率是
-/// 已缩入包络并偶对齐的**显示尺寸**（编码尺寸由 [`Self::coded_extent`] 派生），
-/// 帧率 ≥ 1 且过 level 预算，bpp 钳在 `[MIN_BPP, MAX_BPP]` 并舍入到百分位，
-/// 码率非零且在 u32 范围内（NVENC 侧按裸转换消费）
+/// 字段私有，只能经 [`Self::new`]（事实构造：默认档、性能矩阵与用例）或
+/// [`TierRequest::derive`]（唯一生产构造口）构造：分辨率是已缩入包络并偶对齐的
+/// **显示尺寸**（编码尺寸由 [`Self::coded_extent`] 派生），帧率 ≥ 1，码率非零且在
+/// u32 范围内（NVENC 侧按裸转换消费）。level 预算压帧与码率模型只在
+/// [`TierRequest::derive`] 里生效。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StreamingProfile {
     width: usize,
     height: usize,
     fps: usize,
-    bpp: f32,
     bitrate: usize,
-    codec: VideoCodec,
 }
 
 impl Default for StreamingProfile {
+    /// 初始占位档位：1080p60 下限画质——Actor 软编打底与用例的起点，首个定档请求前生效
     fn default() -> Self {
-        Self::new(1920, 1080, 60, VideoCodec::H264)
+        Self::new(
+            1920,
+            1080,
+            60,
+            calculate_dynamic_bitrate(1920, 1080, 60, MIN_BPP, VideoCodec::H264),
+        )
+    }
+}
+
+/// 定档请求：内容几何与画质偏好的组合，档位派生的唯一输入
+///
+/// 几何与偏好在派生前都是请求值：包络缩入、偶对齐、level 预算压帧与码率模型全部在
+/// [`Self::derive`] 内统一生效。控制面的两个定档命令（`Retier` / `PrepareEncoder`）
+/// 都携带它——命令承载意图，Actor 派生并落账生效事实（档位 + codec + 后端）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TierRequest {
+    pub width: usize,
+    pub height: usize,
+    pub fps: usize,
+    /// 画质偏好（bits per pixel per frame）：只在派生码率时消费，不落进档位
+    pub bpp: f32,
+    pub codec: VideoCodec,
+}
+
+impl TierRequest {
+    /// 派生生效档位：分辨率先过 [`StreamingProfile::sanitize_dimensions`]（缩入包络、
+    /// 偶对齐），bpp 钳到 `[MIN_BPP, MAX_BPP]` 并舍入到百分位（NaN/Inf 兜底为下限），
+    /// 帧率再过 level 预算压一道，码率按最终几何与 bpp 现算——产出即合法档位，无失败路径
+    pub fn derive(self) -> StreamingProfile {
+        let (w, h, f) = StreamingProfile::sanitize_dimensions(self.width, self.height, self.fps);
+        let bpp = clamp_bpp(self.bpp);
+        // 预算按实际 bpp 压帧率；包络内的合法输入必然有解，None 只是防御兜底
+        let f = clamp_framerate_to_level_budget(w, h, f, bpp, self.codec).unwrap_or(1);
+        let bitrate = calculate_dynamic_bitrate(w, h, f, bpp, self.codec);
+        StreamingProfile {
+            width: w,
+            height: h,
+            fps: f,
+            bitrate,
+        }
     }
 }
 
@@ -243,33 +282,15 @@ impl StreamingProfile {
         )
     }
 
-    /// 以默认画质档位构造：bpp 落到下限 [`MIN_BPP`]，其余流程同 [`Self::new_with_bpp`]
-    pub fn new(width: usize, height: usize, fps: usize, codec: VideoCodec) -> Self {
-        Self::new_with_bpp(width, height, fps, None, codec)
-    }
-
-    /// 档位构造的唯一入口：分辨率先过 [`Self::sanitize_dimensions`]（缩入包络、偶对齐），
-    /// bpp 钳到 `[MIN_BPP, MAX_BPP]` 并舍入到百分位（NaN/Inf 兜底为下限），帧率再过
-    /// level 预算压一道，码率按最终几何与 bpp 现算——产出即合法档位快照，无失败路径
-    pub fn new_with_bpp(
-        width: usize,
-        height: usize,
-        fps: usize,
-        bpp: Option<f32>,
-        codec: VideoCodec,
-    ) -> Self {
+    /// 事实构造（默认档、性能矩阵与用例）：几何过 sanitize，码率兜底非零。
+    /// level 预算与码率模型不在这里生效——生产路径一律经 [`TierRequest::derive`]
+    pub fn new(width: usize, height: usize, fps: usize, bitrate: usize) -> Self {
         let (w, h, f) = Self::sanitize_dimensions(width, height, fps);
-        let bpp = bpp.map_or(MIN_BPP, clamp_bpp);
-        // 预算按实际 bpp 压帧率；包络内的合法输入必然有解，None 只是防御兜底
-        let f = clamp_framerate_to_level_budget(w, h, f, bpp, codec).unwrap_or(1);
-        let bitrate = calculate_dynamic_bitrate(w, h, f, bpp, codec);
         Self {
             width: w,
             height: h,
             fps: f,
-            bitrate,
-            codec,
-            bpp,
+            bitrate: bitrate.max(1),
         }
     }
 
@@ -289,14 +310,6 @@ impl StreamingProfile {
         self.bitrate
     }
 
-    pub fn codec(&self) -> VideoCodec {
-        self.codec
-    }
-
-    pub fn bpp(&self) -> f32 {
-        self.bpp
-    }
-
     /// 直写码率（bps）。不变量：非零且落在 u32 范围内——NVENC 侧按裸转换消费
     /// （构造器公式、带宽控制器的 u32 输出天然满足，零值在此兜底为 1）
     pub fn set_bitrate(&mut self, bitrate: usize) {
@@ -304,39 +317,9 @@ impl StreamingProfile {
     }
 
     /// 直写帧率（钳到 `1..=MAX_FPS`），**不重算码率**——运行期码控改帧率的行为：
-    /// 码率由带宽估计器全权所有，帧率变化不把它冲掉（与 [`Self::with_fps`] 的差别）。
     /// level 预算由 ask 路径在源头保证，这里不做二次推演。
     pub fn set_fps(&mut self, fps: usize) {
         self.fps = fps.clamp(1, MAX_FPS);
-    }
-
-    /// 仅替换分辨率（保持帧率与 Codec 不变）；level 预算随新几何重算，可能连带压低帧率
-    pub fn with_dimensions(mut self, width: usize, height: usize) -> Self {
-        let (w, h, f) = Self::sanitize_dimensions(width, height, self.fps);
-        let f = clamp_framerate_to_level_budget(w, h, f, self.bpp, self.codec).unwrap_or(1);
-        self.width = w;
-        self.height = h;
-        self.fps = f;
-        self.bitrate = calculate_dynamic_bitrate(w, h, f, self.bpp, self.codec);
-        self
-    }
-
-    /// 仅替换帧率（保持分辨率与 Codec 不变），重算码率并过 level 预算
-    pub fn with_fps(mut self, fps: usize) -> Self {
-        let (_, _, f) = Self::sanitize_dimensions(self.width, self.height, fps);
-        let f = clamp_framerate_to_level_budget(self.width, self.height, f, self.bpp, self.codec)
-            .unwrap_or(1);
-        self.fps = f;
-        self.bitrate = calculate_dynamic_bitrate(self.width, self.height, f, self.bpp, self.codec);
-        self
-    }
-
-    /// 仅替换编解码器（保持分辨率与帧率不变）
-    pub fn with_codec(mut self, codec: VideoCodec) -> Self {
-        self.codec = codec;
-        self.bitrate =
-            calculate_dynamic_bitrate(self.width, self.height, self.fps, self.bpp, self.codec);
-        self
     }
 }
 
@@ -610,10 +593,15 @@ pub(crate) fn display_nv12_len(profile: &StreamingProfile) -> usize {
 mod tests {
     use super::*;
 
+    /// 几何用例共用的事实构造：码率不在断言范围，占位即可
+    fn fact_profile(w: usize, h: usize, fps: usize) -> StreamingProfile {
+        StreamingProfile::new(w, h, fps, 4_000_000)
+    }
+
     /// display 与 coded 两种口径的差额必须正好是补齐行：差算错就说明还有一处在自推
     #[test]
     fn test_nv12_len_display_and_coded_differ_only_by_padding_rows() {
-        let profile = StreamingProfile::new(MAX_WIDTH, MAX_HEIGHT, 30, VideoCodec::H264);
+        let profile = fact_profile(MAX_WIDTH, MAX_HEIGHT, 30);
         let coded_height = profile.coded_extent((MAX_CODED_ALIGN, MAX_CODED_ALIGN)).1;
         assert!(coded_height > MAX_HEIGHT, "本用例前提：2160 不能被 64 整除");
         assert_eq!(
@@ -662,9 +650,15 @@ mod tests {
         assert_eq!(clamp_bpp(f32::NAN), MIN_BPP);
         assert_eq!(clamp_bpp(0.5), MAX_BPP);
         assert_eq!(clamp_bpp(0.126), 0.13);
-        // 重配请求走同一钐位：越界的 bpp 不会把档位码率推到区间外
-        let p = StreamingProfile::new_with_bpp(1920, 1080, 180, Some(0.5), VideoCodec::H264);
-        assert_eq!(p.bpp(), MAX_BPP);
+        // 定档请求走同一钳位：越界的 bpp 不会把档位码率推到区间外
+        let p = TierRequest {
+            width: 1920,
+            height: 1080,
+            fps: 180,
+            bpp: 0.5,
+            codec: VideoCodec::H264,
+        }
+        .derive();
         assert_eq!(
             p.bitrate(),
             calculate_dynamic_bitrate(1920, 1080, 180, MAX_BPP, VideoCodec::H264)
@@ -674,36 +668,25 @@ mod tests {
     #[test]
     fn test_streaming_profile_sanitization_and_clamps() {
         // 1. 奇数宽高应偶数对齐
-        let p = StreamingProfile::new(1921, 1081, 60, VideoCodec::H264);
+        let p = fact_profile(1921, 1081, 60);
         assert_eq!(p.width(), 1920);
         assert_eq!(p.height(), 1080);
         assert_eq!(p.fps(), 60);
 
-        // 2. 超大尺寸等比缩入 4K 包络；240fps 触 MaxMBPS 预算后取整到 120
-        let huge = StreamingProfile::new(7680, 4320, 300, VideoCodec::H264);
-        assert_eq!(huge.width(), MAX_WIDTH);
-        assert_eq!(huge.height(), MAX_HEIGHT);
-        assert_eq!(huge.fps(), 120);
-
-        // 3. 分辨率没有下限：小窗口按原生尺寸串流，放大发的是假细节
-        let tiny = StreamingProfile::new(100, 100, 5, VideoCodec::H264);
+        // 2. 分辨率没有下限：小窗口按原生尺寸串流，放大发的是假细节
+        let tiny = fact_profile(100, 100, 5);
         assert_eq!(tiny.width(), 100);
         assert_eq!(tiny.height(), 100);
         assert_eq!(tiny.fps(), 5);
 
-        // 4. 800×600 原样保留（spec 钉死的用例）
-        let small = StreamingProfile::new(800, 600, 60, VideoCodec::H264);
+        // 3. 800×600 原样保留（spec 钉死的用例）
+        let small = fact_profile(800, 600, 60);
         assert_eq!((small.width(), small.height(), small.fps()), (800, 600, 60));
 
-        // 5. 超宽内容等比缩入包络，不变形（spec 钉死的用例）
-        let ultrawide = StreamingProfile::new(5120, 1440, 60, VideoCodec::H264);
+        // 4. 超宽内容等比缩入包络，不变形（spec 钉死的用例）
+        let ultrawide = fact_profile(5120, 1440, 60);
         assert_eq!(ultrawide.width(), 3840);
         assert_eq!(ultrawide.height(), 1080);
-
-        // 6. with_dimensions 同样走包络缩放：正方形内容等比缩到 2160×2160
-        let mutated = p.with_dimensions(99_999, 99_999);
-        assert_eq!(mutated.width(), MAX_HEIGHT);
-        assert_eq!(mutated.height(), MAX_HEIGHT);
     }
 
     /// 编码尺寸由显示尺寸派生，粒度决定结果
@@ -725,7 +708,7 @@ mod tests {
             (2560, 1440, (16, 16), 2560, 1440),
             (2560, 1440, (64, 64), 2560, 1472),
         ] {
-            let p = StreamingProfile::new(w, h, 60, VideoCodec::H264);
+            let p = fact_profile(w, h, 60);
             assert_eq!(
                 (p.width(), p.height()),
                 (w, h),
@@ -827,50 +810,68 @@ mod tests {
         assert!(serde_json::from_str::<VideoCodec>("\"mpeg2\"").is_err());
     }
 
-    /// builder 四方法：只动目标维度，其余字段原样保留；除 set_fps 外码率按新几何重算
+    /// set_fps：任意整数原样保留（离散档位退役），且不重算码率——
+    /// 码率归带宽估计器所有，帧率变化不得冲掉
     #[test]
-    fn test_profile_builder_methods_recompute_bitrate() {
-        let base = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
-
-        // set_fps 任意整数原样保留（离散档位退役），且不重算码率：
-        // 码率归带宽估计器所有，帧率变化不得冲掉
+    fn test_set_fps_keeps_bitrate() {
+        let base = StreamingProfile::new(1920, 1080, 60, 12_400_000);
         let mut fps_only = base;
         fps_only.set_fps(73);
         assert_eq!(fps_only.fps(), 73, "任意整数帧率不再吸档");
         assert_eq!(fps_only.bitrate(), base.bitrate(), "set_fps 不重算码率");
         fps_only.set_fps(500);
         assert_eq!(fps_only.fps(), MAX_FPS, "帧率上限 240");
+    }
 
-        // with_dimensions：包络缩放在前、偶数对齐在中、后端输入对齐（宽 %4）在后 + 重算码率
-        let dim = base.with_dimensions(3000, 999);
-        assert_eq!(dim.width(), 3000, "包络内保留原值");
-        assert_eq!(dim.height(), 998, "偶数对齐截 1（NVENC 只要求高度为偶数）");
-        let odd = base.with_dimensions(1367, 1081);
-        assert_eq!(
-            (odd.width(), odd.height()),
-            (1368, 1080),
-            "4:2:0 要求偶数，NVENC pitch 要求宽度为 4 的倍数"
-        );
-        assert_eq!(
-            dim.bitrate(),
-            StreamingProfile::new(3000, 998, 60, VideoCodec::H264).bitrate(),
-            "码率按新几何重算"
-        );
-
-        // with_fps：重算码率
-        let fps = base.with_fps(500);
-        assert_eq!(fps.fps(), 240, "帧率上限 240");
-        assert_eq!(
-            fps.bitrate(),
-            StreamingProfile::new(1920, 1080, 240, VideoCodec::H264).bitrate()
-        );
-
-        // with_codec：H265 系数更低，同几何码率必须下降
-        let hevc = base.with_codec(VideoCodec::H265);
-        assert_eq!(hevc.codec(), VideoCodec::H265);
+    /// 派生口：码率模型按 codec 系数区分；包络缩入、预算压帧与 bpp 钳制在派生内统一生效
+    #[test]
+    fn test_tier_request_derivation() {
+        // 同几何不同 codec：H265 系数更低，码率必须下降
+        let h264 = TierRequest {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bpp: 0.2,
+            codec: VideoCodec::H264,
+        }
+        .derive();
+        let h265 = TierRequest {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bpp: 0.2,
+            codec: VideoCodec::H265,
+        }
+        .derive();
         assert!(
-            hevc.bitrate() < base.bitrate(),
+            h265.bitrate() < h264.bitrate(),
             "换 H265 后码率必须重算下降"
+        );
+
+        // 超大内容等比缩入 4K 包络；240fps 触 MaxMBPS 预算后取整到 120
+        let huge = TierRequest {
+            width: 7680,
+            height: 4320,
+            fps: 300,
+            bpp: MIN_BPP,
+            codec: VideoCodec::H264,
+        }
+        .derive();
+        assert_eq!((huge.width(), huge.height()), (MAX_WIDTH, MAX_HEIGHT));
+        assert_eq!(huge.fps(), 120, "4K 预算压到 120");
+
+        // bpp 越界钳到上限，码率按钳后值现算
+        let clamped = TierRequest {
+            width: 1920,
+            height: 1080,
+            fps: 180,
+            bpp: 0.5,
+            codec: VideoCodec::H264,
+        }
+        .derive();
+        assert_eq!(
+            clamped.bitrate(),
+            calculate_dynamic_bitrate(1920, 1080, 180, MAX_BPP, VideoCodec::H264)
         );
     }
 
@@ -878,19 +879,27 @@ mod tests {
     #[test]
     fn test_level_budget_lowers_framerate_at_envelope() {
         // 4K120 恰好装进 Level 6.0：MaxMBPS 3,888,000 ≤ 4,177,920
-        let p120 = StreamingProfile::new_with_bpp(3840, 2160, 120, Some(MAX_BPP), VideoCodec::H264);
+        let p120 = TierRequest {
+            width: 3840,
+            height: 2160,
+            fps: 120,
+            bpp: MAX_BPP,
+            codec: VideoCodec::H264,
+        }
+        .derive();
         assert_eq!(p120.fps(), 120);
         assert_eq!((p120.width(), p120.height()), (3840, 2160));
 
         // 4K144 / 4K240 无 level 可覆盖：压到 120（MaxMBPS 上限 128.9，触顶取整到 10）
         for requested in [144, 240] {
-            let p = StreamingProfile::new_with_bpp(
-                3840,
-                2160,
-                requested,
-                Some(MAX_BPP),
-                VideoCodec::H264,
-            );
+            let p = TierRequest {
+                width: 3840,
+                height: 2160,
+                fps: requested,
+                bpp: MAX_BPP,
+                codec: VideoCodec::H264,
+            }
+            .derive();
             assert_eq!(p.fps(), 120, "4K{requested} 必须压到 120");
             assert_eq!(
                 (p.width(), p.height()),

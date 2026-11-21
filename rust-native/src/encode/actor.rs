@@ -15,7 +15,8 @@ use crate::encode::hardware::VramSlotDescriptor;
 use crate::encode::hardware::slots::{ActorStage, SlotStateBlock};
 use crate::encode::pool::{FramePool, HostBlock};
 use crate::encode::{
-    FramePayload, StampedVideoPacket, StreamingProfile, VideoCodec, VideoPacket, display_nv12_len,
+    FramePayload, StampedVideoPacket, StreamingProfile, TierRequest, VideoCodec, VideoPacket,
+    display_nv12_len,
 };
 
 use super::encoder::{EncodeBackendKind, VideoEncoder};
@@ -23,6 +24,7 @@ use super::encoder::{EncodeBackendKind, VideoEncoder};
 /// 后端构建入口：生产固定为真实驱动工厂，测试注入假后端；`kind` 为本次要建的身份
 type HardwareBuilder = dyn Fn(
         StreamingProfile,
+        VideoCodec,
         EncodeBackendKind,
         &'static SlotStateBlock,
     ) -> Result<(VideoEncoder, Vec<HostBlock>), String>
@@ -47,7 +49,12 @@ pub struct EncoderActor {
     output: Arc<FrameOutbox>,
     /// Followed Bitrate (bps)，由 RateControl 在值变化时经 BitrateChange 派发。
     bitrate: usize,
+    /// 生效档位：几何与码率上限的事实快照（本结构是档位的唯一事实源头）
     profile: StreamingProfile,
+    /// 生效 codec：与档位并列的回执事实，软编顶格钳制、围栏开窗判据与重建共用
+    codec: VideoCodec,
+    /// 档位派生用的画质偏好：软编顶格重派生码率时消费（重建与回退路径）
+    bpp: f32,
     /// 主机帧池：只持一个弱引用，用来把后端新分配的块装进池。
     pool: Weak<FramePool>,
     /// 槽位所有权共享块：与本 Actor 同代（`VideoPipeline::spawn` 泄漏分配）
@@ -75,8 +82,8 @@ impl EncoderActor {
             output,
             pool,
             slot_state,
-            Arc::new(|profile, kind, slot_state| {
-                VideoEncoder::new_backend(profile, kind, Some(slot_state))
+            Arc::new(|profile, codec, kind, slot_state| {
+                VideoEncoder::new_backend(profile, codec, kind, Some(slot_state))
             }),
         )
     }
@@ -89,9 +96,11 @@ impl EncoderActor {
         slot_state: &'static SlotStateBlock,
         hardware_builder: Arc<HardwareBuilder>,
     ) -> Self {
+        // 占位档位与它的派生输入保持一致（Default = 下限画质 H264），
+        // 首个定档命令落地前它是软编打底的生效事实
         let profile = StreamingProfile::default();
         // 软编随时就绪，作为系统默认底座（同时由它带上第一批堆块）
-        let (encoder, blocks) = match VideoEncoder::new_software(profile) {
+        let (encoder, blocks) = match VideoEncoder::new_software(profile, VideoCodec::H264) {
             Ok((encoder, blocks)) => (Some(encoder), blocks),
             Err(_) => (None, Vec::new()),
         };
@@ -102,6 +111,8 @@ impl EncoderActor {
             output,
             bitrate: 0,
             profile,
+            codec: VideoCodec::H264,
+            bpp: crate::encode::MIN_BPP,
             pool,
             slot_state,
             hardware_builder,
@@ -176,7 +187,7 @@ impl EncoderActor {
 
     /// 处理一条已收到的命令；返回 `false` 表示 Actor 应当退出
     ///
-    /// 会重建编码器的命令（`PrepareEncoder` / `ProfileChange` / `ImportVramSlots` /
+    /// 会重建编码器的命令（`PrepareEncoder` / `Retier` / `ImportVramSlots` /
     /// `ClearVramSlots`）会让旧编码器上的一切（显存槽位注册、会话状态）失效。
     fn apply(&mut self, cmd: ControlCommand) -> bool {
         match cmd {
@@ -192,22 +203,22 @@ impl EncoderActor {
             ControlCommand::RequestKeyframe => {
                 self.pending_keyframe = true;
             }
-            ControlCommand::ProfileChange { profile, reply } => {
-                let (before, had_table) = self.begin_profile_command();
+            ControlCommand::Retier { request, reply } => {
+                let (before_profile, before_codec, had_table) = self.begin_profile_command();
                 let outcome = self
-                    .change_profile(profile)
-                    .map(|profile| (profile, self.current_backend()));
-                self.end_profile_command(before, had_table);
+                    .retier(request)
+                    .map(|(profile, codec)| (profile, codec, self.current_backend()));
+                self.end_profile_command(before_profile, before_codec, had_table);
                 let _ = reply.send(outcome);
             }
             ControlCommand::PrepareEncoder {
-                profile,
+                request,
                 preferred_backend,
                 reply,
             } => {
-                let (before, had_table) = self.begin_profile_command();
-                let outcome = self.prepare_encoder(profile, preferred_backend);
-                self.end_profile_command(before, had_table);
+                let (before_profile, before_codec, had_table) = self.begin_profile_command();
+                let outcome = self.prepare_encoder(request, preferred_backend);
+                self.end_profile_command(before_profile, before_codec, had_table);
                 let _ = reply.send(outcome);
             }
             ControlCommand::ImportVramSlots { slots, reply } => {
@@ -234,14 +245,15 @@ impl EncoderActor {
         true
     }
 
-    /// 换档类命令（`ProfileChange` / `PrepareEncoder`）的统一前置：
-    /// 置阶段码、清收件箱，返回命令前快照 `(档位, 此前是否硬编在位)`——
+    /// 换档类命令（`Retier` / `PrepareEncoder`）的统一前置：
+    /// 置阶段码、清收件箱，返回命令前快照 `(档位, codec, 此前是否硬编在位)`——
     /// 只有硬编可能持有槽位注册，软编在位时无从谈起拒收
-    fn begin_profile_command(&mut self) -> (StreamingProfile, bool) {
+    fn begin_profile_command(&mut self) -> (StreamingProfile, VideoCodec, bool) {
         self.slot_state.set_stage(ActorStage::Reconfigure);
         self.discard_frames_before_rebuild();
         (
             self.profile,
+            self.codec,
             self.encoder.as_ref().is_some_and(|e| e.is_hardware()),
         )
     }
@@ -249,12 +261,17 @@ impl EncoderActor {
     /// 换档类命令的统一收尾：几何或 codec 实际变化且此前硬编在位时，开始拒收
     /// 显存帧。只开不关——一旦拒收，恢复只认导入命令，中途的 fps-only 重配
     /// 不得提前放行旧代帧；本体重配失败不开（档位没变就没有漂移）
-    fn end_profile_command(&mut self, before: StreamingProfile, hardware_table: bool) {
+    fn end_profile_command(
+        &mut self,
+        before: StreamingProfile,
+        before_codec: VideoCodec,
+        hardware_table: bool,
+    ) {
         let after = &self.profile;
         if hardware_table
             && (before.width() != after.width()
                 || before.height() != after.height()
-                || before.codec() != after.codec())
+                || before_codec != self.codec)
         {
             self.rejecting_frames = true;
             log::debug!("档位已变，等待槽位重导入：期间显存帧在入口拒收");
@@ -301,7 +318,8 @@ impl EncoderActor {
             if let Some(dead) = self.encoder.take() {
                 std::mem::forget(dead);
             }
-            self.install_software(Self::software_ceiling_profile(self.profile));
+            let eff = Self::software_ceiling_request(self.state_request());
+            self.install_software(eff.derive(), eff.codec);
             log::error!("槽位注销前排空失败，后端弃置回退软编，保留导入引用: {e}");
             return ControlStatus::ReleaseFailed;
         }
@@ -329,7 +347,8 @@ impl EncoderActor {
             if let Some(dead) = self.encoder.take() {
                 std::mem::forget(dead);
             }
-            self.install_software(Self::software_ceiling_profile(self.profile));
+            let eff = Self::software_ceiling_request(self.state_request());
+            self.install_software(eff.derive(), eff.codec);
             log::error!("槽位导入前排空失败，后端弃置回退软编，整批拒绝: {e}");
             return ControlStatus::ImportFailed;
         }
@@ -360,20 +379,21 @@ impl EncoderActor {
         }
     }
 
-    /// 按给定档位配好编码器：档位与后端同进同退，目标后端未变时不重建。
-    /// `Ok` 携带实际生效的档位与后端身份（建败回退软编时如实上报）
+    /// 按定档请求配好编码器：档位派生在此发生，目标后端未变时只重配不重建。
+    /// `Ok` 携带实际生效的档位、codec 与后端身份（建败回退软编时如实上报）
     fn prepare_encoder(
         &mut self,
-        profile: StreamingProfile,
+        request: TierRequest,
         preferred_backend: Option<EncodeBackendKind>,
-    ) -> Result<(StreamingProfile, EncodeBackendKind), ControlStatus> {
+    ) -> Result<(StreamingProfile, VideoCodec, EncodeBackendKind), ControlStatus> {
         let target = preferred_backend.unwrap_or_else(Self::auto_backend);
-        // 目标即软编时档位先顶格（含 codec 钳 H264）：重配与重建两条路吃同一份钳制
-        let profile = if target == EncodeBackendKind::Software {
-            Self::software_ceiling_profile(profile)
+        // 目标即软编时请求先顶格（几何钳 + codec 钳 H264）：重配与重建两条路吃同一份钳制
+        let request = if target == EncodeBackendKind::Software {
+            Self::software_ceiling_request(request)
         } else {
-            profile
+            request
         };
+        let profile = request.derive();
         let same_backend = self
             .encoder
             .as_ref()
@@ -382,7 +402,7 @@ impl EncoderActor {
         let mut reconfigured = false;
         let mut fresh_blocks = Vec::new();
         if same_backend && let Some(encoder) = self.encoder.as_mut() {
-            match encoder.reconfigure(profile) {
+            match encoder.reconfigure(profile, request.codec) {
                 Ok(blocks) => {
                     reconfigured = true;
                     fresh_blocks = blocks;
@@ -397,9 +417,11 @@ impl EncoderActor {
 
         let code = if reconfigured {
             self.profile = profile;
+            self.codec = request.codec;
+            self.bpp = request.bpp;
             ControlStatus::Ok
         } else {
-            self.rebuild_encoder(profile, target)
+            self.rebuild_encoder(request, target)
         };
         if code != ControlStatus::Ok {
             return Err(code);
@@ -408,12 +430,12 @@ impl EncoderActor {
         // 码率复位到**生效档位**的上限
         self.bitrate = self.profile.bitrate();
         Self::apply_bitrate(&mut self.encoder, self.bitrate);
-        // Ok 即编码器已就绪，档位与身份如实读取；None 意味着「Ok 却无编码器」的不变量
-        // 已破坏，按拒绝收口而不是编造一个后端
+        // Ok 即编码器已就绪，档位、codec 与后端身份如实读取；None 意味着
+        // 「Ok 却无编码器」的不变量已破坏，按拒绝收口而不是编造一个后端
         let backend = self
             .current_backend()
             .ok_or(ControlStatus::ReconfigureFailed)?;
-        Ok((self.profile, backend))
+        Ok((self.profile, self.codec, backend))
     }
 
     /// 无显式偏好时的后端目标：能力快照的默认胜者；快照缺席（未探测/无硬件）即软编
@@ -430,10 +452,10 @@ impl EncoderActor {
 
     /// 重建编码器，销毁旧编码器的一切：CUcontext、已导入的显存槽位、当前 GOP
     ///
-    /// `target` 已解析：硬编建败静默回退软编（回执如实携带）；软编目标按顶格档位直建
+    /// `target` 已解析：硬编建败静默回退软编（回执如实携带）；软编目标按顶格请求直建
     fn rebuild_encoder(
         &mut self,
-        profile: StreamingProfile,
+        request: TierRequest,
         target: EncodeBackendKind,
     ) -> ControlStatus {
         let had_hardware = self.encoder.as_ref().is_some_and(|e| e.is_hardware());
@@ -441,28 +463,36 @@ impl EncoderActor {
             log::warn!("重建硬件编码器：已导入的显存槽位随旧编码器失效，需重新注册");
         }
 
-        let effective;
+        // 生效事实 = 成功分支的派生档位与 codec；建败回退软编时按顶格请求重派生
+        let (effective_profile, effective_codec);
         if target != EncodeBackendKind::Software {
             // 必须先释放旧编码器
             self.encoder = None;
             // 后端连带交回它自己设备上的帧块：后端建不起来（含帧块分配失败）就整体回退软编，
             // 不存在「编码器起来了、帧块却没就绪」的中间态
-            match (self.hardware_builder.as_ref())(profile, target, self.slot_state) {
+            let profile = request.derive();
+            match (self.hardware_builder.as_ref())(profile, request.codec, target, self.slot_state)
+            {
                 Ok((hw, blocks)) => {
                     log::debug!("硬件编码器就绪!");
                     self.attach(blocks);
                     self.encoder = Some(hw);
-                    effective = profile;
+                    effective_profile = profile;
+                    effective_codec = request.codec;
                 }
                 Err(e) => {
                     log::error!("硬件编码器初始化失败，回退软编码: {}", e);
-                    effective = Self::software_ceiling_profile(profile);
-                    self.install_software(effective);
+                    let eff = Self::software_ceiling_request(request);
+                    effective_profile = eff.derive();
+                    effective_codec = eff.codec;
+                    self.install_software(effective_profile, effective_codec);
                 }
             }
         } else {
-            effective = Self::software_ceiling_profile(profile);
-            self.install_software(effective);
+            let eff = Self::software_ceiling_request(request);
+            effective_profile = eff.derive();
+            effective_codec = eff.codec;
+            self.install_software(effective_profile, effective_codec);
         }
 
         if self.encoder.is_none() {
@@ -470,35 +500,52 @@ impl EncoderActor {
             return ControlStatus::ReconfigureFailed;
         }
 
-        self.profile = effective;
+        self.profile = effective_profile;
+        self.codec = effective_codec;
+        self.bpp = request.bpp;
         ControlStatus::Ok
     }
 
-    /// 软编档位顶格：`min(Content Resolution, 1080p) @ 60`，只缩不放、保留 bpp；
-    /// codec 同步钳到 H264——软编只出 H264 码流，回执档位必须与之一致
-    fn software_ceiling_profile(profile: StreamingProfile) -> StreamingProfile {
-        let (w, h, f) = crate::encode::clamp_to_software_ceiling(
-            profile.width(),
-            profile.height(),
-            profile.fps(),
-        );
-        if (w, h, f) != (profile.width(), profile.height(), profile.fps())
-            || profile.codec() != VideoCodec::H264
+    /// 软编请求顶格：`min(Content Resolution, 1080p) @ 60`，只缩不放、保留 bpp；
+    /// codec 同步钳到 H264——软编只出 H264 码流，回执必须与之一致。
+    /// 钳制发生在派生之前：derive 的预算与码率模型消费的是顶格后的请求
+    fn software_ceiling_request(request: TierRequest) -> TierRequest {
+        let (w, h, f) =
+            crate::encode::clamp_to_software_ceiling(request.width, request.height, request.fps);
+        if (w, h, f) != (request.width, request.height, request.fps)
+            || request.codec != VideoCodec::H264
         {
             log::warn!(
                 "软编顶格：请求 {}x{}@{} ({:?}) 钳制为 {w}x{h}@{f} (H264)",
-                profile.width(),
-                profile.height(),
-                profile.fps(),
-                profile.codec()
+                request.width,
+                request.height,
+                request.fps,
+                request.codec
             );
         }
-        StreamingProfile::new_with_bpp(w, h, f, Some(profile.bpp()), VideoCodec::H264)
+        TierRequest {
+            width: w,
+            height: h,
+            fps: f,
+            bpp: request.bpp,
+            codec: VideoCodec::H264,
+        }
+    }
+
+    /// 以当前生效事实重建定档请求：重建与回退路径从这里出发
+    fn state_request(&self) -> TierRequest {
+        TierRequest {
+            width: self.profile.width(),
+            height: self.profile.height(),
+            fps: self.profile.fps(),
+            bpp: self.bpp,
+            codec: self.codec,
+        }
     }
 
     /// 建软编并把它的堆块装进池
-    fn install_software(&mut self, profile: StreamingProfile) {
-        match VideoEncoder::new_software(profile) {
+    fn install_software(&mut self, profile: StreamingProfile, codec: VideoCodec) {
+        match VideoEncoder::new_software(profile, codec) {
             Ok((encoder, blocks)) => {
                 self.attach(blocks);
                 self.encoder = Some(encoder);
@@ -516,11 +563,11 @@ impl EncoderActor {
             return true;
         }
 
-        let profile = self.profile;
+        let request = self.state_request();
         // 不看返回码：`rebuild_encoder` 只在「一个编码器都建不起来」时失败，
         // 而硬编创建失败会静默回退软编并返回 Ok。这里要问的是「是不是硬编」。
         self.slot_state.set_stage(ActorStage::Reconfigure);
-        self.rebuild_encoder(profile, Self::auto_backend());
+        self.rebuild_encoder(request, Self::auto_backend());
         if !self.encoder.as_ref().is_some_and(|e| e.is_hardware()) {
             return false;
         }
@@ -533,49 +580,54 @@ impl EncoderActor {
         true
     }
 
-    /// 应用档位，返回**实际生效**的档位或拒绝原因
-    fn change_profile(
+    /// 应用定档请求，返回**实际生效**的档位与 codec 或拒绝原因
+    fn retier(
         &mut self,
-        profile: StreamingProfile,
-    ) -> Result<StreamingProfile, ControlStatus> {
-        // 软编在跑：档位顶格 min(Content, 1080p)@60，生效档位如实反映钳制结果
-        let profile = if self.encoder.as_ref().is_some_and(|e| !e.is_hardware()) {
-            Self::software_ceiling_profile(profile)
+        request: TierRequest,
+    ) -> Result<(StreamingProfile, VideoCodec), ControlStatus> {
+        // 软编在跑：请求先顶格 min(Content, 1080p)@60 + codec 钳 H264，生效值如实反映钳制
+        let request = if self.encoder.as_ref().is_some_and(|e| !e.is_hardware()) {
+            Self::software_ceiling_request(request)
         } else {
-            profile
+            request
         };
+        let profile = request.derive();
 
         if self.profile.width() == profile.width()
             && self.profile.height() == profile.height()
             && self.profile.fps() == profile.fps()
-            && self.profile.codec() == profile.codec()
+            && self.codec == request.codec
         {
-            // 形状未变：编码器不必重建，直接采纳。bpp 这类软参数由调用方从当前档位带过来，
-            // 实际不会变；采纳而不是忽略，是为了不留下「会话用新值、Actor 用旧值」的分叉。
+            // 形状未变：编码器不必重建，直接采纳（bpp 只改码率上限，由码率回路兑现）。
+            // 采纳而不是忽略，是为了不留下「会话用新值、Actor 用旧值」的分叉
             self.profile = profile;
-            return Ok(profile);
+            self.codec = request.codec;
+            self.bpp = request.bpp;
+            return Ok((profile, request.codec));
         }
 
         // 编码器尚未就绪：直接采纳，后续按新档位构建
         let reconfig = match &mut self.encoder {
-            Some(encoder) => encoder.reconfigure(profile),
+            Some(encoder) => encoder.reconfigure(profile, request.codec),
             None => Ok(Vec::new()),
         };
         let fresh_blocks = match reconfig {
             Ok(blocks) => blocks,
             Err(e) => {
-                log::error!("Profile 变更失败，维持原档位 {:?}: {}", self.profile, e);
+                log::error!("档位变更失败，维持原档位 {:?}: {}", self.profile, e);
                 return Err(ControlStatus::ReconfigureFailed);
             }
         };
         self.attach(fresh_blocks);
 
         self.profile = profile;
+        self.codec = request.codec;
+        self.bpp = request.bpp;
         if self.bitrate > 0 {
             let target = self.bitrate.min(profile.bitrate());
             Self::apply_bitrate(&mut self.encoder, target);
         }
-        Ok(self.profile)
+        Ok((self.profile, self.codec))
     }
 
     /// 编码一帧并把产物放进发件箱。
@@ -721,6 +773,7 @@ mod tests {
         fn reconfigure(
             &mut self,
             _new_profile: StreamingProfile,
+            _new_codec: VideoCodec,
         ) -> Result<Vec<HostBlock>, String> {
             Ok(Vec::new())
         }
@@ -745,11 +798,22 @@ mod tests {
 
     const FAKE_DEVICE_DOMAIN: usize = 0xDEAD_BEEF;
 
+    /// 用例定档请求：bpp 落下限，与旧构造路径（MIN_BPP 档）的派生值完全一致
+    fn tier(w: usize, h: usize, fps: usize, codec: VideoCodec) -> TierRequest {
+        TierRequest {
+            width: w,
+            height: h,
+            fps,
+            bpp: crate::encode::MIN_BPP,
+            codec,
+        }
+    }
+
     /// 假硬编工厂：按给定后端身份交出编码器与新域块，形状与生产入口一致
     fn fake_hardware_builder() -> Arc<HardwareBuilder> {
-        Arc::new(move |profile, kind, _slot_state| {
+        Arc::new(move |profile, codec, kind, _slot_state| {
             Ok((
-                VideoEncoder::from_backend(profile, Box::new(FakeBackend { kind })),
+                VideoEncoder::from_backend(profile, codec, Box::new(FakeBackend { kind })),
                 fake_device_blocks(FAKE_DEVICE_DOMAIN),
             ))
         })
@@ -763,8 +827,8 @@ mod tests {
         test_actor_with_builder(
             inbox,
             output,
-            Arc::new(|profile, kind, slot_state| {
-                VideoEncoder::new_backend(profile, kind, Some(slot_state))
+            Arc::new(|profile, codec, kind, slot_state| {
+                VideoEncoder::new_backend(profile, codec, kind, Some(slot_state))
             }),
         )
     }
@@ -799,11 +863,11 @@ mod tests {
         let output = test_outbox();
         let (mut actor, pool) =
             test_actor_with_builder(inbox, Arc::clone(&output), fake_hardware_builder());
-        let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        let request = tier(1280, 720, 60, VideoCodec::H264);
 
         // 1. 请求硬编：ACK 时池必须已换成假设备块
         assert_eq!(
-            prepare(&mut actor, profile, Some(EncodeBackendKind::Nvenc)),
+            prepare(&mut actor, request, Some(EncodeBackendKind::Nvenc)),
             ControlStatus::Ok
         );
         assert_eq!(pool.len(), POOL_DEPTH, "装批必须在 ACK 之前完成");
@@ -818,7 +882,7 @@ mod tests {
 
         // 2. 退回软编：旧域块在换批时释放，ACK 时池已是堆块
         assert_eq!(
-            prepare(&mut actor, profile, Some(EncodeBackendKind::Software)),
+            prepare(&mut actor, request, Some(EncodeBackendKind::Software)),
             ControlStatus::Ok
         );
         let frame = pool.acquire().expect("软编必须给块");
@@ -832,7 +896,7 @@ mod tests {
         assert_eq!(pool.stale_len(), 0, "换域时旧设备块必须已释放");
     }
 
-    /// Ok 必须携带实际生效的档位与后端身份：偏好硬编但构建失败静默回退软编时，
+    /// Ok 必须携带实际生效的档位、codec 与后端身份：偏好硬编但构建失败静默回退软编时，
     /// 回执身份是软编而非偏好值——调用方无需再问「是不是硬编」
     #[test]
     fn test_prepare_reports_fallback_backend_identity() {
@@ -844,21 +908,29 @@ mod tests {
         let (mut actor, _pool) = test_actor_with_builder(
             inbox,
             Arc::clone(&output),
-            Arc::new(|_profile, _kind, _slot_state| Err("硬编构建失败".to_string())),
+            Arc::new(|_profile, _codec, _kind, _slot_state| Err("硬编构建失败".to_string())),
         );
-        let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        let request = tier(1280, 720, 60, VideoCodec::H264);
 
         assert_eq!(
-            prepare_kind(&mut actor, profile, Some(EncodeBackendKind::Nvenc)),
-            Ok((profile, EncodeBackendKind::Software)),
+            prepare_kind(&mut actor, request, Some(EncodeBackendKind::Nvenc)),
+            Ok((
+                request.derive(),
+                VideoCodec::H264,
+                EncodeBackendKind::Software
+            )),
             "偏好硬编失败回退软编后，Ok 的身份必须是软编"
         );
 
         // 软编在跑时的换档回执同样如实携带软编身份
-        let outcome = switch_profile_with_backend(&mut actor, profile);
+        let outcome = switch_profile_with_backend(&mut actor, request);
         assert_eq!(
             outcome,
-            Ok((profile, Some(EncodeBackendKind::Software))),
+            Ok((
+                request.derive(),
+                VideoCodec::H264,
+                Some(EncodeBackendKind::Software)
+            )),
             "换档回执的身份必须与在跑后端一致"
         );
     }
@@ -875,16 +947,16 @@ mod tests {
         let (mut actor, _pool) = test_actor_with_builder(
             inbox,
             Arc::clone(&output),
-            Arc::new(|_profile, _kind, _slot_state| Err("硬编构建失败".to_string())),
+            Arc::new(|_profile, _codec, _kind, _slot_state| Err("硬编构建失败".to_string())),
         );
-        let profile = StreamingProfile::new(2560, 1440, 120, VideoCodec::H265);
+        let request = tier(2560, 1440, 120, VideoCodec::H265);
 
-        let (effective, backend) =
-            prepare_kind(&mut actor, profile, Some(EncodeBackendKind::Nvenc))
+        let (effective, codec, backend) =
+            prepare_kind(&mut actor, request, Some(EncodeBackendKind::Nvenc))
                 .expect("回退软编仍须成功");
         assert_eq!(backend, EncodeBackendKind::Software);
         assert_eq!(
-            effective.codec(),
+            codec,
             VideoCodec::H264,
             "软编只出 H264 码流，回执 codec 必须钳制"
         );
@@ -895,13 +967,13 @@ mod tests {
         );
     }
 
-    /// 直接走 Actor 的控制出口换档并取回生效档位与后端身份
+    /// 直接走 Actor 的控制出口换档并取回生效档位、codec 与后端身份
     fn switch_profile_with_backend(
         actor: &mut EncoderActor,
-        profile: StreamingProfile,
-    ) -> Result<(StreamingProfile, Option<EncodeBackendKind>), ControlStatus> {
+        request: TierRequest,
+    ) -> Result<(StreamingProfile, VideoCodec, Option<EncodeBackendKind>), ControlStatus> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        assert!(actor.apply(ControlCommand::ProfileChange { profile, reply }));
+        assert!(actor.apply(ControlCommand::Retier { request, reply }));
         wait_reply(rx)
     }
 
@@ -916,9 +988,9 @@ mod tests {
         let output = test_outbox();
         let (mut actor, _pool) =
             test_actor_with_builder(inbox, Arc::clone(&output), fake_hardware_builder());
-        let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        let request = tier(1280, 720, 60, VideoCodec::H264);
         assert_eq!(
-            prepare(&mut actor, profile, Some(EncodeBackendKind::Nvenc)),
+            prepare(&mut actor, request, Some(EncodeBackendKind::Nvenc)),
             ControlStatus::Ok
         );
 
@@ -956,9 +1028,9 @@ mod tests {
         let (mut state, pool) = test_actor(inbox, Arc::clone(&output));
 
         let (w, h) = (1280usize, 720usize);
-        let profile = StreamingProfile::new(w, h, 60, VideoCodec::H264);
+        let profile = StreamingProfile::new(w, h, 60, 4_000_000);
         state.profile = profile;
-        if let Ok((encoder, blocks)) = VideoEncoder::new_software(profile) {
+        if let Ok((encoder, blocks)) = VideoEncoder::new_software(profile, VideoCodec::H264) {
             pool.attach(blocks);
             state.encoder = Some(encoder);
         }
@@ -986,9 +1058,9 @@ mod tests {
         let output = test_outbox();
         let (mut state, pool) = test_actor(inbox, Arc::clone(&output));
 
-        let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        let profile = StreamingProfile::new(1280, 720, 60, 4_000_000);
         state.profile = profile;
-        if let Ok((encoder, blocks)) = VideoEncoder::new_software(profile) {
+        if let Ok((encoder, blocks)) = VideoEncoder::new_software(profile, VideoCodec::H264) {
             pool.attach(blocks);
             state.encoder = Some(encoder);
         }
@@ -1028,9 +1100,9 @@ mod tests {
         let output = test_outbox();
         let (mut state, pool) = test_actor(inbox, Arc::clone(&output));
 
-        let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        let profile = StreamingProfile::new(1280, 720, 60, 4_000_000);
         state.profile = profile;
-        if let Ok((encoder, blocks)) = VideoEncoder::new_software(profile) {
+        if let Ok((encoder, blocks)) = VideoEncoder::new_software(profile, VideoCodec::H264) {
             pool.attach(blocks);
             state.encoder = Some(encoder);
         }
@@ -1053,9 +1125,9 @@ mod tests {
         let output = test_outbox();
         let (mut state, pool) = test_actor(inbox, Arc::clone(&output));
 
-        let p1_profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        let p1_profile = StreamingProfile::new(1280, 720, 60, 4_000_000);
         state.profile = p1_profile;
-        if let Ok((encoder, blocks)) = VideoEncoder::new_software(p1_profile) {
+        if let Ok((encoder, blocks)) = VideoEncoder::new_software(p1_profile, VideoCodec::H264) {
             pool.attach(blocks);
             state.encoder = Some(encoder);
         }
@@ -1065,11 +1137,16 @@ mod tests {
         drop(p1);
         assert!(output.take().is_some());
 
-        let new_profile = StreamingProfile::new(1600, 900, 60, VideoCodec::H264);
+        let new_profile = StreamingProfile::new(1600, 900, 60, 5_000_000);
         state.profile = new_profile;
         if let Some(encoder) = &mut state.encoder {
             // 软编不碰设备，重配不该交回新批
-            assert!(encoder.reconfigure(new_profile).unwrap().is_empty());
+            assert!(
+                encoder
+                    .reconfigure(new_profile, VideoCodec::H264)
+                    .unwrap()
+                    .is_empty()
+            );
         }
 
         let frame_bytes = display_nv12_len(&new_profile);
@@ -1105,24 +1182,24 @@ mod tests {
     /// 直接走 Actor 的控制出口配好编码器并取回结果码
     fn prepare(
         actor: &mut EncoderActor,
-        profile: StreamingProfile,
+        request: TierRequest,
         preferred_backend: Option<EncodeBackendKind>,
     ) -> ControlStatus {
-        match prepare_kind(actor, profile, preferred_backend) {
+        match prepare_kind(actor, request, preferred_backend) {
             Ok(_) => ControlStatus::Ok,
             Err(code) => code,
         }
     }
 
-    /// 直接走 Actor 的控制出口配好编码器并取回生效档位与实际后端身份
+    /// 直接走 Actor 的控制出口配好编码器并取回生效档位、codec 与实际后端身份
     fn prepare_kind(
         actor: &mut EncoderActor,
-        profile: StreamingProfile,
+        request: TierRequest,
         preferred_backend: Option<EncodeBackendKind>,
-    ) -> Result<(StreamingProfile, EncodeBackendKind), ControlStatus> {
+    ) -> Result<(StreamingProfile, VideoCodec, EncodeBackendKind), ControlStatus> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         assert!(actor.apply(ControlCommand::PrepareEncoder {
-            profile,
+            request,
             preferred_backend,
             reply,
         }));
@@ -1132,11 +1209,11 @@ mod tests {
     /// 直接走 Actor 的控制出口换档并取回生效档位或拒绝原因
     fn switch_profile(
         actor: &mut EncoderActor,
-        profile: StreamingProfile,
+        request: TierRequest,
     ) -> Result<StreamingProfile, ControlStatus> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        assert!(actor.apply(ControlCommand::ProfileChange { profile, reply }));
-        wait_reply(rx).map(|(profile, _)| profile)
+        assert!(actor.apply(ControlCommand::Retier { request, reply }));
+        wait_reply(rx).map(|(profile, _codec, _backend)| profile)
     }
 
     /// 直接走 Actor 的控制出口下发跟随码率
@@ -1172,20 +1249,21 @@ mod tests {
             .unwrap();
 
         // 0. 调整 Profile 为 720p (1280x720)
-        let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        let request = tier(1280, 720, 60, VideoCodec::H264);
+        let profile = request.derive();
         let frame_bytes = display_nv12_len(&profile);
         let (ack0_tx, ack0_rx) = tokio::sync::oneshot::channel();
         assert!(
             ctl_tx
-                .blocking_send(ControlCommand::ProfileChange {
-                    profile,
+                .blocking_send(ControlCommand::Retier {
+                    request,
                     reply: ack0_tx,
                 })
                 .is_ok(),
             "控制队列必须受理"
         );
         assert_eq!(
-            wait_reply(ack0_rx).map(|(profile, _)| profile),
+            wait_reply(ack0_rx).map(|(applied, _codec, _backend)| applied),
             Ok(profile),
             "应答必须是 Actor 实际生效的档位"
         );
@@ -1247,8 +1325,8 @@ mod tests {
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let (mut actor, _pool) = test_actor(inbox, test_outbox());
 
-        // 1. 初始为 1080p Profile (上限 20_000_000 bps)：走公共缝装配，不直写字段
-        let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
+        // 1. 初始为 1080p 档位：走公共缝装配，不直写字段
+        let p1080 = tier(1920, 1080, 60, VideoCodec::H264);
         assert_eq!(
             prepare(&mut actor, p1080, Some(EncodeBackendKind::Software)),
             ControlStatus::Ok
@@ -1258,8 +1336,8 @@ mod tests {
         set_bitrate(&mut actor, 5_000_000);
         assert_eq!(actor.bitrate, 5_000_000);
 
-        // 3. 切到 720p（上限 7_533_282 bps，高于 5M）：缓存不动
-        let p720 = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        // 3. 切到 720p（派生上限高于 5M）：缓存不动
+        let p720 = tier(1280, 720, 60, VideoCodec::H264);
         let _ = switch_profile(&mut actor, p720);
         assert_eq!(
             actor.bitrate, 5_000_000,
@@ -1272,9 +1350,9 @@ mod tests {
 
         // 5. 切到上限更低的档位：下发值被压到新上限，但**缓存仍是 RC 派发过的 10M**，
         //    等 `RateControl::set_bps` 把它改写成真正的跟随值
-        let p720_15fps = StreamingProfile::new(1280, 720, 15, VideoCodec::H264);
+        let p720_15fps = tier(1280, 720, 15, VideoCodec::H264);
         assert!(
-            p720_15fps.bitrate() < 10_000_000,
+            p720_15fps.derive().bitrate() < 10_000_000,
             "本用例前提：新档位上限低于 10M"
         );
         let _ = switch_profile(&mut actor, p720_15fps);
@@ -1317,6 +1395,7 @@ mod tests {
         fn reconfigure(
             &mut self,
             _new_profile: StreamingProfile,
+            _new_codec: VideoCodec,
         ) -> Result<Vec<HostBlock>, String> {
             Ok(Vec::new())
         }
@@ -1349,10 +1428,11 @@ mod tests {
 
     /// 围栏测试工厂：交出硬件身份编码器（行为按用例配置）
     fn fence_backend_builder(drain_ok: bool, import_ok: bool) -> Arc<HardwareBuilder> {
-        Arc::new(move |profile, _kind, slot_state| {
+        Arc::new(move |profile, codec, _kind, slot_state| {
             Ok((
                 VideoEncoder::from_backend(
                     profile,
+                    codec,
                     Box::new(FenceBackend {
                         slot_state,
                         drain_ok,
@@ -1428,7 +1508,7 @@ mod tests {
         let output = test_outbox();
         let (mut actor, pool, block) = fence_actor(inbox.clone(), output.clone(), true, true);
 
-        let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
+        let p1080 = tier(1920, 1080, 60, VideoCodec::H264);
         assert_eq!(
             prepare(&mut actor, p1080, Some(EncodeBackendKind::Nvenc)),
             ControlStatus::Ok
@@ -1436,8 +1516,9 @@ mod tests {
         assert!(!actor.rejecting_frames);
 
         // 几何变化生效：窗口开启
-        let p720 = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
-        assert_eq!(switch_profile(&mut actor, p720), Ok(p720));
+        let request720 = tier(1280, 720, 60, VideoCodec::H264);
+        let p720 = request720.derive();
+        assert_eq!(switch_profile(&mut actor, request720), Ok(p720));
         assert!(actor.rejecting_frames);
 
         // 窗口内槽位帧：入口拒收、busy 位归还、不进编码
@@ -1488,14 +1569,17 @@ mod tests {
         let output = test_outbox();
         let (mut actor, _pool, block) = fence_actor(inbox.clone(), output.clone(), true, true);
 
-        let p1080_h264 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
+        let p1080_h264 = tier(1920, 1080, 60, VideoCodec::H264);
         assert_eq!(
             prepare(&mut actor, p1080_h264, Some(EncodeBackendKind::Nvenc)),
             ControlStatus::Ok
         );
 
-        let p1080_h265 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H265);
-        assert_eq!(switch_profile(&mut actor, p1080_h265), Ok(p1080_h265));
+        let p1080_h265 = tier(1920, 1080, 60, VideoCodec::H265);
+        assert_eq!(
+            switch_profile(&mut actor, p1080_h265),
+            Ok(p1080_h265.derive())
+        );
         assert!(actor.rejecting_frames);
 
         block.set_busy(3);
@@ -1527,13 +1611,14 @@ mod tests {
         let output = test_outbox();
         let (mut actor, pool, _block) = fence_actor(inbox.clone(), output.clone(), false, true);
 
-        let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
+        let p1080 = tier(1920, 1080, 60, VideoCodec::H264);
         assert_eq!(
             prepare(&mut actor, p1080, Some(EncodeBackendKind::Nvenc)),
             ControlStatus::Ok
         );
-        let p720 = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
-        let _ = switch_profile(&mut actor, p720);
+        let request720 = tier(1280, 720, 60, VideoCodec::H264);
+        let p720 = request720.derive();
+        let _ = switch_profile(&mut actor, request720);
         assert!(actor.rejecting_frames);
 
         assert_eq!(
@@ -1568,7 +1653,7 @@ mod tests {
         let output = test_outbox();
         let (mut actor, _pool, block) = fence_actor(inbox.clone(), output.clone(), true, true);
 
-        let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
+        let p1080 = tier(1920, 1080, 60, VideoCodec::H264);
         assert_eq!(
             prepare(&mut actor, p1080, Some(EncodeBackendKind::Nvenc)),
             ControlStatus::Ok
@@ -1609,24 +1694,24 @@ mod tests {
         let output = test_outbox();
         let (mut actor, _pool, block) = fence_actor(inbox.clone(), output.clone(), true, true);
 
-        let p1080 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
+        let p1080 = tier(1920, 1080, 60, VideoCodec::H264);
         assert_eq!(
             prepare(&mut actor, p1080, Some(EncodeBackendKind::Nvenc)),
             ControlStatus::Ok
         );
 
         // fps-only 重配不动表：单独发生时不开窗
-        let p1080_30fps_h264 = StreamingProfile::new(1920, 1080, 30, VideoCodec::H264);
+        let p1080_30fps_h264 = tier(1920, 1080, 30, VideoCodec::H264);
         let _ = switch_profile(&mut actor, p1080_30fps_h264);
         assert!(!actor.rejecting_frames, "fps-only 重配不得开窗");
 
         // 同几何换 codec 开窗（旧 sync_value 帧自此不得进编码）
-        let p1080_h265 = StreamingProfile::new(1920, 1080, 60, VideoCodec::H265);
+        let p1080_h265 = tier(1920, 1080, 60, VideoCodec::H265);
         let _ = switch_profile(&mut actor, p1080_h265);
         assert!(actor.rejecting_frames);
 
         // 窗口期间来一条 fps-only 重配：不得关闭拒收
-        let p1080_30fps = StreamingProfile::new(1920, 1080, 30, VideoCodec::H265);
+        let p1080_30fps = tier(1920, 1080, 30, VideoCodec::H265);
         let _ = switch_profile(&mut actor, p1080_30fps);
         assert!(actor.rejecting_frames, "fps-only 重配不得提前放行旧代帧");
 

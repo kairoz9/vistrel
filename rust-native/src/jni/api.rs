@@ -261,7 +261,7 @@ async fn handle_negotiate_offer(
         },
     };
 
-    let (answer, profile, backend) = match engine
+    let (answer, profile, codec, backend) = match engine
         .handle_offer(
             offer,
             w,
@@ -287,9 +287,10 @@ async fn handle_negotiate_offer(
             "width": profile.width(),
             "height": profile.height(),
             "fps": profile.fps(),
-            "bpp": profile.bpp(),
+            // 生效画质输入：与派生码率消费的钳制值一致（偏好本身不在档位事实里）
+            "bpp": encode::clamp_bpp(initial_bpp.unwrap_or(encode::MIN_BPP)),
             "bitrate": profile.bitrate(),
-            "codec": profile.codec().as_str(),
+            "codec": codec.as_str(),
             "backend": backend.as_str(),
             // 可选值清单：硬编按探测优先级序，软件编码恒收尾；远程玩家设置面板据此渲染
             "backends": encode::encoder_caps_options()
@@ -396,8 +397,10 @@ async fn handle_apply_profile(
             codec,
         )
         .await;
-    let (profile, backend) = match outcome {
-        crate::streaming::ProfileApply::Applied(profile, backend) => (profile, backend),
+    let (profile, codec, backend) = match outcome {
+        crate::streaming::ProfileApply::Applied(profile, codec, backend) => {
+            (profile, codec, backend)
+        }
         crate::streaming::ProfileApply::Rejected | crate::streaming::ProfileApply::NoSession => {
             return None;
         }
@@ -407,9 +410,10 @@ async fn handle_apply_profile(
             "width": profile.width(),
             "height": profile.height(),
             "fps": profile.fps(),
-            "bpp": profile.bpp(),
+            // 生效画质输入：与派生码率消费的钳制值一致（偏好本身不在档位事实里）
+            "bpp": encode::clamp_bpp(bpp),
             "bitrate": profile.bitrate(),
-            "codec": profile.codec().as_str(),
+            "codec": codec.as_str(),
             // 后端未就绪的采纳态为 null，Java 按未知处理
             "backend": backend.map(|b| b.as_str()),
         })

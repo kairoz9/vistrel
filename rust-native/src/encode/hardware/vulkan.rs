@@ -27,7 +27,7 @@ use crate::encode::hardware::slots::{
     SlotStateBlock, SlotTable, VramSlotDescriptor, ensure_batch_geometry,
 };
 use crate::encode::pool::{HOST_SLOT_BYTES, HostBlock, POOL_DEPTH};
-use crate::encode::{FramePayload, StreamingProfile, display_nv12_len};
+use crate::encode::{FramePayload, StreamingProfile, VideoCodec, display_nv12_len};
 
 use ash::vk;
 use bytes::Bytes;
@@ -165,6 +165,8 @@ pub(crate) struct VulkanVideoBackend {
     /// 当前档位。`reconfigure` 靠它判断「几何是否真的变了」——
     /// 只有 fps / 码率变化时绝不能重建会话（会清空显存槽位表）
     profile: StreamingProfile,
+    /// 当前 codec
+    codec: VideoCodec,
     slots: SlotTable<VramSlot>,
     /// 槽位所有权共享块：编码出口归还位（毒化时粘滞），与 Actor 同代
     slot_state: &'static SlotStateBlock,
@@ -187,9 +189,9 @@ impl VulkanVideoBackend {
     /// 不允许出现「编码器起来了、块却没就绪」的半状态
     pub(crate) fn new(
         profile: StreamingProfile,
+        codec: VideoCodec,
         slot_state: &'static SlotStateBlock,
     ) -> Result<(Self, Vec<HostBlock>), String> {
-        let codec = profile.codec();
         let width = profile.width();
         let height = profile.height();
         let fps = profile.fps() as u32;
@@ -219,7 +221,7 @@ impl VulkanVideoBackend {
             Some(_) => INTRA_REFRESH_GOP,
             None => fps.max(2),
         };
-        let mut encoder = FrameEncoder::new(&device, &caps, profile, gop)?;
+        let mut encoder = FrameEncoder::new(&device, &caps, profile, codec, gop)?;
         if let Some(cycle) = intra_cycle {
             encoder.set_intra_refresh(cycle)?;
         }
@@ -243,6 +245,7 @@ impl VulkanVideoBackend {
                 device,
                 encoder,
                 profile,
+                codec,
                 slots: SlotTable::new(),
                 slot_state,
                 coded_align: (
@@ -339,17 +342,21 @@ impl VideoEncodeBackend for VulkanVideoBackend {
         Ok(())
     }
 
-    fn reconfigure(&mut self, new_profile: StreamingProfile) -> Result<Vec<HostBlock>, String> {
+    fn reconfigure(
+        &mut self,
+        new_profile: StreamingProfile,
+        new_codec: VideoCodec,
+    ) -> Result<Vec<HostBlock>, String> {
         // 几何与 codec 都没变：coded extent、DPB、SPS 全部仍然有效，只有码控参数要更新。
         //
         // **绝不能重建会话**。重建会清空显存槽位表，而采集侧在尺寸不变时不会重建
         // 采集管线、也就不会重新注册槽位——之后每一帧都变成「VRAM slot N not found」，
         // 而两条采集路径里 RAM 回退也没被启用（游戏侧认为管线还健康），画面永久冻结。
         // 这是「只切帧率就卡死」的根因。
-        let same_geometry = self.profile.width() == new_profile.width()
+        let same_shape = self.profile.width() == new_profile.width()
             && self.profile.height() == new_profile.height()
-            && self.profile.codec() == new_profile.codec();
-        if same_geometry {
+            && self.codec == new_codec;
+        if same_shape {
             // 码控每帧随 `VkVideoCodingControlInfoKHR` 下发，改字段 + 置脏即可生效
             self.encoder.set_fps(new_profile.fps() as u32);
             self.encoder.set_bitrate(new_profile.bitrate() as u64);
@@ -359,7 +366,7 @@ impl VideoEncodeBackend for VulkanVideoBackend {
 
         // 先建新后端再替换：新建失败时旧后端仍然可用。新后端带在自己的新设备上分配的帧块，
         // 由调用方装进帧池——池里旧域的块会落进 `stale`，等下次 `attach` 时释放
-        let (new_backend, blocks) = Self::new(new_profile, self.slot_state)?;
+        let (new_backend, blocks) = Self::new(new_profile, new_codec, self.slot_state)?;
         *self = new_backend;
         Ok(blocks)
     }

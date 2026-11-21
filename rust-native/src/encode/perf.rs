@@ -271,12 +271,12 @@ fn run_cell(
     codec: VideoCodec,
     path: InputPath,
 ) -> Result<MatrixRow, String> {
-    let mut profile = StreamingProfile::new(resolution.width, resolution.height, FPS, codec);
-    // 按最高档 1440p@240 的 60 Mbps 口径
-    profile.set_bitrate(MATRIX_BITRATE_BPS);
+    // 码率按最高档 1440p@240 的 60 Mbps 口径显式给定（性能矩阵绕开动态码率公式）
+    let profile =
+        StreamingProfile::new(resolution.width, resolution.height, FPS, MATRIX_BITRATE_BPS);
     // 池由采集侧持有；后端构造时交回自己的块（软编是堆块，硬编是设备块）
     let (mut encoder, blocks) =
-        VideoEncoder::new_backend(profile, backend, Some(SlotStateBlock::new_leaked()))?;
+        VideoEncoder::new_backend(profile, codec, backend, Some(SlotStateBlock::new_leaked()))?;
     let pool = FramePool::new();
     pool.attach(blocks);
     let (coded_width, coded_height) = encoder.coded_extent();
@@ -548,7 +548,7 @@ fn make_nv12_frame(width: usize, height: usize, seed: usize) -> Vec<u8> {
 #[cfg(test)]
 #[test]
 fn generated_nv12_frame_matches_coded_extent() {
-    let profile = StreamingProfile::new(1280, 720, FPS, VideoCodec::H264);
+    let profile = StreamingProfile::new(1280, 720, FPS, 4_000_000);
     let (coded_width, coded_height) = profile.coded_extent((1, 32));
     let frame = make_nv12_frame(coded_width, coded_height, 0);
     assert_eq!(frame.len(), nv12_len(coded_width, coded_height));
@@ -557,7 +557,7 @@ fn generated_nv12_frame_matches_coded_extent() {
 #[cfg(test)]
 #[test]
 fn generated_rgba_frame_matches_coded_extent() {
-    let profile = StreamingProfile::new(1280, 720, FPS, VideoCodec::H264);
+    let profile = StreamingProfile::new(1280, 720, FPS, 4_000_000);
     let (coded_width, coded_height) = profile.coded_extent((1, 32));
     let frame = make_rgba_frame(coded_width, coded_height, 0);
     assert_eq!(frame.len(), coded_width * coded_height * 4);
@@ -575,10 +575,10 @@ fn nvenc_host_input_produces_real_bitstream() {
     super::software::init_api_for_tests();
     super::hardware::bootstrap_hardware_caps();
 
-    let mut profile = StreamingProfile::new(1920, 1080, FPS, VideoCodec::Av1);
-    profile.set_bitrate(12_000_000);
+    let profile = StreamingProfile::new(1920, 1080, FPS, 12_000_000);
     let (mut encoder, blocks) = VideoEncoder::new_backend(
         profile,
+        VideoCodec::Av1,
         EncodeBackendKind::Nvenc,
         Some(SlotStateBlock::new_leaked()),
     )

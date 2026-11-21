@@ -171,6 +171,7 @@ pub(super) fn build_encoder_config(
     driver: NvencDriver,
     encoder: &EncoderHandle,
     profile: &StreamingProfile,
+    codec: VideoCodec,
     input_format: NV_ENC_BUFFER_FORMAT,
 ) -> Result<(Box<NV_ENC_CONFIG>, NV_ENC_INITIALIZE_PARAMS), String> {
     // fps 由 StreamingProfile 构造器钳到离散档位（≤240），码率由公式/带宽控制器
@@ -178,7 +179,7 @@ pub(super) fn build_encoder_config(
     let (fps, bitrate) = (profile.fps() as u32, profile.bitrate() as u32);
 
     // 1. 查询输入格式支持，确保驱动接受所请求的输入布局（生产是 NV12，采集侧已完成 CSC）
-    let (codec_guid, profile_guid) = match profile.codec() {
+    let (codec_guid, profile_guid) = match codec {
         VideoCodec::H264 => (NV_ENC_CODEC_H264_GUID, NV_ENC_H264_PROFILE_HIGH_GUID),
         VideoCodec::H265 => (NV_ENC_CODEC_HEVC_GUID, NV_ENC_HEVC_PROFILE_MAIN_GUID),
         VideoCodec::Av1 => (NV_ENC_CODEC_AV1_GUID, NV_ENC_AV1_PROFILE_MAIN_GUID),
@@ -195,8 +196,7 @@ pub(super) fn build_encoder_config(
         if res != NVENCSTATUS::NV_ENC_SUCCESS || format_count == 0 {
             return Err(format!(
                 "nvEncGetInputFormatCount failed for {:?}: {:?}",
-                profile.codec(),
-                res
+                codec, res
             ));
         }
     }
@@ -219,8 +219,7 @@ pub(super) fn build_encoder_config(
         if res != NVENCSTATUS::NV_ENC_SUCCESS {
             return Err(format!(
                 "nvEncGetInputFormats failed for {:?}: {:?}",
-                profile.codec(),
-                res
+                codec, res
             ));
         }
     }
@@ -229,7 +228,7 @@ pub(super) fn build_encoder_config(
     if !formats.contains(&input_format) {
         return Err(format!(
             "NVENC driver does not support {input_format:?} input format for {:?}, supported: {formats:?}",
-            profile.codec(),
+            codec,
         ));
     }
 
@@ -285,7 +284,7 @@ pub(super) fn build_encoder_config(
     rc.maxBitRate = bitrate;
     rc.set_enableMinQP(u32::from(true));
     rc.set_enableMaxQP(u32::from(false));
-    let min_qp = match profile.codec() {
+    let min_qp = match codec {
         VideoCodec::H264 => 18,
         VideoCodec::H265 => 22,
         VideoCodec::Av1 => 22,
@@ -299,18 +298,17 @@ pub(super) fn build_encoder_config(
     // 性能矩阵对照实测（AQ on/off，Vulkan 行为对照组，波动 <0.5%）：
     // HEVC/AV1 提交 +1.1ms/帧（1440p +2.2ms）、端到端 +24~39%，延迟预算下得不偿失；
     // H264 提交仅 +20µs、硬件等待还略降，画质收益近乎免费，予以保留
-    rc.set_enableAQ(u32::from(profile.codec() == VideoCodec::H264));
+    rc.set_enableAQ(u32::from(codec == VideoCodec::H264));
     rc.set_aqStrength(8);
 
     let frame_size_bits = bitrate / fps; // 平均单帧比特数
     rc.vbvBufferSize = frame_size_bits;
     rc.vbvInitialDelay = frame_size_bits;
     // 按当前帧率自适应 Intra-Refresh 周期：约 0.5s 刷新一轮
-    match profile.codec() {
+    match codec {
         VideoCodec::H264 => {
             // SAFETY: 取引用时该成员的内存刚被驱动在 get_preset 中按 codec_guid
             // 对应的活跃成员整体写入，枚举字段位模式均为 C 头文件声明的合法变体值；
-            // union 活跃成员由 profile.codec() 在本 match 内单点决定，本分支只访问
             // h264Config，写入的 itu 字段也全部落在该成员上
             let cfg = unsafe { &mut config.encodeCodecConfig.h264Config };
             itu_common!(cfg, h264VUIParameters);
@@ -342,7 +340,7 @@ pub(super) fn build_encoder_config(
     }
 
     // Intra-Refresh 波次与 Level 依赖帧率/几何/码率，与 reconfigure 共用同一推导
-    apply_refresh_and_level(profile.codec(), &mut config, fps, bitrate);
+    apply_refresh_and_level(codec, &mut config, fps, bitrate);
 
     // 4. 初始化编码器
     let (dar_w, dar_h) = calculate_dar(profile.width() as u32, profile.height() as u32);

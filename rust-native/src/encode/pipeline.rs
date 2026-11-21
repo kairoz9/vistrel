@@ -24,7 +24,10 @@ use crate::encode::frame::{
 };
 use crate::encode::hardware::slots::SlotStateBlock;
 use crate::encode::pool::FramePool;
-use crate::encode::{StreamingProfile, bootstrap_hardware_caps, is_hardware_caps_bootstrapped};
+use crate::encode::{
+    StreamingProfile, TierRequest, VideoCodec, bootstrap_hardware_caps,
+    is_hardware_caps_bootstrapped,
+};
 /// 关停等待编码线程的上限
 ///
 /// 见 `VideoPipeline::shutdown`：设备销毁后 GPU 调用可能长时间不返回，无界等待会拖死渲染线程。
@@ -80,14 +83,15 @@ impl VideoPipeline {
         self.control.import_vram_slots(slots)
     }
 
-    /// 会话建立前把编码器按档位就绪（ask），`Ok` 携带**实际生效**的档位与后端身份
+    /// 会话建立前把编码器按定档请求就绪（ask），`Ok` 携带**实际生效**的档位、codec
+    /// 与后端身份
     pub(crate) async fn prepare_encoder(
         &self,
-        profile: StreamingProfile,
+        request: TierRequest,
         preferred_backend: Option<EncodeBackendKind>,
-    ) -> Result<(StreamingProfile, EncodeBackendKind), ControlStatus> {
+    ) -> Result<(StreamingProfile, VideoCodec, EncodeBackendKind), ControlStatus> {
         self.control
-            .prepare_encoder(profile, preferred_backend)
+            .prepare_encoder(request, preferred_backend)
             .await
     }
 

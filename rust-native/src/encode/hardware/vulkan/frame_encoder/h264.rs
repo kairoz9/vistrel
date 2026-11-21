@@ -773,7 +773,7 @@ mod tests {
                 return;
             }
         };
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(&caps), 15) {
+        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), caps.codec, 15) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("编码器初始化失败: {e}");
@@ -915,7 +915,7 @@ mod tests {
         }
 
         // GOP 取 300 帧：frame_num 位宽应升到 9，否则参考链会在 GOP 中途断掉
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(&caps), 300) {
+        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), caps.codec, 300) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("编码器初始化失败: {e}");

@@ -538,9 +538,10 @@ mod tests {
             .unwrap_or_default();
         for codec in [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1] {
             if supported.contains(&codec) {
-                let profile = StreamingProfile::new(1920, 1080, 60, codec);
+                let profile = StreamingProfile::new(1920, 1080, 60, 12_400_000);
                 let (mut encoder, blocks) = match VideoEncoder::new_backend(
                     profile,
+                    codec,
                     EncodeBackendKind::VulkanVideo,
                     Some(test_slot_state()),
                 ) {
@@ -555,8 +556,10 @@ mod tests {
                 assert_eq!(encoder.profile(), profile);
 
                 // 测试重配分辨率 (1080p -> 720p)：几何变化换了设备，后端交回新批
-                let new_profile = StreamingProfile::new(1280, 720, 60, codec);
-                let fresh = encoder.reconfigure(new_profile).expect("重配必须成功");
+                let new_profile = StreamingProfile::new(1280, 720, 60, 4_000_000);
+                let fresh = encoder
+                    .reconfigure(new_profile, codec)
+                    .expect("重配必须成功");
                 pool.attach(fresh);
                 assert_eq!(encoder.profile(), new_profile);
             }
@@ -567,9 +570,10 @@ mod tests {
     #[test]
     #[ignore = "requires GPU"]
     fn test_new_backend_keeps_requested_profile() {
-        let profile = StreamingProfile::new(1920, 1080, 60, VideoCodec::H264);
+        let profile = StreamingProfile::new(1920, 1080, 60, 12_400_000);
         let (encoder, _blocks) = match VideoEncoder::new_backend(
             profile,
+            VideoCodec::H264,
             EncodeBackendKind::Nvenc,
             Some(test_slot_state()),
         ) {
@@ -592,6 +596,7 @@ mod tests {
         }
         let (mut encoder, blocks) = match VideoEncoder::new_backend(
             StreamingProfile::default(),
+            VideoCodec::H264,
             EncodeBackendKind::Nvenc,
             Some(test_slot_state()),
         ) {
@@ -604,7 +609,10 @@ mod tests {
         let pool = pool_with(blocks);
 
         let fresh = encoder
-            .reconfigure(StreamingProfile::new(1280, 720, 60, VideoCodec::H264))
+            .reconfigure(
+                StreamingProfile::new(1280, 720, 60, 4_000_000),
+                VideoCodec::H264,
+            )
             .expect("NVENC 重配失败");
         assert!(fresh.is_empty(), "NVENC 不换 CUDA 上下文，重配不该交回新批");
         pool.attach(fresh);
@@ -624,10 +632,11 @@ mod tests {
     #[ignore = "requires GPU"]
     fn test_backend_supplies_blocks_for_the_pool() {
         crate::encode::software::init_api_for_tests();
-        let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        let profile = StreamingProfile::new(1280, 720, 60, 4_000_000);
 
         match VideoEncoder::new_backend(
             profile,
+            VideoCodec::H264,
             EncodeBackendKind::VulkanVideo,
             Some(test_slot_state()),
         ) {
@@ -639,7 +648,8 @@ mod tests {
             Err(e) => println!("Vulkan Video 不可用，跳过: {e}"),
         }
 
-        let (_soft, heap) = VideoEncoder::new_software(profile).expect("软编必须可建");
+        let (_soft, heap) =
+            VideoEncoder::new_software(profile, VideoCodec::H264).expect("软编必须可建");
         assert_eq!(heap.len(), POOL_DEPTH, "软编交回的是一整批堆块");
         assert!(
             heap.iter()
@@ -654,7 +664,8 @@ mod tests {
     fn test_geometry_change_moves_old_blocks_to_stale() {
         use crate::encode::VideoCodec::H264;
         let (mut encoder, blocks) = match VideoEncoder::new_backend(
-            StreamingProfile::new(1920, 1080, 60, H264),
+            StreamingProfile::new(1920, 1080, 60, 12_400_000),
+            H264,
             EncodeBackendKind::VulkanVideo,
             Some(test_slot_state()),
         ) {
@@ -669,7 +680,7 @@ mod tests {
         let in_flight = pool.acquire().expect("池里必须有余量");
 
         let fresh = encoder
-            .reconfigure(StreamingProfile::new(1280, 720, 60, H264))
+            .reconfigure(StreamingProfile::new(1280, 720, 60, 4_000_000), H264)
             .expect("几何变化必须能重配");
         assert!(!fresh.is_empty(), "几何变化换了设备，后端必须交回新批块");
         pool.attach(fresh);
@@ -688,15 +699,19 @@ mod tests {
     fn test_backend_trait_shared_lifecycle() {
         for encoder_type in [EncodeBackendKind::Nvenc, EncodeBackendKind::VulkanVideo] {
             let (w, h) = (1280usize, 720usize);
-            let profile = StreamingProfile::new(w, h, 60, VideoCodec::H264);
-            let (mut encoder, blocks) =
-                match VideoEncoder::new_backend(profile, encoder_type, Some(test_slot_state())) {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        println!("{encoder_type:?} 初始化失败，跳过: {e}");
-                        continue;
-                    }
-                };
+            let profile = StreamingProfile::new(w, h, 60, 4_000_000);
+            let (mut encoder, blocks) = match VideoEncoder::new_backend(
+                profile,
+                VideoCodec::H264,
+                encoder_type,
+                Some(test_slot_state()),
+            ) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    println!("{encoder_type:?} 初始化失败，跳过: {e}");
+                    continue;
+                }
+            };
             let pool = pool_with(blocks);
             assert_eq!(encoder.backend_kind(), encoder_type, "请求即所得");
 
@@ -708,7 +723,10 @@ mod tests {
             assert!(!nalu.is_empty(), "码流不得为空");
 
             let fresh = encoder
-                .reconfigure(StreamingProfile::new(1920, 1080, 60, VideoCodec::H264))
+                .reconfigure(
+                    StreamingProfile::new(1920, 1080, 60, 12_400_000),
+                    VideoCodec::H264,
+                )
                 .expect("重配必须成功");
             pool.attach(fresh);
             encoder.drain().expect("排空必须成功");
@@ -724,9 +742,10 @@ mod tests {
             return;
         }
         let (w, h) = (1280, 720);
-        let profile = StreamingProfile::new(w, h, 60, VideoCodec::H264);
+        let profile = StreamingProfile::new(w, h, 60, 4_000_000);
         let (mut encoder, blocks) = match VideoEncoder::new_backend(
             profile,
+            VideoCodec::H264,
             EncodeBackendKind::Nvenc,
             Some(test_slot_state()),
         ) {
@@ -756,9 +775,10 @@ mod tests {
     #[ignore = "requires GPU"]
     fn test_vulkan_video_encodes_heap_frame() {
         let (w, h) = (1280, 720);
-        let profile = StreamingProfile::new(w, h, 60, VideoCodec::H264);
+        let profile = StreamingProfile::new(w, h, 60, 4_000_000);
         let (mut encoder, blocks) = match VideoEncoder::new_backend(
             profile,
+            VideoCodec::H264,
             EncodeBackendKind::VulkanVideo,
             Some(test_slot_state()),
         ) {
@@ -786,9 +806,10 @@ mod tests {
     #[ignore = "requires GPU"]
     fn test_vulkan_video_encodes_pool_frame() {
         let (w, h) = (1280, 720);
-        let profile = StreamingProfile::new(w, h, 60, VideoCodec::H264);
+        let profile = StreamingProfile::new(w, h, 60, 4_000_000);
         let (mut encoder, blocks) = match VideoEncoder::new_backend(
             profile,
+            VideoCodec::H264,
             EncodeBackendKind::VulkanVideo,
             Some(test_slot_state()),
         ) {
@@ -823,9 +844,10 @@ mod tests {
     #[test]
     #[ignore = "requires GPU"]
     fn test_vulkan_video_vram_slot_not_found_returns_err() {
-        let profile = StreamingProfile::new(1280, 720, 60, VideoCodec::H264);
+        let profile = StreamingProfile::new(1280, 720, 60, 4_000_000);
         let (mut encoder, _blocks) = match VideoEncoder::new_backend(
             profile,
+            VideoCodec::H264,
             EncodeBackendKind::VulkanVideo,
             Some(test_slot_state()),
         ) {

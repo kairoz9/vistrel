@@ -799,7 +799,7 @@ mod tests {
                 return;
             }
         };
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(&caps), 15) {
+        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), caps.codec, 15) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("H.265 编码器初始化失败: {e}");
