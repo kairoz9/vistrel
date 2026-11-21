@@ -83,15 +83,16 @@ impl VideoPipeline {
         self.control.import_vram_slots(slots)
     }
 
-    /// 会话建立前把编码器按定档请求就绪（ask），`Ok` 携带**实际生效**的档位、codec
-    /// 与后端身份
+    /// 会话建立前把编码器按定档请求与协商定死的 codec 就绪（ask），`Ok` 携带
+    /// **实际生效**的档位、codec 与后端身份
     pub(crate) async fn prepare_encoder(
         &self,
         request: TierRequest,
+        codec: VideoCodec,
         preferred_backend: Option<EncodeBackendKind>,
     ) -> Result<(StreamingProfile, VideoCodec, EncodeBackendKind), ControlStatus> {
         self.control
-            .prepare_encoder(request, preferred_backend)
+            .prepare_encoder(request, codec, preferred_backend)
             .await
     }
 

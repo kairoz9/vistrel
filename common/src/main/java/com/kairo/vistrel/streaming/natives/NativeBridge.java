@@ -194,7 +194,7 @@ public class NativeBridge {
      * 阻塞应用新的画质档位
      *
      * <p>这是档位的唯一运行期写路径, 成功应答返回**实际生效**的档位 JSON
-     * ({@code width/height/fps/bpp/bitrate/codec})；请求被拒绝或无活跃会话返回空串，
+     * ({@code width/height/fps/bpp/bitrate})；请求被拒绝或无活跃会话返回空串，
      * 调用方保持自己上次的生效基线。
      *
      * <p>0 几何 / 0 帧率 Native 按拒绝处理。
@@ -203,10 +203,9 @@ public class NativeBridge {
      * @param height 目标高度
      * @param fps    目标帧率
      * @param bpp    客户端画质档位 (BPP)
-     * @param codec  目标编码器标识（会话协商值）
      * @return 实际生效档位 JSON；被拒绝或无活跃会话返回空串
      */
-    public static native String applyProfile(int width, int height, int fps, double bpp, String codec);
+    public static native String applyProfile(int width, int height, int fps, double bpp);
 
     /**
      * 注入客户端 ICE Candidate

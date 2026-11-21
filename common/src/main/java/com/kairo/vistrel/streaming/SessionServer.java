@@ -53,9 +53,9 @@ public interface SessionServer {
 
     /**
      * 阻塞式应用编码档位（控制面 → Native 会话重配）：成功回生效档位 JSON，
-     * 无会话 / 引擎未启动 / 请求被拒回空串。调用方只能是后台 ask 线程
+     * 无会话 / 引擎未启动 / 请求被拒回空串。调用方只能是后台 ask 线程。
      */
-    String applyProfile(int width, int height, int fps, double bpp, String codec);
+    String applyProfile(int width, int height, int fps, double bpp);
 
     /**
      * 注入档位协调器：信令面在 offer 协商成功时回调落账、会话关闭时投递复位。
@@ -64,54 +64,46 @@ public interface SessionServer {
     default void setProfileCoordinator(ProfileCoordinator worker) {}
 
     /**
-     * 不可变会话状态快照
+     * 是否为硬件编码（nvenc / vulkan_video）。
      *
-     * <p>宽高为**显示尺寸**（码流声明的 Content Resolution，1080 显示高度即 1080）；
-     * 编码补边 (coded_extent) 是 Native 内部细节，不在此字段。
+     * @param backend 协商应答携带的线上后端词汇
      */
-    record SessionState(Phase phase, int width, int height, int fps, double bpp, String codec, String backend) {
+    public static boolean isHardwareBackend(String backend) {
+        return "nvenc".equals(backend) || "vulkan_video".equals(backend);
+    }
+
+    /**
+     * 档位：显示几何、帧率与画质（bpp）
+     *
+     * <p>宽高为**显示尺寸**（码流声明的 Content Resolution，1080 显示高度即 1080）。
+     */
+    record Tier(int width, int height, int fps, double bpp) {}
+
+    /**
+     * 会话控制面广播事件：事件不可变，消费者按类型分发，跨会话边界无撕裂窗口
+     */
+    sealed interface SessionEvent {
         /**
-         * 会话相位：STREAMING 内容在流动；PAUSED 会话在线但内容丢失（仅停视频采集）；
-         * INACTIVE 无会话
+         * 会话已建立（协商落账）：后端身份与初始档位原子携带
          */
-        public enum Phase {
-            INACTIVE,
-            PAUSED,
-            STREAMING
-        }
+        record Established(String backend, Tier tier) implements SessionEvent {}
 
         /**
-         * 后端身份的「未定」值：无会话或未携带该字段
+         * 档位或内容相位变化。相位只表达内容在不在流动，会话本身仍在线
          */
-        public static final String BACKEND_UNKNOWN = "unknown";
-        /**
-         * 未激活基线：无会话，几何为默认档位，bpp 取前端滑杆下限
-         */
-        public static final SessionState INACTIVE =
-                new SessionState(Phase.INACTIVE, 1920, 1080, 60, 0.1, "None", BACKEND_UNKNOWN);
-
-        public boolean active() {
-            return phase == Phase.STREAMING;
-        }
+        record TierChanged(Phase phase, Tier tier) implements SessionEvent {}
 
         /**
-         * 后端身份是否为硬件编码（线上词汇 nvenc / vulkan_video）。
-         *
-         * <p>
-         * 显存直通的槽位只有硬件编码器能消费：协商落到软编时采集侧不得尝试
-         * 构建显存直通管线——Native 侧导入前置是纯检查，不会静默重建硬编。
+         * 会话已关闭：停止采集、停投递，等待下一次协商
          */
-        public boolean isHardwareBackend() {
-            return "nvenc".equals(backend) || "vulkan_video".equals(backend);
-        }
+        record Closed() implements SessionEvent {}
 
         /**
-         * 内容丢失：会话仍然在线，沿用最近档位只降相位——音频照常，仅视频停采
-         *
-         * @return 相位降为 PAUSED、几何 / 帧率 / BPP / codec / 后端 均不变的新快照
+         * 内容相位：STREAMING 内容在流动；PAUSED 会话在线但内容丢失（仅停视频采集）
          */
-        public SessionState paused() {
-            return new SessionState(Phase.PAUSED, width, height, fps, bpp, codec, backend);
+        enum Phase {
+            STREAMING,
+            PAUSED
         }
     }
 }

@@ -2,7 +2,8 @@ package com.kairo.vistrel.capture;
 
 import com.kairo.vistrel.capture.AudioCaptureScheduler.LoopbackBinding;
 import com.kairo.vistrel.streaming.EncoderChannel;
-import com.kairo.vistrel.streaming.SessionServer.SessionState;
+import com.kairo.vistrel.streaming.SessionServer.SessionEvent;
+import com.kairo.vistrel.streaming.SessionServer.Tier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
@@ -56,9 +57,7 @@ public class AudioCaptureSchedulerTest {
 
         Assertions.assertFalse(LoopbackBinding.current().isBound());
         // 模拟外部控制面通知会话接入（采集线程在首个接入会话时启动）
-        scheduler.onSessionChanged(
-                new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.1, "H264", "unknown")
-        );
+        scheduler.onSessionEvent(new SessionEvent.Established("nvenc", new Tier(1920, 1080, 60, 0.1)));
         // 测试模拟绑定环回设备 (句柄 0x12345678L)
         LoopbackBinding.open(0x12345678L);
         Assertions.assertTrue(LoopbackBinding.current().isBound());
@@ -71,9 +70,7 @@ public class AudioCaptureSchedulerTest {
     void testSynchronousCleanupJoinsThread() throws Exception {
         TestEncoderChannel channel = new TestEncoderChannel();
         AudioCaptureScheduler scheduler = new AudioCaptureScheduler(channel, (dev, buf, samples) -> {});
-        scheduler.onSessionChanged(
-                new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.1, "H264", "unknown")
-        );
+        scheduler.onSessionEvent(new SessionEvent.Established("nvenc", new Tier(1920, 1080, 60, 0.1)));
 
         LoopbackBinding.open(0x11223344L);
         Assertions.assertTrue(LoopbackBinding.current().isBound());
@@ -98,9 +95,7 @@ public class AudioCaptureSchedulerTest {
             renderCount.incrementAndGet();
         });
         // 仅开启推流和绑定设备，此时 context 未就绪
-        scheduler.onSessionChanged(
-                new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.1, "H264", "unknown")
-        );
+        scheduler.onSessionEvent(new SessionEvent.Established("nvenc", new Tier(1920, 1080, 60, 0.1)));
         LoopbackBinding.open(0x99887766L);
         // 等待 60ms (3 个时钟周期)，断言在 context 未 ready 时绝不能有任何渲染与投递
         Thread.sleep(60);

@@ -142,8 +142,9 @@ public class FakeSessionServer implements SessionServer {
     }
 
     @Override
-    public String applyProfile(int width, int height, int fps, double bpp, String codec) {
-        // 测试替身直接接受请求档位（真实 Native 会回实际生效档位）
+    public String applyProfile(int width, int height, int fps, double bpp) {
+        // 测试替身直接接受请求档位（真实 Native 会回实际生效档位）；
+        // 应答只含档位字段——codec 与后端身份是会话常量，不随档位应答走
         return "{\"width\":"
                 + width
                 + ",\"height\":"
@@ -152,8 +153,6 @@ public class FakeSessionServer implements SessionServer {
                 + fps
                 + ",\"bpp\":"
                 + bpp
-                + ",\"bitrate\":4000000,\"codec\":\""
-                + codec
-                + "\"}";
+                + ",\"bitrate\":4000000}";
     }
 }

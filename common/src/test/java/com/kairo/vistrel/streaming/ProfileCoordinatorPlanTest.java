@@ -4,7 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.kairo.vistrel.streaming.ProfileCoordinator.ContentSnapshot;
-import com.kairo.vistrel.streaming.SessionServer.SessionState;
+import com.kairo.vistrel.streaming.SessionServer.Tier;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -16,7 +16,7 @@ class ProfileCoordinatorPlanTest {
         return new ContentSnapshot(w, h, fps, vsync, refresh);
     }
 
-    private static SessionState plan(ContentSnapshot snapshot, int vpW, int vpH, double bpp) {
+    private static Tier plan(ContentSnapshot snapshot, int vpW, int vpH, double bpp) {
         ProfileCoordinator worker = new ProfileCoordinator(null, null);
         worker.onContentSnapshot(snapshot, 0L);
         return worker.plan(vpW, vpH, bpp);
@@ -25,14 +25,14 @@ class ProfileCoordinatorPlanTest {
     @Test
     void testContentFollowsFramebufferWithoutLift() {
         // 800×600 原样串流：服务端绝不放大发假细节
-        SessionState t = plan(snapshot(800, 600, 60, false, 0), 0, 0, 0.1);
-        assertEquals(new SessionState(SessionState.Phase.STREAMING, 800, 600, 60, 0.1, "None", "unknown"), t);
+        Tier t = plan(snapshot(800, 600, 60, false, 0), 0, 0, 0.1);
+        assertEquals(new Tier(800, 600, 60, 0.1), t);
     }
 
     @Test
     void testViewportCapsPhysicalPixelsPreservingAspect() {
         // 4K 内容落在 1920×1080 的物理视口：等比缩到 1920×1080
-        SessionState t = plan(snapshot(3840, 2160, 60, false, 0), 1920, 1080, 0.1);
+        Tier t = plan(snapshot(3840, 2160, 60, false, 0), 1920, 1080, 0.1);
         assertEquals(1920, t.width());
         assertEquals(1080, t.height());
         // HiDPI 视口上限 1280×720（CSS 640×360 × DPR 2 已由网页端算好）
@@ -52,7 +52,7 @@ class ProfileCoordinatorPlanTest {
     @Test
     void testInvalidViewportIsIgnored() {
         // 无视口上报（0）与非法视口在规划器里同为「无上限」
-        SessionState t = plan(snapshot(1920, 1080, 60, false, 0), 0, 0, 0.1);
+        Tier t = plan(snapshot(1920, 1080, 60, false, 0), 0, 0, 0.1);
         assertEquals(1920, t.width());
         assertEquals(1080, t.height());
     }
@@ -60,7 +60,7 @@ class ProfileCoordinatorPlanTest {
     @Test
     void testUnlimitedMapsToStreamCeilingAndVsyncCapsToRefresh() {
         // Unlimited(260) → 240
-        SessionState t = plan(snapshot(1920, 1080, 260, false, 0), 0, 0, 0.1);
+        Tier t = plan(snapshot(1920, 1080, 260, false, 0), 0, 0, 0.1);
         assertEquals(ProfileCoordinator.STREAM_MAX_FPS, t.fps());
         // VSync 开启：再被显示器刷新率夹低
         t = plan(snapshot(1920, 1080, 260, true, 144), 0, 0, 0.1);
@@ -75,8 +75,8 @@ class ProfileCoordinatorPlanTest {
 
     @Test
     void testEmptySnapshotFallsBackTo1080p60() {
-        SessionState t = plan(ContentSnapshot.EMPTY, 0, 0, 0.2);
-        assertEquals(new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.2, "None", "unknown"), t);
+        Tier t = plan(ContentSnapshot.EMPTY, 0, 0, 0.2);
+        assertEquals(new Tier(1920, 1080, 60, 0.2), t);
     }
 
     @Test

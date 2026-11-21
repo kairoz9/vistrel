@@ -730,7 +730,7 @@ public class SignalingServer {
             double bpp = msg.bpp() != null ? msg.bpp() : ProfileCoordinator.MIN_BPP;
             String sdpJson = msg.sdp() != null ? msg.sdp().toString() : "{}";
             // 快照与内部状态同源：worker 内部持有渲染线程喂入的最新快照
-            SessionServer.SessionState target = profileCoordinator.plan(viewportWidth, viewportHeight, bpp);
+            SessionServer.Tier target = profileCoordinator.plan(viewportWidth, viewportHeight, bpp);
             String answerJson =
                     delegate.onOffer(
                             sdpJson,

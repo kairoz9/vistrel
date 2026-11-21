@@ -60,10 +60,10 @@ pub struct EncodePreferences {
     pub codec: Option<VideoCodec>,
 }
 
-/// 档位 ask 的应答（被动数据载体）：只有生效值能被回传
+/// 档位 ask 的应答（被动数据载体）：只有生效值能被回传。
 pub enum ProfileApply {
-    /// 请求已被编码器接受并生效。codec 随应答携带
-    Applied(StreamingProfile, VideoCodec),
+    /// 请求已被编码器接受并生效（codec 是会话常量，不随档位应答）
+    Applied(StreamingProfile),
     /// 请求被拒绝（0 几何 / 0 帧率的暂停信号，或编码器重配失败）；
     /// 旧档位由调用方自己的基线保持
     Rejected,
@@ -222,21 +222,15 @@ impl StreamingEngine {
                 .and_then(|list| list.iter().find(|p| &p.backend_type == kind)),
             None => backends.as_deref().and_then(|list| list.first()),
         };
-        let request = resolve_initial_request(
-            width,
-            height,
-            fps,
-            bpp,
-            &offer,
-            caps_entry,
-            preferences.codec,
-        )
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        // codec 是协商产物（offer 提供 ∩ 服务端可行，偏好为硬约束）
+        let codec = resolve_codec(Some(&offer), caps_entry, preferences.codec)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        let request = resolve_initial_request(width, height, fps, bpp, caps_entry);
 
         // prepare 回执携带实际生效档位、codec 与后端身份；指定维度被替换（建败回退）在此拒绝
         let (effective, codec, backend) = self
             .video
-            .prepare_encoder(request, preferred)
+            .prepare_encoder(request, codec, preferred)
             .await
             .map_err(|e| format!("编码器未能在会话建立前就绪 (code={})", e.code()))?;
         if let Some(kind) = preferred
@@ -277,16 +271,13 @@ impl StreamingEngine {
         Ok((answer, effective, codec, backend))
     }
 
-    /// 应用新的画质档位：阻塞 ask，应答见 [`ProfileApply`]
-    ///
-    /// 这是档位的唯一写路径。
+    /// 应用新的画质档位：阻塞 ask，应答见 [`ProfileApply`]。档位的唯一写路径
     pub async fn apply_profile(
         &self,
         width: usize,
         height: usize,
         fps: usize,
         bpp: f32,
-        codec: VideoCodec,
     ) -> ProfileApply {
         let Some(session) = self.active_session.load_full() else {
             log::warn!("无活跃会话，档位请求被拒绝");
@@ -301,14 +292,13 @@ impl StreamingEngine {
             height,
             fps,
             bpp,
-            codec,
         };
         // 控制面所有权在引擎：ask 直接发起，生效码率回填会话的码率回路；
         // 拒绝路径不经过回路，上界自然保持旧值
         match self.video.control().retier(request).await {
-            Ok((applied, applied_codec)) => {
+            Ok(applied) => {
                 session.commit_bps(applied.bitrate());
-                ProfileApply::Applied(applied, applied_codec)
+                ProfileApply::Applied(applied)
             }
             Err(e) => {
                 log::warn!("档位变更被拒绝（{e:?}），继续沿用旧档位");
@@ -318,29 +308,25 @@ impl StreamingEngine {
     }
 }
 
-/// 结合内容快照、硬件探测与远程玩家偏好协商初始定档请求
+/// 结合内容快照与硬件探测产出初始定档请求（几何与画质）
 ///
 /// 探测条目由调用方注入（生产读全局快照，单测注入假结果）；无条目即软编：
 /// 请求几何先钳进 `min(Content Resolution, 1080p) @ 60` 只缩不放——放大发的是假细节。
-/// 指定的 codec 偏好不可行时返回 `Err`：协商显式拒绝，绝不静默替换。
-/// 派生本身发生在 Actor 的定档命令处理里，这里只产出请求
+/// codec 不在此解析（见 [`resolve_codec`]）：它是协商产物，派生本身发生在
+/// Actor 的定档命令处理里，这里只产出请求
 fn resolve_initial_request(
     width: usize,
     height: usize,
     fps: usize,
     bpp: Option<f32>,
-    offer: &RTCSessionDescription,
     caps_entry: Option<&HardwareProbeResult>,
-    preferred_codec: Option<VideoCodec>,
-) -> Result<TierRequest, String> {
-    let codec = resolve_codec(Some(offer), caps_entry, preferred_codec)?;
+) -> TierRequest {
     let mut request = TierRequest {
         width,
         height,
         fps,
         // 缺省即下限画质
         bpp: bpp.unwrap_or(crate::encode::MIN_BPP),
-        codec,
     };
     if caps_entry.is_none() {
         let (w, h, f) =
@@ -352,7 +338,7 @@ fn resolve_initial_request(
         request.height = h;
         request.fps = f;
     }
-    Ok(request)
+    request
 }
 
 /// 收集 offer 实际提供的 codec 集合（rtpmap 识别）：offer 载荷列表承载浏览器解码
@@ -481,19 +467,22 @@ pub(crate) mod test_support {
                         let _ = if reject_change {
                             reply.send(Err(ControlStatus::ReconfigureFailed))
                         } else {
-                            reply.send(Ok((request.derive(), request.codec)))
+                            // 假 Actor 无会话常量可依：派生 codec 占位取 H264，
+                            // 断言只看几何；真实行为由 encode/actor.rs 的用例覆盖
+                            reply.send(Ok(request.derive(VideoCodec::H264)))
                         };
                         Rec::Retier
                     }
                     ControlCommand::PrepareEncoder {
                         request,
+                        codec,
                         preferred_backend,
                         reply,
                         ..
                     } => {
                         let _ = reply.send(Ok((
-                            request.derive(),
-                            request.codec,
+                            request.derive(codec),
+                            codec,
                             EncodeBackendKind::Software,
                         )));
                         Rec::Prepare(request, preferred_backend)
@@ -642,12 +631,17 @@ mod tests {
         std::thread::spawn(move || {
             while let Some(cmd) = rx.blocking_recv() {
                 match cmd {
-                    ControlCommand::PrepareEncoder { request, reply, .. } => {
+                    ControlCommand::PrepareEncoder {
+                        request,
+                        codec,
+                        reply,
+                        ..
+                    } => {
                         let _ = entry_tx.send(());
                         let _ = release_rx.recv();
                         let _ = reply.send(Ok((
-                            request.derive(),
-                            request.codec,
+                            request.derive(codec),
+                            codec,
                             EncodeBackendKind::Software,
                         )));
                     }
@@ -699,12 +693,9 @@ mod tests {
     }
 
     /// 内容驱动档位：硬件路径按请求档位生效；软编路径退化为 min(Content, 1080p)@60。
-    /// codec 由偏好解析（见 `test_resolve_codec_with_sdp`），本用例钉几何/bpp/钳制
+    /// 请求只承载几何/bpp；codec 由偏好独立解析（见 `test_resolve_codec_with_sdp`）
     #[test]
     fn test_negotiate_profile_codec_hierarchy() {
-        let offer_h264 = RTCSessionDescription::offer(
-            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\na=rtpmap:102 H264/90000\r\n".to_string()
-        ).unwrap();
         let offer_av1 = RTCSessionDescription::offer(
             "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 AV1/90000\r\n".to_string()
         ).unwrap();
@@ -715,43 +706,33 @@ mod tests {
             gpu_name: String::new(),
         };
 
-        // 硬件路径按内容档位生效（offer 提供 AV1 且硬件支持 → auto 首选 AV1）
-        let r = resolve_initial_request(1920, 1080, 60, None, &offer_av1, Some(&av1_probe), None)
-            .expect("可行偏好必须成功");
-        assert_eq!(r.codec, VideoCodec::Av1);
+        // 硬件路径（offer 提供 AV1 且硬件支持 → auto 首选 AV1）：请求按内容档位生效
+        let codec =
+            resolve_codec(Some(&offer_av1), Some(&av1_probe), None).expect("可行偏好必须成功");
+        assert_eq!(codec, VideoCodec::Av1);
+        let r = resolve_initial_request(1920, 1080, 60, None, Some(&av1_probe));
         assert_eq!((r.width, r.height, r.fps), (1920, 1080, 60));
 
         // 软编钳制只缩不放：大内容缩进 1080p，小内容原样保留
-        let r = resolve_initial_request(3840, 2160, 240, None, &offer_av1, None, None)
-            .expect("auto 协商必须成功");
+        let r = resolve_initial_request(3840, 2160, 240, None, None);
         assert_eq!((r.width, r.height, r.fps), (1920, 1080, 60));
-        let r = resolve_initial_request(800, 600, 90, None, &offer_av1, None, None)
-            .expect("auto 协商必须成功");
+        let r = resolve_initial_request(800, 600, 90, None, None);
         assert_eq!((r.width, r.height, r.fps), (800, 600, 60));
 
         // offer 携带的 bpp 进入请求
-        let r = resolve_initial_request(
-            1920,
-            1080,
-            60,
-            Some(0.2),
-            &offer_h264,
-            Some(&av1_probe),
-            None,
-        )
-        .expect("可行偏好必须成功");
+        let r = resolve_initial_request(1920, 1080, 60, Some(0.2), Some(&av1_probe));
         assert_eq!(r.bpp, 0.2);
     }
 
-    /// 档位 ask 事务：成功返回实际档位、无会话与 0 几何/帧率显式拒绝
+    /// 档位 ask 事务：成功返回实际档位、无会话与 0 几何/帧率显式拒绝。
+    /// 请求不携带 codec——它是协商定死的会话常量
     #[tokio::test]
     async fn test_apply_profile_ask_transaction() {
         let (mgr, _rx) = make_test_engine(false);
-        let codec = VideoCodec::H264;
 
         // 无活跃会话：NoSession
         assert!(matches!(
-            mgr.apply_profile(1920, 1080, 60, 0.2, codec).await,
+            mgr.apply_profile(1920, 1080, 60, 0.2).await,
             ProfileApply::NoSession
         ));
 
@@ -766,26 +747,23 @@ mod tests {
         .await
         .unwrap();
 
-        // 成功路径：假 Actor 回显请求档位，codec 随请求原样带出
-        let ProfileApply::Applied(applied, applied_codec) =
-            mgr.apply_profile(1600, 900, 90, 0.2, codec).await
-        else {
+        // 成功路径：假 Actor 回显请求档位
+        let ProfileApply::Applied(applied) = mgr.apply_profile(1600, 900, 90, 0.2).await else {
             panic!("活跃会话上的合法请求必须生效");
         };
         assert_eq!(
             (applied.width(), applied.height(), applied.fps()),
             (1600, 900, 90)
         );
-        assert_eq!(applied_codec, codec);
 
         // 0 几何（暂停信号）按拒绝处理，不捏造最小档位
-        let ProfileApply::Rejected = mgr.apply_profile(0, 0, 60, 0.2, codec).await else {
+        let ProfileApply::Rejected = mgr.apply_profile(0, 0, 60, 0.2).await else {
             panic!("0 几何必须被拒绝");
         };
 
         // 帧率为 0 同样拒绝
         assert!(matches!(
-            mgr.apply_profile(1600, 900, 0, 0.2, codec).await,
+            mgr.apply_profile(1600, 900, 0, 0.2).await,
             ProfileApply::Rejected
         ));
     }

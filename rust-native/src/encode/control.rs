@@ -50,10 +50,6 @@ pub(crate) enum ControlStatus {
     ReleaseFailed = 8,
 }
 
-/// 重定档回执：Actor 实际生效的档位与 codec。
-/// 后端身份不在回执里：它只在协商时确定并变更（`PrepareEncoder` 的回执是唯一上报点）
-pub(crate) type RetierReceipt = Result<(StreamingProfile, VideoCodec), ControlStatus>;
-
 /// 控制命令
 ///
 /// 形状即纪律：tell 变体不带应答（投递即完成），ask 变体自带一次性应答通道。因此
@@ -68,15 +64,16 @@ pub(crate) enum ControlCommand {
     /// 挂起一次关键帧请求：下一帧以 IDR 编码（tell）
     /// 请求是幂等意图而非逐条事件：重复投递在消费点塌缩成一个挂起标志
     RequestKeyframe,
-    /// 按定档请求重定档位，回送实际生效的档位与 codec 或拒绝原因
+    /// 按定档请求重定档位，回送实际生效的档位或拒绝原因
     Retier {
         request: TierRequest,
-        reply: tokio::sync::oneshot::Sender<RetierReceipt>,
+        reply: tokio::sync::oneshot::Sender<Result<StreamingProfile, ControlStatus>>,
     },
-    /// 按定档请求与后端偏好配好编码器，回送实际生效的档位、codec 与后端身份
-    /// （硬编建败回退软编如实上报）
+    /// 协商落账：按定档请求与协商定死的 codec/后端偏好配好编码器，回送实际生效的
+    /// 档位、codec 与后端身份（硬编建败回退软编如实上报）
     PrepareEncoder {
         request: TierRequest,
+        codec: VideoCodec,
         preferred_backend: Option<EncodeBackendKind>,
         reply: tokio::sync::oneshot::Sender<
             Result<(StreamingProfile, VideoCodec, EncodeBackendKind), ControlStatus>,
@@ -143,11 +140,14 @@ impl ControlSender {
 
     /// 请求重定档位（ask）
     ///
-    /// `Ok` 是 Actor **实际生效**的档位与 codec：调用方提交 Actor 说的准，
-    /// 而不是「成功就假定请求生效、失败就回读旧值」这套两阶段推断。
-    /// `Err(ReconfigureFailed)` 表示 Actor 拒绝了这次重定档、
-    /// 维持原档位；其余错误码表示命令没送达或应答超时，调用方同样维持已知档位。
-    pub(crate) async fn retier(&self, request: TierRequest) -> RetierReceipt {
+    /// `Ok` 是 Actor **实际生效**的档位：调用方提交 Actor 说的准，而不是
+    /// 「成功就假定请求生效、失败就回读旧值」这套两阶段推断。`Err(ReconfigureFailed)`
+    /// 表示 Actor 拒绝了这次重定档、维持原档位；其余错误码表示命令没送达或应答超时，
+    /// 调用方同样维持已知档位。
+    pub(crate) async fn retier(
+        &self,
+        request: TierRequest,
+    ) -> Result<StreamingProfile, ControlStatus> {
         let (reply, wait) = tokio::sync::oneshot::channel();
         self.send(ControlCommand::Retier { request, reply })
             .map_err(Self::send_error)?;
@@ -158,18 +158,20 @@ impl ControlSender {
         }
     }
 
-    /// 按定档请求把编码器配好（ask）：新会话接入、顶号、预热都走这一条
+    /// 协商落账：按定档请求把编码器配好（ask），新会话接入、顶号、预热都走这一条
     ///
-    /// 后端偏好随命令携带（`None` = 自动，按能力快照默认胜者）；`Ok` 才代表已就绪，
-    /// 档位、codec 与后端都是实际生效值——硬编建败回退软编时如实携带回退值，调用方不必靠猜
+    /// codec 与后端偏好随命令携带（偏好 `None` = 自动）；`Ok` 才代表已就绪，档位、
+    /// codec 与后端都是实际生效值——硬编建败回退软编时如实携带回退值，调用方不必靠猜
     pub(crate) async fn prepare_encoder(
         &self,
         request: TierRequest,
+        codec: VideoCodec,
         preferred_backend: Option<EncodeBackendKind>,
     ) -> Result<(StreamingProfile, VideoCodec, EncodeBackendKind), ControlStatus> {
         let (reply, wait) = tokio::sync::oneshot::channel();
         self.send(ControlCommand::PrepareEncoder {
             request,
+            codec,
             preferred_backend,
             reply,
         })
@@ -295,7 +297,7 @@ mod tests {
                     let _ = reply.send(ControlStatus::Ok);
                 }
                 ControlCommand::Retier { reply, .. } => {
-                    let _ = reply.send(Ok((StreamingProfile::default(), VideoCodec::H264)));
+                    let _ = reply.send(Ok(StreamingProfile::default()));
                 }
                 ControlCommand::Shutdown
                 | ControlCommand::BitrateChange(_)
@@ -390,21 +392,23 @@ mod tests {
         drop(held);
     }
 
-    /// 后端偏好随命令逐次携带：偏好值必须真的送达 Actor，否则「指定后端」只是注释
+    /// 后端偏好随命令逐次携带：偏好值必须真的送达 Actor，否则「指定后端」只是注释。
+    /// codec 同为协商定死的随命令事实，一并钉住送达
     #[test]
     fn test_prepare_encoder_carries_backend_preference() {
         let (recorded_tx, recorded_rx) = std::sync::mpsc::channel();
         let sender = fake_actor(move |cmd| {
             if let ControlCommand::PrepareEncoder {
+                codec,
                 preferred_backend,
                 reply,
                 ..
             } = cmd
             {
-                let _ = recorded_tx.send(preferred_backend);
+                let _ = recorded_tx.send((codec, preferred_backend));
                 let _ = reply.send(Ok((
                     StreamingProfile::default(),
-                    VideoCodec::H264,
+                    codec,
                     EncodeBackendKind::Software,
                 )));
             }
@@ -414,11 +418,14 @@ mod tests {
             height: 720,
             fps: 60,
             bpp: 0.1,
-            codec: VideoCodec::H264,
         };
         let rt = tokio::runtime::Runtime::new().expect("测试 runtime 必须能建起来");
         assert_eq!(
-            rt.block_on(sender.prepare_encoder(request, Some(EncodeBackendKind::Nvenc))),
+            rt.block_on(sender.prepare_encoder(
+                request,
+                VideoCodec::H264,
+                Some(EncodeBackendKind::Nvenc)
+            )),
             Ok((
                 StreamingProfile::default(),
                 VideoCodec::H264,
@@ -427,8 +434,8 @@ mod tests {
         );
         assert_eq!(
             recorded_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            Some(EncodeBackendKind::Nvenc),
-            "随命令携带的后端偏好必须送达 Actor"
+            (VideoCodec::H264, Some(EncodeBackendKind::Nvenc)),
+            "随命令携带的 codec 与后端偏好必须送达 Actor"
         );
     }
 
@@ -441,7 +448,7 @@ mod tests {
         std::thread::spawn(move || {
             while let Some(cmd) = rx.blocking_recv() {
                 if let ControlCommand::Retier { reply, .. } = cmd {
-                    let _ = reply.send(Ok((applied, VideoCodec::H264)));
+                    let _ = reply.send(Ok(applied));
                 }
             }
         });
@@ -451,15 +458,17 @@ mod tests {
             height: 720,
             fps: 60,
             bpp: 0.1,
-            codec: VideoCodec::H264,
         };
-        let (got, codec) = ControlSender::new(tx, bell)
+        let got = ControlSender::new(tx, bell)
             .retier(request)
             .await
             .expect("假 Actor 应答过，必须拿到值");
-        assert_ne!(got, request.derive(), "应答不得是请求值的回显");
+        assert_ne!(
+            got,
+            request.derive(VideoCodec::H264),
+            "应答不得是请求值的回显"
+        );
         assert_eq!(got, applied, "应答必须是 Actor 实际生效的档位");
-        assert_eq!(codec, VideoCodec::H264);
     }
 
     /// Actor 拒绝重定档时，拒绝原因必须跨过接口，而不是让调用方比对档位去猜
@@ -481,7 +490,6 @@ mod tests {
                 height: 720,
                 fps: 60,
                 bpp: 0.1,
-                codec: VideoCodec::H264,
             })
             .await
             .expect_err("拒绝必须原样上报，不得折成「维持原档位」让调用方自己推断");

@@ -27,12 +27,12 @@ import java.util.concurrent.locks.LockSupport;
  *       纯内存算术，无锁无阻塞），事件落 latest-wins 槽位并唤醒工作线程；暂停事件在客户端
  *       线程就地分发。无会话时经 {@link #seedContentSnapshot} 仅更新快照，供 offer 规划使用。
  *       稳定窗状态（lastSeenAtNanos / seenDirty / paused）只由客户端线程读写</li>
- *   <li>信令线程经三个入口落位会话事件：{@link #noteOfferAnswer}（offer 落账）、
+ *   <li>信令线程经三个入口落位会话事件：{@link #noteOfferAnswer}（offer 落账 → 建立事件）、
  *       {@link #onClientSettings}（外部偏好变更：视口 / BPP 任一变化立即落槽位）、
- *       {@link #onSessionClosed}（关闭复位）。lastAttempted 的跨线程写只发生在
+ *       {@link #onSessionClosed}（关闭复位 → 关闭事件）。lastAttempted 的跨线程写只发生在
  *       offer 落账与 ask 记账——Java 引用写原子，最坏滞后一帧重放行一次</li>
  *   <li>工作线程串行执行阻塞 ask（{@link Applier}，即 JNI {@code applyProfile}），
- *       应答 JSON 是档位的唯一事实源，结果广播给全部已注册监听器</li>
+ *       应答 JSON 是档位的唯一事实源，档位变化事件广播给全部已注册监听器</li>
  * </ul>
  *
  * <p>拒绝不自动重试：目标统一记为已尝试，避免编码器持续拒绝时的风暴；
@@ -83,14 +83,14 @@ public final class ProfileCoordinator {
      * 返回应答 JSON（成功时含实际生效档位）；无会话 / 引擎未启动 / 请求被拒返回空串或 null
      */
     public interface Applier {
-        String apply(int width, int height, int fps, double bpp, String codec);
+        String apply(int width, int height, int fps, double bpp);
     }
 
     private final Applier applier;
-    // 状态监听器：写少读多，广播来自工作线程 / 渲染线程 / 信令线程，各自跳线程
-    private final List<Consumer<SessionServer.SessionState>> listeners = new CopyOnWriteArrayList<>();
-    // latest-wins 槽位直接存待下发状态（内容变更与 BPP 变更同型，拖动风暴自动合并）
-    private final AtomicReference<SessionServer.SessionState> pending = new AtomicReference<>(null);
+    // 事件监听器：写少读多，广播来自工作线程 / 渲染线程 / 信令线程，各自跳线程
+    private final List<Consumer<SessionServer.SessionEvent>> listeners = new CopyOnWriteArrayList<>();
+    // latest-wins 槽位直接存待下发档位
+    private final AtomicReference<SessionServer.Tier> pending = new AtomicReference<>(null);
     private final Thread worker;
     private volatile boolean stopped = false;
     // 视口物理像素上限（网页端算好 CSS × DPR），0 = 无上限；两字段独立写，
@@ -98,16 +98,15 @@ public final class ProfileCoordinator {
     private volatile int viewportWidth = 0;
     private volatile int viewportHeight = 0;
     /**
-     * 最近一次实际生效的档位
+     * 最近一次实际生效的档位；null = 无会话
      * 换代必换实例——在途 ask 结账按引用同一性作废，值相等不代表同一会话
      */
-    private final AtomicReference<SessionServer.SessionState> lastApplied =
-            new AtomicReference<>(SessionServer.SessionState.INACTIVE);
+    private final AtomicReference<SessionServer.Tier> lastTier = new AtomicReference<>(null);
     // ---- 内容稳定计时：lastSeenAtNanos/seenDirty 只由渲染线程读写；lastAttempted 另有信令线程记账 ----
     private volatile ContentSnapshot latestSnapshot = ContentSnapshot.EMPTY;
     private long lastSeenAtNanos = 0L;
     private boolean seenDirty = false;
-    private SessionServer.SessionState lastAttempted = null;
+    private SessionServer.Tier lastAttempted = null;
     private volatile boolean paused = false;
 
     /**
@@ -117,7 +116,7 @@ public final class ProfileCoordinator {
      *                （ask 恒无应答，旧档继续生效）
      */
     public ProfileCoordinator(Applier applier) {
-        this.applier = applier != null ? applier : (width, height, fps, bpp, codec) -> null;
+        this.applier = applier != null ? applier : (width, height, fps, bpp) -> null;
         this.worker = new Thread(this::runLoop, "vistrel-profile-worker");
         this.worker.setDaemon(true);
     }
@@ -125,21 +124,21 @@ public final class ProfileCoordinator {
     /**
      * 单监听器便捷构造：等同构造后立即 {@link #addListener}，测试与简单装配用
      *
-     * @param applier  阻塞 ask 出口，语义同主构造（{@code null} 等同空实现）
-     * @param listener 初始状态监听器；{@code null} 时不注册
+     * @param applier 阻塞 ask 出口，语义同主构造（{@code null} 等同空实现）
+     * @param listener 初始事件监听器；{@code null} 时不注册
      */
-    public ProfileCoordinator(Applier applier, Consumer<SessionServer.SessionState> listener) {
+    public ProfileCoordinator(Applier applier, Consumer<SessionServer.SessionEvent> listener) {
         this(applier);
         addListener(listener);
     }
 
     /**
-     * 注册状态消费者：只收生效状态（STREAMING 落账 / PAUSED 内容丢失 / INACTIVE 关闭），
+     * 注册事件消费者
      * 拒绝不外报——旧档继续生效，流本身没有变化，浏览器以视频元素与 getStats 自观测
      *
-     * @param listener 状态消费者；{@code null} 忽略不注册，重复注册重复收
+     * @param listener 事件消费者；{@code null} 忽略不注册，重复注册重复收
      */
-    public void addListener(Consumer<SessionServer.SessionState> listener) {
+    public void addListener(Consumer<SessionServer.SessionEvent> listener) {
         if (listener != null) {
             listeners.add(listener);
         }
@@ -180,9 +179,10 @@ public final class ProfileCoordinator {
             // 同时清去重锚：恢复时目标常与暂停前一字不差，必须照常下发以重建采集
             seenDirty = false;
             lastAttempted = null;
-            if (!paused) {
+            SessionServer.Tier live = lastTier.get();
+            if (!paused && live != null) {
                 paused = true;
-                broadcast(lastApplied.get().paused());
+                broadcast(new SessionServer.SessionEvent.TierChanged(SessionServer.SessionEvent.Phase.PAUSED, live));
             }
             return;
         }
@@ -201,7 +201,7 @@ public final class ProfileCoordinator {
         seenDirty = false;
         paused = false;
         // latestSnapshot 此刻已是本次快照，plan 直读内部状态
-        SessionServer.SessionState target = plan(viewportWidth, viewportHeight, currentBpp());
+        SessionServer.Tier target = plan(viewportWidth, viewportHeight, currentBpp());
         if (target.equals(lastAttempted)) {
             return;
         }
@@ -252,25 +252,26 @@ public final class ProfileCoordinator {
         if (bpp != null) {
             double requested = clampBpp(bpp);
             if (!isBppInRange(requested)) {
-                Constants.LOG.warn("BPP 请求越界 ({})，保持旧档 {}", requested, lastApplied.get());
-            } else if (requested != currentBpp() && lastApplied.get().active()) {
+                Constants.LOG.warn("BPP 请求越界 ({})，保持旧档 {}", requested, lastTier.get());
+            } else if (requested != currentBpp() && lastTier.get() != null) {
                 requestedBpp = requested;
                 bppChanged = true;
             }
         }
         // 未协商（offer 未落账）时不主动 ask：内容由 offer 的初始规划生效。
         // 会话活跃即基线已种入，此处读 lastAttempted 恒非空
-        if ((viewportChanged || bppChanged) && lastApplied.get().active()) {
+        if ((viewportChanged || bppChanged) && lastTier.get() != null) {
             submit(planForSettings(requestedBpp));
         }
     }
 
     /**
-     * 当前生效的 BPP：取自最近一次生效快照——纯码率重配不会被编码器拒绝，请求值与生效值
-     * 无分叉；未协商时 INACTIVE 自带滑杆下限
+     * 当前生效的 BPP：取自最近一次生效档位——纯码率重配不会被编码器拒绝，请求值与生效值
+     * 无分叉；未协商时取下限
      */
     private double currentBpp() {
-        return lastApplied.get().bpp();
+        SessionServer.Tier tier = lastTier.get();
+        return tier != null ? tier.bpp() : MIN_BPP;
     }
 
     /**
@@ -291,9 +292,9 @@ public final class ProfileCoordinator {
      * @param viewportWidth  视口物理像素上限，0 = 无上限
      * @param viewportHeight 视口物理像素上限，0 = 无上限
      * @param bpp            请求画质档位 (BPP)
-     * @return 档位请求（active 位恒 true，只作为 ask 请求下发），并非最终生效档位
+     * @return 档位请求，只作为 ask 目标下发，并非最终生效档位
      */
-    public SessionServer.SessionState plan(int viewportWidth, int viewportHeight, double bpp) {
+    public SessionServer.Tier plan(int viewportWidth, int viewportHeight, double bpp) {
         ContentSnapshot snapshot = latestSnapshot;
         int width;
         int height;
@@ -327,84 +328,73 @@ public final class ProfileCoordinator {
                 }
             }
         }
-        // 请求态：active 位固定 true（规划结果只作为 ask 请求），codec 与 backend 由
-        // offer 应答决定，会话前为占位值，不会被 ask 消费
-        return new SessionServer.SessionState(
-                SessionServer.SessionState.Phase.STREAMING,
-                width,
-                height,
-                fps,
-                clampBpp(bpp),
-                lastApplied.get().codec(),
-                lastApplied.get().backend()
-        );
+        return new SessionServer.Tier(width, height, fps, clampBpp(bpp));
     }
 
     /**
-     * 信令线程入口：offer 协商成功的 Answer 落账。Answer JSON 自行解析（与阻塞 ask
-     * 应答同形状，解析器只有一份），种入 lastApplied / bpp 基线并经 listener 广播
-     * 初始档位——渲染侧管线落地、音频会话同步与会话接入提示都从这条链走；
+     * 信令线程入口：offer 协商成功的 Answer 落账。应答携带协商定死的后端身份与初始档位，
      * 此后内容 / BPP 请求以该基线为去重锚
      */
     public void noteOfferAnswer(String answerJson, double requestedBpp) {
         if (stopped) {
             return;
         }
-        SessionServer.SessionState applied = parseApplied(answerJson, SessionServer.SessionState.BACKEND_UNKNOWN);
-        if (applied == null) {
-            Constants.LOG.warn("Answer 解析失败，档位基线保持未种");
+        JsonObject obj;
+        try {
+            obj = JsonParser.parseString(answerJson).getAsJsonObject();
+        } catch (Exception e) {
+            Constants.LOG.warn("Answer 解析失败，档位基线保持未种: {}", e.getMessage());
             return;
         }
-        // 落账即换代：parseApplied 恒产新实例，在途 ask 结账按引用同一性作废
-        lastApplied.set(applied);
-        lastAttempted = new SessionServer.SessionState(
-                SessionServer.SessionState.Phase.STREAMING,
-                applied.width(),
-                applied.height(),
-                applied.fps(),
-                clampBpp(requestedBpp),
-                applied.codec(),
-                applied.backend()
-        );
-        broadcast(applied);
+        SessionServer.Tier applied = tierFrom(obj);
+        if (applied == null) {
+            Constants.LOG.warn("Answer 档位字段缺失，基线保持未种");
+            return;
+        }
+        String backend =
+                obj.has("backend") && !obj.get("backend").isJsonNull() ? obj.get("backend").getAsString() : null;
+        // 落账即换代：新实例替换基线，在途 ask 结账按引用同一性作废
+        lastTier.set(applied);
+        lastAttempted = new SessionServer.Tier(applied.width(), applied.height(), applied.fps(), clampBpp(requestedBpp));
+        broadcast(new SessionServer.SessionEvent.Established(backend, applied));
     }
 
     /**
      * 信令线程入口：会话关闭（WS 断开）复位基线并清空待办，
      * 使迟到的内容事件按「无活跃会话」处理而不是沿用已失效的值
      *
-     * <p>关闭必须无条件广播 INACTIVE：内容已暂停时 listener 已处于暂停相位，
+     * <p>关闭必须无条件广播：内容已暂停时 listener 已处于暂停相位，
      * 去重会让这次复位丢失（音频不停、sessionActive 不复位）
      */
     public void onSessionClosed() {
         if (stopped) {
             return;
         }
-        // 复位即换代：基线换回 INACTIVE 常量，与在途 ask 捕获的活跃实例引用必不相同
-        lastApplied.set(SessionServer.SessionState.INACTIVE);
+        // 复位即换代：基线清空，与在途 ask 捕获的活跃实例引用必不相同
+        lastTier.set(null);
         pending.set(null);
-        broadcast(SessionServer.SessionState.INACTIVE);
+        broadcast(new SessionServer.SessionEvent.Closed());
     }
 
-    private void broadcast(SessionServer.SessionState state) {
-        for (Consumer<SessionServer.SessionState> listener : listeners) {
+    private void broadcast(SessionServer.SessionEvent event) {
+        for (Consumer<SessionServer.SessionEvent> listener : listeners) {
             try {
-                listener.accept(state);
+                listener.accept(event);
             } catch (Throwable t) {
                 // 单消费者异常不得截断广播（关闭 / 暂停必须到达其余消费者）
-                Constants.LOG.error("会话状态监听器异常", t);
+                Constants.LOG.error("会话事件监听器异常", t);
             }
         }
     }
 
-    private void submit(SessionServer.SessionState state) {
-        pending.set(state);
+    private void submit(SessionServer.Tier tier) {
+        pending.set(tier);
         LockSupport.unpark(worker);
     }
 
     private void runLoop() {
         while (!stopped) {
-            SessionServer.SessionState apply = pending.getAndSet(null);
+            SessionServer.Tier apply = pending.getAndSet(null);
             if (apply == null) {
                 // park 前的投递由 unpark 许可兜住：不会漏任务也不会永久睡眠
                 LockSupport.park(this);
@@ -423,26 +413,18 @@ public final class ProfileCoordinator {
      * （bpp 下降可经 level 预算把被压低的帧率拿回来，视口收缩立即降采样）；
      * 暂停中 / 无快照时保持实际生效的几何与帧率，绝不借回退档位抬几何
      */
-    private SessionServer.SessionState planForSettings(double bpp) {
+    private SessionServer.Tier planForSettings(double bpp) {
         ContentSnapshot snapshot = latestSnapshot;
         if (!snapshot.hasFramebuffer()) {
-            SessionServer.SessionState applied = lastApplied.get();
-            return new SessionServer.SessionState(
-                    SessionServer.SessionState.Phase.STREAMING,
-                    applied.width(),
-                    applied.height(),
-                    applied.fps(),
-                    bpp,
-                    applied.codec(),
-                    applied.backend()
-            );
+            SessionServer.Tier applied = lastTier.get();
+            return new SessionServer.Tier(applied.width(), applied.height(), applied.fps(), bpp);
         }
         return plan(viewportWidth, viewportHeight, bpp);
     }
 
-    private void applyTarget(SessionServer.SessionState target) {
-        SessionServer.SessionState before = lastApplied.get();
-        if (!before.active()) {
+    private void applyTarget(SessionServer.Tier target) {
+        SessionServer.Tier before = lastTier.get();
+        if (before == null) {
             lastAttempted = target;
             return;
         }
@@ -451,58 +433,53 @@ public final class ProfileCoordinator {
         if (target.equals(lastAttempted)) {
             return;
         }
-        String json = applier.apply(target.width(), target.height(), target.fps(), target.bpp(), target.codec());
-        if (lastApplied.get() != before) {
+        String json = applier.apply(target.width(), target.height(), target.fps(), target.bpp());
+        if (lastTier.get() != before) {
             // ask 期间换代（关闭复位 / 新 offer 落账）
             return;
         }
-        SessionServer.SessionState parsed = json == null || json.isEmpty() ? null : parseApplied(json, before.backend());
+        SessionServer.Tier parsed = json == null || json.isEmpty() ? null : parseTierReply(json);
         if (parsed == null) {
             // 无会话 / 应答不可解析：旧档继续生效，基线保持不动
             lastAttempted = target;
-            Constants.LOG.warn("档位 ask 无应答（{}），保持旧档 {}", target, lastApplied.get());
+            Constants.LOG.warn("档位 ask 无应答（{}），保持旧档 {}", target, lastTier.get());
             return;
         }
         // CAS 失败说明应答属于旧会话，连同广播一并作废。
-        if (!lastApplied.compareAndSet(before, parsed)) {
+        if (!lastTier.compareAndSet(before, parsed)) {
             return;
         }
         lastAttempted = target;
-        broadcast(parsed);
+        broadcast(new SessionServer.SessionEvent.TierChanged(SessionServer.SessionEvent.Phase.STREAMING, parsed));
     }
 
     /**
-     * 解析 JNI 应答：字段恒为「仍在生效」的实际档位——拒绝 / 无会话由 Native 回空串，
-     * 解析失败即 null。backend 为可选字段：缺失时按未知处理
+     * 应答 JSON 的公共档位字段（协商应答与档位 ask 应答同形）：缺任一字段即 null
      */
-    /**
-     * 解析 JNI 应答：字段恒为「仍在生效」的实际档位——拒绝 / 无会话由 Native 回空串，
-     * 解析失败即 null。后端身份只在协商应答里携带（身份只在协商时确定并变更）：
-     * 协商落账传未知值兜底，档位 ask 传基线的协商值
-     *
-     * @param fallbackBackend 应答未携带 backend 时的后端身份
-     */
-    private SessionServer.SessionState parseApplied(String json, String fallbackBackend) {
+    private static SessionServer.Tier tierFrom(JsonObject obj) {
         try {
-            JsonObject obj = JsonParser.parseString(json).getAsJsonObject();
-            int width = obj.get("width").getAsInt();
-            int height = obj.get("height").getAsInt();
-            int fps = obj.get("fps").getAsInt();
-            double bpp = obj.has("bpp") ? obj.get("bpp").getAsDouble() : MIN_BPP;
-            String codec = obj.get("codec").getAsString();
-            String backend =
-                    obj.has("backend") && !obj.get("backend").isJsonNull()
-                    ? obj.get("backend").getAsString()
-                    : fallbackBackend;
-            return new SessionServer.SessionState(
-                    SessionServer.SessionState.Phase.STREAMING,
-                    width,
-                    height,
-                    fps,
-                    bpp,
-                    codec,
-                    backend
+            return new SessionServer.Tier(
+                    obj.get("width").getAsInt(),
+                    obj.get("height").getAsInt(),
+                    obj.get("fps").getAsInt(),
+                    obj.has("bpp") ? obj.get("bpp").getAsDouble() : MIN_BPP
             );
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 解析 JNI 档位 ask 应答：字段恒为「仍在生效」的实际档位——拒绝 / 无会话由 Native
+     * 回空串，解析失败即 null。
+     */
+    private SessionServer.Tier parseTierReply(String json) {
+        try {
+            SessionServer.Tier tier = tierFrom(JsonParser.parseString(json).getAsJsonObject());
+            if (tier == null) {
+                Constants.LOG.warn("档位应答 JSON 字段缺失");
+            }
+            return tier;
         } catch (Exception e) {
             Constants.LOG.warn("档位应答 JSON 解析失败: {}", e.getMessage());
             return null;

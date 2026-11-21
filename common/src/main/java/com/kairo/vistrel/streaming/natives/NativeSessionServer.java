@@ -147,7 +147,7 @@ public final class NativeSessionServer implements SessionServer {
     }
 
     @Override
-    public String applyProfile(int width, int height, int fps, double bpp, String codec) {
-        return NativeBridge.applyProfile(width, height, fps, bpp, codec);
+    public String applyProfile(int width, int height, int fps, double bpp) {
+        return NativeBridge.applyProfile(width, height, fps, bpp);
     }
 }

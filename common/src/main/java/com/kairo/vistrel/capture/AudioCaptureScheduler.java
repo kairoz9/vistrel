@@ -2,7 +2,7 @@ package com.kairo.vistrel.capture;
 
 import com.kairo.vistrel.Constants;
 import com.kairo.vistrel.streaming.EncoderChannel;
-import com.kairo.vistrel.streaming.SessionServer.SessionState;
+import com.kairo.vistrel.streaming.SessionServer.SessionEvent;
 import org.lwjgl.openal.ALC10;
 import org.lwjgl.openal.SOFTLoopback;
 import org.lwjgl.system.MemoryStack;
@@ -151,19 +151,19 @@ public class AudioCaptureScheduler {
     }
 
     /**
-     * 会话广播入口（经 {@code ProfileCoordinator} 的监听回调触发）：INACTIVE 停止投递
-     * （采集线程挂起待命，不退出）；PAUSED 会话仍在线，音频保持原状；活跃会话置位、
-     * 启动采集线程并在 context 已就绪时即刻唤醒节拍循环
+     * 会话事件入口（经 {@code ProfileCoordinator} 的监听回调触发）：关闭事件停止投递
+     * （采集线程挂起待命，不退出）；内容暂停（PAUSED）会话仍在线，音频保持原状；
+     * 建立与档位变化（会话活跃）置位、启动采集线程并在 context 已就绪时即刻唤醒节拍循环
      *
-     * @param state 最新会话状态快照
+     * @param event 最新会话控制面事件
      */
-    public void onSessionChanged(SessionState state) {
-        if (state.phase() == SessionState.Phase.INACTIVE) {
+    public void onSessionEvent(SessionEvent event) {
+        if (event instanceof SessionEvent.Closed) {
             this.isStreaming = false;
             return;
         }
         // 内容暂停（PAUSED）：会话仍在线，音频保持原状
-        if (!state.active()) {
+        if (event instanceof SessionEvent.TierChanged tierChanged && tierChanged.phase() == SessionEvent.Phase.PAUSED) {
             return;
         }
         this.isStreaming = true;

@@ -106,17 +106,20 @@ class SignalingServerTest {
     }
 
     /**
-     * 协调器监听记录：Answer 落账广播的初始档位（生效事件）
+     * 协调器监听记录：Answer 落账广播的建立事件与档位变化事件（生效档位）
      */
     private static final class RecordingWorkerListener
-            implements java.util.function.Consumer<SessionServer.SessionState>
+            implements java.util.function.Consumer<SessionServer.SessionEvent>
     {
-        final List<SessionServer.SessionState> applied = new CopyOnWriteArrayList<>();
+        final List<SessionServer.Tier> applied = new CopyOnWriteArrayList<>();
 
         @Override
-        public void accept(SessionServer.SessionState state) {
-            if (state.active()) {
-                applied.add(state);
+        public void accept(SessionServer.SessionEvent event) {
+            if (event instanceof SessionServer.SessionEvent.Established established) {
+                applied.add(established.tier());
+            } else if (event instanceof SessionServer.SessionEvent.TierChanged tierChanged
+                    && tierChanged.phase() == SessionServer.SessionEvent.Phase.STREAMING) {
+                applied.add(tierChanged.tier());
             }
         }
     }
@@ -485,7 +488,7 @@ class SignalingServerTest {
      */
     private static ProfileCoordinator newWorker(
             ProfileCoordinator.ContentSnapshot snapshot,
-            java.util.function.Consumer<SessionServer.SessionState> listener,
+            java.util.function.Consumer<SessionServer.SessionEvent> listener,
             ProfileCoordinator.Applier applier
     ) {
         ProfileCoordinator worker = new ProfileCoordinator(applier, listener);
@@ -498,7 +501,7 @@ class SignalingServerTest {
     /**
      * 恒返 null 的假 Applier：只观察规划与落账路径，不经真实编码 ask
      */
-    private static String nullApplier(int width, int height, int fps, double bpp, String codec) {
+    private static String nullApplier(int width, int height, int fps, double bpp) {
         return null;
     }
 
@@ -533,15 +536,7 @@ class SignalingServerTest {
         Assertions.assertEquals("vulkan_video", rec.offerBackend.get(), "后端偏好原样进入协商");
         // Answer 落账：委托返回的 fake answer（1920×1080@60，nvenc）成为生效基线并广播
         Assertions.assertEquals(
-                new SessionServer.SessionState(
-                        SessionServer.SessionState.Phase.STREAMING,
-                        1920,
-                        1080,
-                        60,
-                        0.1,
-                        "H264",
-                        "nvenc"
-                ),
+                new SessionServer.Tier(1920, 1080, 60, 0.1),
                 listener.applied.get(0),
                 "Answer 必须经协调器落账广播初始档位（含后端身份透传）"
         );
@@ -589,11 +584,10 @@ class SignalingServerTest {
         server.setPassword("pass123");
         java.util.concurrent.CountDownLatch askLatch = new java.util.concurrent.CountDownLatch(1);
         AtomicReference<String> seenRequest = new AtomicReference<>();
-        ProfileCoordinator worker = newWorker(null, new RecordingWorkerListener(), (w, h, f, b, c) -> {
+        ProfileCoordinator worker = newWorker(null, new RecordingWorkerListener(), (w, h, f, b) -> {
             seenRequest.set(w + "x" + h + "@" + f + " bpp=" + b);
             askLatch.countDown();
-            return "{\"width\":1920,\"height\":1080,\"fps\":60,\"bpp\":0.25,"
-                    + "\"bitrate\":4000000,\"codec\":\"H264\"}";
+            return "{\"width\":1920,\"height\":1080,\"fps\":60,\"bpp\":0.25,\"bitrate\":4000000}";
         });
         worker.start();
         server.setProfileCoordinator(worker);
@@ -618,7 +612,7 @@ class SignalingServerTest {
         SignalingServer server = new SignalingServer(rec);
         server.setPassword("pass123");
         AtomicReference<String> seenRequest = new AtomicReference<>();
-        server.setProfileCoordinator(newWorker(null, new RecordingWorkerListener(), (w, h, f, b, c) -> {
+        server.setProfileCoordinator(newWorker(null, new RecordingWorkerListener(), (w, h, f, b) -> {
             seenRequest.set(w + "x" + h + "@" + f + " bpp=" + b);
             return null;
         }));

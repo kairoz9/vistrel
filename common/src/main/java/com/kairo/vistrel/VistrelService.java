@@ -149,12 +149,12 @@ public final class VistrelService {
             //? }
             activeInputInjector = injector;
             // 4. 内容档位协调器：内容/视口/BPP 三路输入的阻塞 ask 汇聚点（ask 只在工作线程）。
-            // 会话状态只有一个生产者（协调器）：采集、音频与接入标记都直接订阅它的广播，
+            // 会话事件只有一个生产者（协调器）：采集、音频与接入标记都直接订阅它的广播，
             // 信令层只负责把关闭事件投给它
             ProfileCoordinator profileCoordinator = new ProfileCoordinator(server::applyProfile);
-            profileCoordinator.addListener(videoScheduler::onSessionChanged);
-            profileCoordinator.addListener(audioScheduler::onSessionChanged);
-            profileCoordinator.addListener(VistrelService::onSessionChanged);
+            profileCoordinator.addListener(videoScheduler::onSessionEvent);
+            profileCoordinator.addListener(audioScheduler::onSessionEvent);
+            profileCoordinator.addListener(VistrelService::onSessionEvent);
             // 协调器注入信令面：offer 规划/落账与 WS 关闭复位都由信令面回调触发
             server.setProfileCoordinator(profileCoordinator);
             profileCoordinator.start();
@@ -342,21 +342,20 @@ public final class VistrelService {
         Constants.LOG.info("Vistrel 服务已停止");
     }
 
-    private static void onSessionChanged(SessionServer.SessionState state) {
-        switch (state.phase()) {
-            case STREAMING -> {
-                boolean wasActive = sessionActive;
-                sessionActive = true;
-                // 内容路径同样可能迎来首个真实接入（offer 成功走信令层，这里兜恢复/重协商）
-                if (!wasActive) {
-                    com.kairo.vistrel.command.VistrelCommands.feedback("§e远程会话已接入");
-                }
+    private static void onSessionEvent(SessionServer.SessionEvent event) {
+        if (event instanceof SessionServer.SessionEvent.Established) {
+            boolean wasActive = sessionActive;
+            sessionActive = true;
+            // 内容路径同样可能迎来首个真实接入（offer 成功走信令层，这里兜恢复/重协商）
+            if (!wasActive) {
+                com.kairo.vistrel.command.VistrelCommands.feedback("§e远程会话已接入");
             }
-            case INACTIVE -> sessionActive = false;
-            // 内容暂停：会话仍在线
-            case PAUSED -> {
-            }
+            return;
         }
+        if (event instanceof SessionServer.SessionEvent.Closed) {
+            sessionActive = false;
+        }
+        // 档位与内容暂停：会话仍在线，接入标记不动
     }
 
     /**

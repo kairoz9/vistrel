@@ -319,16 +319,14 @@ const _: jni::NativeMethod = native_method! {
         height: jint,
         fps: jint,
         bpp: jfloat,
-        codec: JString,
     ) -> JString,
 };
 
 /// 阻塞应用新的画质档位（Java 后台 worker / 信令 executor 调用，渲染线程绝不调用）
 ///
-/// codec 随请求携带：编码器与 SDP 载荷类型都锚在它上，Rust 侧不再保留档位快照，
-/// Java 从 offer 应答里落账的值原样传回。应答只在**生效**时携带实际档位（
-/// `width/height/fps/bpp/bitrate/codec`），被拒绝或无会话返回空串。
-/// 返回空串，Java 按「无应答」保持自己的生效基线。
+/// 应答只在**生效**时携带实际档位（`width/height/fps/bpp/bitrate`），被拒绝或
+/// 无会话返回空串，Java 按「无应答」保持自己的生效基线。codec 不在线合同里：
+/// 它是协商定死的会话常量。
 fn apply_profile<'caller>(
     env: &mut Env<'caller>,
     _class: JClass<'caller>,
@@ -336,23 +334,12 @@ fn apply_profile<'caller>(
     height: jint,
     fps: jint,
     bpp: jfloat,
-    codec: JString<'caller>,
 ) -> jni::errors::Result<JString<'caller>> {
     let state = get_global();
     let engine = state.streaming_engine.load_full();
-    let codec_token = if codec.is_null() {
-        None
-    } else {
-        codec.try_to_string(env).ok()
-    };
-    let answer = state.runtime.block_on(handle_apply_profile(
-        engine,
-        codec_token.as_deref(),
-        width,
-        height,
-        fps,
-        bpp,
-    ));
+    let answer = state
+        .runtime
+        .block_on(handle_apply_profile(engine, width, height, fps, bpp));
     let Some(resp_str) = answer else {
         return Ok(JString::default());
     };
@@ -362,12 +349,11 @@ fn apply_profile<'caller>(
     }
 }
 
-/// applyProfile 线上请求的处理函数：codec 令牌解析、几何透传与应答整形都在这里，
+/// applyProfile 线上请求的处理函数：几何透传与应答整形都在这里，
 /// 出口只做 JString/Env 搬运，测试不经 Env 直接驱动本函数钉住线契约。
 /// 返回 `None` = 无应答，Java 按「无应答」保持自己的生效基线。
 async fn handle_apply_profile(
     engine: Option<Arc<StreamingEngine>>,
-    codec_token: Option<&str>,
     width: i32,
     height: i32,
     fps: i32,
@@ -375,15 +361,6 @@ async fn handle_apply_profile(
 ) -> Option<String> {
     let Some(engine) = engine else {
         log::warn!("applyProfile 时引擎未启动，拒绝档位请求");
-        return None;
-    };
-    // codec 决定后端与会话已协商的载荷类型：解析不出就不猜，按拒绝处理
-    let Some(token) = codec_token else {
-        log::warn!("applyProfile 的 codec 缺失，拒绝档位请求");
-        return None;
-    };
-    let Some(codec) = encode::VideoCodec::from_token(token) else {
-        log::warn!("applyProfile 的 codec 无法识别，拒绝档位请求");
         return None;
     };
 
@@ -394,11 +371,10 @@ async fn handle_apply_profile(
             height.max(0) as usize,
             fps.max(0) as usize,
             bpp,
-            codec,
         )
         .await;
-    let (profile, codec) = match outcome {
-        crate::streaming::ProfileApply::Applied(profile, codec) => (profile, codec),
+    let profile = match outcome {
+        crate::streaming::ProfileApply::Applied(profile) => profile,
         crate::streaming::ProfileApply::Rejected | crate::streaming::ProfileApply::NoSession => {
             return None;
         }
@@ -411,7 +387,6 @@ async fn handle_apply_profile(
             // 生效画质输入：与派生码率消费的钳制值一致（偏好本身不在档位事实里）
             "bpp": encode::clamp_bpp(bpp),
             "bitrate": profile.bitrate(),
-            "codec": codec.as_str(),
         })
         .to_string(),
     )
@@ -851,19 +826,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_profile_without_engine_returns_no_answer() {
-        let answer = handle_apply_profile(None, Some("h264"), 1600, 900, 90, 0.2).await;
+        let answer = handle_apply_profile(None, 1600, 900, 90, 0.2).await;
         assert!(answer.is_none(), "无引擎档位请求必须无应答");
-    }
-
-    /// codec 令牌解析不出就不猜：缺失与无法识别同为拒绝
-    #[tokio::test]
-    async fn test_apply_profile_rejects_unresolvable_codec() {
-        let (engine, _rx) = make_test_engine(false);
-        for token in [None, Some("wmv")] {
-            let answer =
-                handle_apply_profile(Some(Arc::clone(&engine)), token, 1600, 900, 90, 0.2).await;
-            assert!(answer.is_none(), "codec {token:?} 必须被拒绝");
-        }
     }
 
     /// 全线往返：协商建会话 → 档位生效 → 0 几何档位被拒。应答 JSON 的键集是 Java
@@ -912,26 +876,25 @@ mod tests {
             "未探测环境的能力清单只含软件编码（软件编码恒收尾）"
         );
 
-        let applied =
-            handle_apply_profile(Some(Arc::clone(&engine)), Some("h264"), 1600, 900, 90, 0.2).await;
+        let applied = handle_apply_profile(Some(Arc::clone(&engine)), 1600, 900, 90, 0.2).await;
         let Some(applied_json) = applied else {
             panic!("活跃会话上的合法档位必须生效");
         };
         let applied: serde_json::Value = serde_json::from_str(&applied_json).unwrap();
         assert_eq!(applied["width"], 1600);
-        // 请求令牌大小写不敏感地解析，应答回规范拼写
-        assert_eq!(applied["codec"], "H264");
-        for key in ["width", "height", "fps", "bpp", "bitrate", "codec"] {
+        for key in ["width", "height", "fps", "bpp", "bitrate"] {
             assert!(applied.get(key).is_some(), "档位应答缺 {key} 键");
         }
-        // 后端身份只在协商应答里出现：运行期不改后端，档位应答不携带
-        assert!(
-            applied.get("backend").is_none(),
-            "档位应答不得携带 backend 键（身份只在协商时确定）"
-        );
+        // codec 与后端身份都是协商定死的会话常量：档位应答一概不携带
+        for absent in ["codec", "backend"] {
+            assert!(
+                applied.get(absent).is_none(),
+                "档位应答不得携带 {absent} 键（会话常量只在协商时确定）"
+            );
+        }
 
         assert!(
-            handle_apply_profile(Some(Arc::clone(&engine)), Some("h264"), 0, 0, 0, 0.2)
+            handle_apply_profile(Some(Arc::clone(&engine)), 0, 0, 0, 0.2)
                 .await
                 .is_none(),
             "0 几何档位必须按暂停信号契约被拒"

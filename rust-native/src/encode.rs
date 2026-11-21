@@ -163,8 +163,8 @@ impl Default for StreamingProfile {
 /// 定档请求：内容几何与画质偏好的组合，档位派生的唯一输入
 ///
 /// 几何与偏好在派生前都是请求值：包络缩入、偶对齐、level 预算压帧与码率模型全部在
-/// [`Self::derive`] 内统一生效。控制面的两个定档命令（`Retier` / `PrepareEncoder`）
-/// 都携带它——命令承载意图，Actor 派生并落账生效事实（档位 + codec + 后端）
+/// [`Self::derive`] 内统一生效。codec 不在请求里——它是协商定死的会话常量（换 codec
+/// 走 WebRTC 重协商的 offer 路径），派生时作为上下文传入
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TierRequest {
     pub width: usize,
@@ -172,19 +172,19 @@ pub struct TierRequest {
     pub fps: usize,
     /// 画质偏好（bits per pixel per frame）：只在派生码率时消费，不落进档位
     pub bpp: f32,
-    pub codec: VideoCodec,
 }
 
 impl TierRequest {
     /// 派生生效档位：分辨率先过 [`StreamingProfile::sanitize_dimensions`]（缩入包络、
     /// 偶对齐），bpp 钳到 `[MIN_BPP, MAX_BPP]` 并舍入到百分位（NaN/Inf 兜底为下限），
-    /// 帧率再过 level 预算压一道，码率按最终几何与 bpp 现算——产出即合法档位，无失败路径
-    pub fn derive(self) -> StreamingProfile {
+    /// 帧率再过 level 预算压一道，码率按最终几何、bpp 与 codec 现算——产出即合法档位，
+    /// 无失败路径
+    pub fn derive(self, codec: VideoCodec) -> StreamingProfile {
         let (w, h, f) = StreamingProfile::sanitize_dimensions(self.width, self.height, self.fps);
         let bpp = clamp_bpp(self.bpp);
         // 预算按实际 bpp 压帧率；包络内的合法输入必然有解，None 只是防御兜底
-        let f = clamp_framerate_to_level_budget(w, h, f, bpp, self.codec).unwrap_or(1);
-        let bitrate = calculate_dynamic_bitrate(w, h, f, bpp, self.codec);
+        let f = clamp_framerate_to_level_budget(w, h, f, bpp, codec).unwrap_or(1);
+        let bitrate = calculate_dynamic_bitrate(w, h, f, bpp, codec);
         StreamingProfile {
             width: w,
             height: h,
@@ -656,9 +656,8 @@ mod tests {
             height: 1080,
             fps: 180,
             bpp: 0.5,
-            codec: VideoCodec::H264,
         }
-        .derive();
+        .derive(VideoCodec::H264);
         assert_eq!(
             p.bitrate(),
             calculate_dynamic_bitrate(1920, 1080, 180, MAX_BPP, VideoCodec::H264)
@@ -823,26 +822,19 @@ mod tests {
         assert_eq!(fps_only.fps(), MAX_FPS, "帧率上限 240");
     }
 
-    /// 派生口：码率模型按 codec 系数区分；包络缩入、预算压帧与 bpp 钳制在派生内统一生效
+    /// 派生口：码率模型按 codec 系数区分；包络缩入、预算压帧与 bpp 钳制在派生内统一生效。
+    /// codec 是派生的上下文参数（会话常量），同一请求配不同 codec 各自成立
     #[test]
     fn test_tier_request_derivation() {
         // 同几何不同 codec：H265 系数更低，码率必须下降
-        let h264 = TierRequest {
+        let request = TierRequest {
             width: 1920,
             height: 1080,
             fps: 60,
             bpp: 0.2,
-            codec: VideoCodec::H264,
-        }
-        .derive();
-        let h265 = TierRequest {
-            width: 1920,
-            height: 1080,
-            fps: 60,
-            bpp: 0.2,
-            codec: VideoCodec::H265,
-        }
-        .derive();
+        };
+        let h264 = request.derive(VideoCodec::H264);
+        let h265 = request.derive(VideoCodec::H265);
         assert!(
             h265.bitrate() < h264.bitrate(),
             "换 H265 后码率必须重算下降"
@@ -854,9 +846,8 @@ mod tests {
             height: 4320,
             fps: 300,
             bpp: MIN_BPP,
-            codec: VideoCodec::H264,
         }
-        .derive();
+        .derive(VideoCodec::H264);
         assert_eq!((huge.width(), huge.height()), (MAX_WIDTH, MAX_HEIGHT));
         assert_eq!(huge.fps(), 120, "4K 预算压到 120");
 
@@ -866,9 +857,8 @@ mod tests {
             height: 1080,
             fps: 180,
             bpp: 0.5,
-            codec: VideoCodec::H264,
         }
-        .derive();
+        .derive(VideoCodec::H264);
         assert_eq!(
             clamped.bitrate(),
             calculate_dynamic_bitrate(1920, 1080, 180, MAX_BPP, VideoCodec::H264)
@@ -884,9 +874,8 @@ mod tests {
             height: 2160,
             fps: 120,
             bpp: MAX_BPP,
-            codec: VideoCodec::H264,
         }
-        .derive();
+        .derive(VideoCodec::H264);
         assert_eq!(p120.fps(), 120);
         assert_eq!((p120.width(), p120.height()), (3840, 2160));
 
@@ -897,9 +886,8 @@ mod tests {
                 height: 2160,
                 fps: requested,
                 bpp: MAX_BPP,
-                codec: VideoCodec::H264,
             }
-            .derive();
+            .derive(VideoCodec::H264);
             assert_eq!(p.fps(), 120, "4K{requested} 必须压到 120");
             assert_eq!(
                 (p.width(), p.height()),
