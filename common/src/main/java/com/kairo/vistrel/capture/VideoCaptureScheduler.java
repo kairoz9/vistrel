@@ -38,8 +38,8 @@ public class VideoCaptureScheduler {
     private int pipelineWidth = 0;
     private int pipelineHeight = 0;
     /**
-     * 编码停滞自愈回调：显存管线心跳超时触发时在渲染线程调用，实现方必须立即移交后台线程。
-     * 测试与未装配场景用空实现占位
+     * 编码停滞自愈回调：显存管线心跳超时或导入报「编码器不可用」时在渲染线程调用，
+     * 实现方必须立即移交后台线程。测试与未装配场景用空实现占位
      */
     private static final Runnable NOOP_STALL_LISTENER = () -> {};
     private Runnable encoderStallListener = NOOP_STALL_LISTENER;
@@ -47,9 +47,9 @@ public class VideoCaptureScheduler {
     /**
      * 注入编码停滞自愈回调（服务启动时装配）
      *
-     * @param listener 停滞自愈回调；显存管线心跳超时判定后在渲染线程触发一次，
-     *                 实现方必须立即移交后台线程，不得在回调内触碰任何 GPU 资源；
-     *                 {@code null} 回落空实现
+     * @param listener 停滞自愈回调；显存管线心跳超时或导入报「编码器不可用」判定后
+     *                 在渲染线程触发一次，实现方必须立即移交后台线程，不得在回调内
+     *                 触碰任何 GPU 资源；{@code null} 回落空实现
      */
     public void setEncoderStallListener(Runnable listener) {
         this.encoderStallListener = listener != null ? listener : NOOP_STALL_LISTENER;
@@ -138,7 +138,7 @@ public class VideoCaptureScheduler {
                 return;
             }
             this.state = CaptureState.CAPTURING;
-            boolean vramDirectEnabled = resolveVramDirect();
+            boolean vramDirectEnabled = resolveVramDirect(session);
             // 只变了帧率：尺寸没变且管线还在，直接复用（暂停后管线已释放，自然不会命中）；
             // 能力从 false 变 true 时必须重建
             boolean vramSettled =
@@ -158,12 +158,25 @@ public class VideoCaptureScheduler {
             } catch (Throwable t) {
                 Constants.LOG.error("构建 RAM 回读管道异常: {}", t.getMessage(), t);
             }
-            // 2. 构造期就定死显存直通 (VRAM Direct) 能不能用：失败即永久降级，本次会话不再重试
+            // 2. 构造期就定死显存直通 (VRAM Direct) 能不能用：结构性失败即永久降级，
+            //    本次会话不再重试；「编码器不可用」不走降级——降级采集救不了没有编码器的流，
+            //    触发整引擎自愈重启（重新探测硬件并重新协商）
             if (vramDirectEnabled && !this.vramBreaker.isTripped()) {
                 try {
                     this.vramPipeline = createVramPipeline(width, height);
                     if (this.vramPipeline == null) {
                         demoteVram("当前版本不支持显存直通");
+                    }
+                } catch (EncoderChannel.ControlException t) {
+                    this.vramPipeline = null;
+                    if (t.code == EncoderChannel.CONTROL_NO_HARDWARE_ENCODER) {
+                        // 编码器不在了：降级采集救不了没有编码器的流，唯一恢复路径
+                        // 是整引擎自愈重启（重新探测硬件并重新协商）
+                        Constants.LOG.error("显存直通构建失败：{}，触发编码停滞自愈", t.getMessage());
+                        this.encoderStallListener.run();
+                    } else {
+                        // 槽位注册失败等表级故障：编码器仍在，降级 RAM 照常续流
+                        demoteVram("构造期未就绪: " + t.getMessage());
                     }
                 } catch (Throwable t) {
                     this.vramPipeline = null;
@@ -177,11 +190,13 @@ public class VideoCaptureScheduler {
     }
 
     /**
-     * 读取显存直通能力：失败按禁用处理，绝不让 JNI 能力查询异常掀翻渲染线程
+     * 读取显存直通能力：失败按禁用处理，绝不让 JNI 能力查询异常掀翻渲染线程。
+     * 协商落到软编时恒为 false——槽位只有硬件编码器能消费，Native 侧导入前置
+     * 是纯检查，尝试构建只会换来一次必然失败的导入
      */
-    private boolean resolveVramDirect() {
+    private boolean resolveVramDirect(SessionState session) {
         try {
-            return this.vramDirectAllowed.getAsBoolean();
+            return this.vramDirectAllowed.getAsBoolean() && session.isHardwareBackend();
         } catch (Throwable t) {
             Constants.LOG.error("读取显存直通能力失败，按禁用处理: {}", t.getMessage());
             return false;

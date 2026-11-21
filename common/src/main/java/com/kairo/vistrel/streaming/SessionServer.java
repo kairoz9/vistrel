@@ -95,6 +95,17 @@ public interface SessionServer {
         }
 
         /**
+         * 后端身份是否为硬件编码（线上词汇 nvenc / vulkan_video）。
+         *
+         * <p>
+         * 显存直通的槽位只有硬件编码器能消费：协商落到软编时采集侧不得尝试
+         * 构建显存直通管线——Native 侧导入前置是纯检查，不会静默重建硬编。
+         */
+        public boolean isHardwareBackend() {
+            return "nvenc".equals(backend) || "vulkan_video".equals(backend);
+        }
+
+        /**
          * 内容丢失：会话仍然在线，沿用最近档位只降相位——音频照常，仅视频停采
          *
          * @return 相位降为 PAUSED、几何 / 帧率 / BPP / codec / 后端 均不变的新快照

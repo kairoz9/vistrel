@@ -350,7 +350,7 @@ public final class ProfileCoordinator {
         if (stopped) {
             return;
         }
-        SessionServer.SessionState applied = parseApplied(answerJson);
+        SessionServer.SessionState applied = parseApplied(answerJson, SessionServer.SessionState.BACKEND_UNKNOWN);
         if (applied == null) {
             Constants.LOG.warn("Answer 解析失败，档位基线保持未种");
             return;
@@ -456,7 +456,7 @@ public final class ProfileCoordinator {
             // ask 期间换代（关闭复位 / 新 offer 落账）
             return;
         }
-        SessionServer.SessionState parsed = json == null || json.isEmpty() ? null : parseApplied(json);
+        SessionServer.SessionState parsed = json == null || json.isEmpty() ? null : parseApplied(json, before.backend());
         if (parsed == null) {
             // 无会话 / 应答不可解析：旧档继续生效，基线保持不动
             lastAttempted = target;
@@ -475,7 +475,14 @@ public final class ProfileCoordinator {
      * 解析 JNI 应答：字段恒为「仍在生效」的实际档位——拒绝 / 无会话由 Native 回空串，
      * 解析失败即 null。backend 为可选字段：缺失时按未知处理
      */
-    private SessionServer.SessionState parseApplied(String json) {
+    /**
+     * 解析 JNI 应答：字段恒为「仍在生效」的实际档位——拒绝 / 无会话由 Native 回空串，
+     * 解析失败即 null。后端身份只在协商应答里携带（身份只在协商时确定并变更）：
+     * 协商落账传未知值兜底，档位 ask 传基线的协商值
+     *
+     * @param fallbackBackend 应答未携带 backend 时的后端身份
+     */
+    private SessionServer.SessionState parseApplied(String json, String fallbackBackend) {
         try {
             JsonObject obj = JsonParser.parseString(json).getAsJsonObject();
             int width = obj.get("width").getAsInt();
@@ -483,9 +490,10 @@ public final class ProfileCoordinator {
             int fps = obj.get("fps").getAsInt();
             double bpp = obj.has("bpp") ? obj.get("bpp").getAsDouble() : MIN_BPP;
             String codec = obj.get("codec").getAsString();
-            String backend = obj.has("backend") && !obj.get("backend").isJsonNull()
+            String backend =
+                    obj.has("backend") && !obj.get("backend").isJsonNull()
                     ? obj.get("backend").getAsString()
-                    : SessionServer.SessionState.BACKEND_UNKNOWN;
+                    : fallbackBackend;
             return new SessionServer.SessionState(
                     SessionServer.SessionState.Phase.STREAMING,
                     width,

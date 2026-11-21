@@ -397,10 +397,8 @@ async fn handle_apply_profile(
             codec,
         )
         .await;
-    let (profile, codec, backend) = match outcome {
-        crate::streaming::ProfileApply::Applied(profile, codec, backend) => {
-            (profile, codec, backend)
-        }
+    let (profile, codec) = match outcome {
+        crate::streaming::ProfileApply::Applied(profile, codec) => (profile, codec),
         crate::streaming::ProfileApply::Rejected | crate::streaming::ProfileApply::NoSession => {
             return None;
         }
@@ -414,8 +412,6 @@ async fn handle_apply_profile(
             "bpp": encode::clamp_bpp(bpp),
             "bitrate": profile.bitrate(),
             "codec": codec.as_str(),
-            // 后端未就绪的采纳态为 null，Java 按未知处理
-            "backend": backend.map(|b| b.as_str()),
         })
         .to_string(),
     )
@@ -925,11 +921,14 @@ mod tests {
         assert_eq!(applied["width"], 1600);
         // 请求令牌大小写不敏感地解析，应答回规范拼写
         assert_eq!(applied["codec"], "H264");
-        for key in [
-            "width", "height", "fps", "bpp", "bitrate", "codec", "backend",
-        ] {
+        for key in ["width", "height", "fps", "bpp", "bitrate", "codec"] {
             assert!(applied.get(key).is_some(), "档位应答缺 {key} 键");
         }
+        // 后端身份只在协商应答里出现：运行期不改后端，档位应答不携带
+        assert!(
+            applied.get("backend").is_none(),
+            "档位应答不得携带 backend 键（身份只在协商时确定）"
+        );
 
         assert!(
             handle_apply_profile(Some(Arc::clone(&engine)), Some("h264"), 0, 0, 0, 0.2)

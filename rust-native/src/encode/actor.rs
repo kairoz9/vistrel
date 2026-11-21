@@ -205,9 +205,7 @@ impl EncoderActor {
             }
             ControlCommand::Retier { request, reply } => {
                 let (before_profile, before_codec, had_table) = self.begin_profile_command();
-                let outcome = self
-                    .retier(request)
-                    .map(|(profile, codec)| (profile, codec, self.current_backend()));
+                let outcome = self.retier(request);
                 self.end_profile_command(before_profile, before_codec, had_table);
                 let _ = reply.send(outcome);
             }
@@ -314,13 +312,11 @@ impl EncoderActor {
         };
         self.slot_state.set_stage(ActorStage::Drain);
         if let Err(e) = encoder.drain() {
-            // 排空失败即上下文不可信：后端整体弃置
+            // 排空失败即上下文不可信：后端整体弃置（mem::forget 永不析构）。
             if let Some(dead) = self.encoder.take() {
                 std::mem::forget(dead);
             }
-            let eff = Self::software_ceiling_request(self.state_request());
-            self.install_software(eff.derive(), eff.codec);
-            log::error!("槽位注销前排空失败，后端弃置回退软编，保留导入引用: {e}");
+            log::error!("槽位注销前排空失败，后端弃置，保留导入引用: {e}");
             return ControlStatus::ReleaseFailed;
         }
         self.slot_state.set_stage(ActorStage::ClearSlots);
@@ -329,9 +325,9 @@ impl EncoderActor {
         ControlStatus::Ok
     }
 
-    /// 导入显存直通槽位并激活硬编（不动档位）
+    /// 导入显存直通槽位（不动档位）
     fn import_vram_slots(&mut self, mut slots: Vec<VramSlotDescriptor>) -> ControlStatus {
-        if !self.ensure_hardware_backend() {
+        if !self.encoder.as_ref().is_some_and(|e| e.is_hardware()) {
             log::error!("硬件编码不可用");
             return ControlStatus::NoHardwareEncoder;
         }
@@ -341,16 +337,12 @@ impl EncoderActor {
         // 换表全清前置 drain
         self.slot_state.set_stage(ActorStage::Drain);
         if let Err(e) = encoder.drain() {
-            // 排空失败即上下文不可信：后端整体弃置（mem::forget 永不析构），
-            // 回退软编打底；Java 按 ImportFailed 降级 RAM 采集，主机帧由软编
-            // 继续编码，流不断
+            // 排空失败即上下文不可信：后端整体弃置（mem::forget 永不析构）
             if let Some(dead) = self.encoder.take() {
                 std::mem::forget(dead);
             }
-            let eff = Self::software_ceiling_request(self.state_request());
-            self.install_software(eff.derive(), eff.codec);
-            log::error!("槽位导入前排空失败，后端弃置回退软编，整批拒绝: {e}");
-            return ControlStatus::ImportFailed;
+            log::error!("槽位导入前排空失败，后端弃置，整批拒绝: {e}");
+            return ControlStatus::NoHardwareEncoder;
         }
         self.slot_state.set_stage(ActorStage::ImportSlots);
         self.slot_state.mark_all_free();
@@ -415,7 +407,7 @@ impl EncoderActor {
         // 重配可能换了内存域（如 Vulkan 换了设备），此时后端交回新批
         self.attach(fresh_blocks);
 
-        let code = if reconfigured {
+        let mut code = if reconfigured {
             self.profile = profile;
             self.codec = request.codec;
             self.bpp = request.bpp;
@@ -423,6 +415,11 @@ impl EncoderActor {
         } else {
             self.rebuild_encoder(request, target)
         };
+        // 协商期兜底：目标硬编建不起来时按软编目标重建（顶格 + H264）——auto 路径必须
+        // 有底座；指定后端被替换由协商层按回执拒绝。
+        if code != ControlStatus::Ok && target != EncodeBackendKind::Software {
+            code = self.rebuild_encoder(request, EncodeBackendKind::Software);
+        }
         if code != ControlStatus::Ok {
             return Err(code);
         }
@@ -452,7 +449,7 @@ impl EncoderActor {
 
     /// 重建编码器，销毁旧编码器的一切：CUcontext、已导入的显存槽位、当前 GOP
     ///
-    /// `target` 已解析：硬编建败静默回退软编（回执如实携带）；软编目标按顶格请求直建
+    /// 单一职责：目标建不起来就整体失败（Actor 留在无编码器态）
     fn rebuild_encoder(
         &mut self,
         request: TierRequest,
@@ -463,45 +460,45 @@ impl EncoderActor {
             log::warn!("重建硬件编码器：已导入的显存槽位随旧编码器失效，需重新注册");
         }
 
-        // 生效事实 = 成功分支的派生档位与 codec；建败回退软编时按顶格请求重派生
-        let (effective_profile, effective_codec);
-        if target != EncodeBackendKind::Software {
-            // 必须先释放旧编码器
-            self.encoder = None;
-            // 后端连带交回它自己设备上的帧块：后端建不起来（含帧块分配失败）就整体回退软编，
-            // 不存在「编码器起来了、帧块却没就绪」的中间态
-            let profile = request.derive();
-            match (self.hardware_builder.as_ref())(profile, request.codec, target, self.slot_state)
-            {
+        let effective = if target == EncodeBackendKind::Software {
+            Self::software_ceiling_request(request)
+        } else {
+            request
+        };
+        let profile = effective.derive();
+
+        // 必须先释放旧编码器
+        self.encoder = None;
+        let built = if target == EncodeBackendKind::Software {
+            self.install_software(profile, effective.codec);
+            self.encoder.is_some()
+        } else {
+            match (self.hardware_builder.as_ref())(
+                profile,
+                effective.codec,
+                target,
+                self.slot_state,
+            ) {
                 Ok((hw, blocks)) => {
                     log::debug!("硬件编码器就绪!");
                     self.attach(blocks);
                     self.encoder = Some(hw);
-                    effective_profile = profile;
-                    effective_codec = request.codec;
+                    true
                 }
                 Err(e) => {
-                    log::error!("硬件编码器初始化失败，回退软编码: {}", e);
-                    let eff = Self::software_ceiling_request(request);
-                    effective_profile = eff.derive();
-                    effective_codec = eff.codec;
-                    self.install_software(effective_profile, effective_codec);
+                    log::error!("硬件编码器初始化失败: {e}");
+                    false
                 }
             }
-        } else {
-            let eff = Self::software_ceiling_request(request);
-            effective_profile = eff.derive();
-            effective_codec = eff.codec;
-            self.install_software(effective_profile, effective_codec);
-        }
+        };
 
-        if self.encoder.is_none() {
+        if !built {
             log::error!("编码器建立失败，档位维持 {:?}", self.profile);
             return ControlStatus::ReconfigureFailed;
         }
 
-        self.profile = effective_profile;
-        self.codec = effective_codec;
+        self.profile = profile;
+        self.codec = effective.codec;
         self.bpp = request.bpp;
         ControlStatus::Ok
     }
@@ -532,17 +529,6 @@ impl EncoderActor {
         }
     }
 
-    /// 以当前生效事实重建定档请求：重建与回退路径从这里出发
-    fn state_request(&self) -> TierRequest {
-        TierRequest {
-            width: self.profile.width(),
-            height: self.profile.height(),
-            fps: self.profile.fps(),
-            bpp: self.bpp,
-            codec: self.codec,
-        }
-    }
-
     /// 建软编并把它的堆块装进池
     fn install_software(&mut self, profile: StreamingProfile, codec: VideoCodec) {
         match VideoEncoder::new_software(profile, codec) {
@@ -555,29 +541,6 @@ impl EncoderActor {
                 self.encoder = None;
             }
         }
-    }
-
-    /// 确保当前是硬编后端；不动档位，按缓存补回跟随码率
-    fn ensure_hardware_backend(&mut self) -> bool {
-        if self.encoder.as_ref().is_some_and(|e| e.is_hardware()) {
-            return true;
-        }
-
-        let request = self.state_request();
-        // 不看返回码：`rebuild_encoder` 只在「一个编码器都建不起来」时失败，
-        // 而硬编创建失败会静默回退软编并返回 Ok。这里要问的是「是不是硬编」。
-        self.slot_state.set_stage(ActorStage::Reconfigure);
-        self.rebuild_encoder(request, Self::auto_backend());
-        if !self.encoder.as_ref().is_some_and(|e| e.is_hardware()) {
-            return false;
-        }
-
-        // 重建把编码器打回了档位 CBR，必须补回 RC 上次派发的值——
-        // 不补的话 RC 以为还在跟随，编码器实际跑着档位上限。
-        if self.bitrate > 0 {
-            Self::apply_bitrate(&mut self.encoder, self.bitrate);
-        }
-        true
     }
 
     /// 应用定档请求，返回**实际生效**的档位与 codec 或拒绝原因
@@ -922,16 +885,12 @@ mod tests {
             "偏好硬编失败回退软编后，Ok 的身份必须是软编"
         );
 
-        // 软编在跑时的换档回执同样如实携带软编身份
+        // 软编在跑时的换档回执如实携带生效 codec；后端身份不随档位回执走
         let outcome = switch_profile_with_backend(&mut actor, request);
         assert_eq!(
             outcome,
-            Ok((
-                request.derive(),
-                VideoCodec::H264,
-                Some(EncodeBackendKind::Software)
-            )),
-            "换档回执的身份必须与在跑后端一致"
+            Ok((request.derive(), VideoCodec::H264)),
+            "换档回执必须是实际生效的档位与 codec"
         );
     }
 
@@ -967,11 +926,11 @@ mod tests {
         );
     }
 
-    /// 直接走 Actor 的控制出口换档并取回生效档位、codec 与后端身份
+    /// 直接走 Actor 的控制出口换档并取回生效档位与 codec
     fn switch_profile_with_backend(
         actor: &mut EncoderActor,
         request: TierRequest,
-    ) -> Result<(StreamingProfile, VideoCodec, Option<EncodeBackendKind>), ControlStatus> {
+    ) -> Result<(StreamingProfile, VideoCodec), ControlStatus> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         assert!(actor.apply(ControlCommand::Retier { request, reply }));
         wait_reply(rx)
@@ -1213,7 +1172,7 @@ mod tests {
     ) -> Result<StreamingProfile, ControlStatus> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         assert!(actor.apply(ControlCommand::Retier { request, reply }));
-        wait_reply(rx).map(|(profile, _codec, _backend)| profile)
+        wait_reply(rx).map(|(profile, _codec)| profile)
     }
 
     /// 直接走 Actor 的控制出口下发跟随码率
@@ -1263,7 +1222,7 @@ mod tests {
             "控制队列必须受理"
         );
         assert_eq!(
-            wait_reply(ack0_rx).map(|(applied, _codec, _backend)| applied),
+            wait_reply(ack0_rx).map(|(applied, _codec)| applied),
             Ok(profile),
             "应答必须是 Actor 实际生效的档位"
         );
@@ -1598,14 +1557,10 @@ mod tests {
         assert!(!actor.rejecting_frames);
     }
 
-    /// 用例 3：导入前排空失败——整批拒绝且窗口不滞留，旧代恢复接收
+    /// 用例 3：导入前排空失败——后端弃置不降级，整批拒绝且窗口不滞留；
+    /// 此后导入一律失败，自愈（重启引擎）是唯一恢复路径
     #[test]
     fn test_fence_closes_window_when_import_drain_fails() {
-        // 换软编要用真编码器产出：先装测试夹具的 openh264
-        assert!(
-            crate::encode::software::init_api_for_tests(),
-            "openh264 测试夹具应就绪"
-        );
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let output = test_outbox();
@@ -1623,15 +1578,15 @@ mod tests {
 
         assert_eq!(
             import_slots(&mut actor, 0),
-            ControlStatus::ImportFailed,
-            "排空失败必须整批拒绝"
+            ControlStatus::NoHardwareEncoder,
+            "排空失败弃置后端：整批拒绝且如实上报无编码器可跑"
         );
         assert!(!actor.rejecting_frames);
-        // 排空失败即硬编后端报废：整体回退软编，降级后是主机帧流
-        let encoder = actor.encoder.as_ref().expect("回退软编必须建出编码器");
-        assert!(!encoder.is_hardware(), "排空失败后必须回退软编");
+        // 排空失败即上下文不可信：后端弃置且不降级——运行期不改后端身份，
+        // 自愈（重启引擎重新协商）是唯一恢复路径
+        assert!(actor.encoder.is_none(), "弃置后不得残留任何编码器");
 
-        // 主机帧不受围栏约束，软编继续产出（降级路径的真实帧流）
+        // 主机帧被消费但不产出码流：无编码器可跑
         let host = host_payload(&pool, vec![100u8; display_nv12_len(&p720)]);
         inbox.push(VideoFrame {
             birth_nanos: 1,
@@ -1639,9 +1594,12 @@ mod tests {
         });
         let frame = inbox.take().expect("主机帧在收件箱");
         actor.handle_frame(frame);
-        assert!(
-            output.take().is_some(),
-            "导入失败后窗口关闭，降级软编继续出帧"
+        assert!(output.take().is_none(), "无编码器时主机帧不得产出码流");
+
+        // 此后的导入一律失败：硬件前置检查在没有编码器时必然不过
+        assert_eq!(
+            import_slots(&mut actor, 0),
+            ControlStatus::NoHardwareEncoder
         );
     }
 

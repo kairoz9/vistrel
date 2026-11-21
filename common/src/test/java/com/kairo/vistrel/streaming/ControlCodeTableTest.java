@@ -39,6 +39,6 @@ public class ControlCodeTableTest {
                 EncoderChannel.describeControlResult(EncoderChannel.CONTROL_RECONFIGURE_FAILED),
                 "档位重配失败必须与 ACK 超时区分开"
         );
-        Assertions.assertTrue(EncoderChannel.describeControlResult(9).startsWith("未知错误码"), "表外的码才允许落进未知");
+        Assertions.assertTrue(EncoderChannel.describeControlResult(10).startsWith("未知错误码"), "表外的码才允许落进未知");
     }
 }

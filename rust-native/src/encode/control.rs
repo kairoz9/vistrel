@@ -50,9 +50,9 @@ pub(crate) enum ControlStatus {
     ReleaseFailed = 8,
 }
 
-/// 重定档回执：Actor 实际生效的档位与 codec，后端 `None` 表示编码器尚未就绪的采纳态
-pub(crate) type RetierReceipt =
-    Result<(StreamingProfile, VideoCodec, Option<EncodeBackendKind>), ControlStatus>;
+/// 重定档回执：Actor 实际生效的档位与 codec。
+/// 后端身份不在回执里：它只在协商时确定并变更（`PrepareEncoder` 的回执是唯一上报点）
+pub(crate) type RetierReceipt = Result<(StreamingProfile, VideoCodec), ControlStatus>;
 
 /// 控制命令
 ///
@@ -68,8 +68,7 @@ pub(crate) enum ControlCommand {
     /// 挂起一次关键帧请求：下一帧以 IDR 编码（tell）
     /// 请求是幂等意图而非逐条事件：重复投递在消费点塌缩成一个挂起标志
     RequestKeyframe,
-    /// 按定档请求重定档位，回送实际生效的档位、codec 与当时后端身份或拒绝原因；
-    /// 后端 None 表示编码器尚未就绪的纯采纳态（会话建立前不可达）
+    /// 按定档请求重定档位，回送实际生效的档位与 codec 或拒绝原因
     Retier {
         request: TierRequest,
         reply: tokio::sync::oneshot::Sender<RetierReceipt>,
@@ -144,9 +143,9 @@ impl ControlSender {
 
     /// 请求重定档位（ask）
     ///
-    /// `Ok` 是 Actor **实际生效**的档位、codec 与当时后端身份：调用方提交 Actor 说的准，
-    /// 而不是「成功就假定请求生效、失败就回读旧值」这套两阶段推断。后端 `None` 表示
-    /// 编码器尚未就绪的纯采纳态。`Err(ReconfigureFailed)` 表示 Actor 拒绝了这次重定档、
+    /// `Ok` 是 Actor **实际生效**的档位与 codec：调用方提交 Actor 说的准，
+    /// 而不是「成功就假定请求生效、失败就回读旧值」这套两阶段推断。
+    /// `Err(ReconfigureFailed)` 表示 Actor 拒绝了这次重定档、
     /// 维持原档位；其余错误码表示命令没送达或应答超时，调用方同样维持已知档位。
     pub(crate) async fn retier(&self, request: TierRequest) -> RetierReceipt {
         let (reply, wait) = tokio::sync::oneshot::channel();
@@ -296,7 +295,7 @@ mod tests {
                     let _ = reply.send(ControlStatus::Ok);
                 }
                 ControlCommand::Retier { reply, .. } => {
-                    let _ = reply.send(Ok((StreamingProfile::default(), VideoCodec::H264, None)));
+                    let _ = reply.send(Ok((StreamingProfile::default(), VideoCodec::H264)));
                 }
                 ControlCommand::Shutdown
                 | ControlCommand::BitrateChange(_)
@@ -442,11 +441,7 @@ mod tests {
         std::thread::spawn(move || {
             while let Some(cmd) = rx.blocking_recv() {
                 if let ControlCommand::Retier { reply, .. } = cmd {
-                    let _ = reply.send(Ok((
-                        applied,
-                        VideoCodec::H264,
-                        Some(EncodeBackendKind::Nvenc),
-                    )));
+                    let _ = reply.send(Ok((applied, VideoCodec::H264)));
                 }
             }
         });
@@ -458,14 +453,13 @@ mod tests {
             bpp: 0.1,
             codec: VideoCodec::H264,
         };
-        let (got, codec, backend) = ControlSender::new(tx, bell)
+        let (got, codec) = ControlSender::new(tx, bell)
             .retier(request)
             .await
             .expect("假 Actor 应答过，必须拿到值");
         assert_ne!(got, request.derive(), "应答不得是请求值的回显");
         assert_eq!(got, applied, "应答必须是 Actor 实际生效的档位");
         assert_eq!(codec, VideoCodec::H264);
-        assert_eq!(backend, Some(EncodeBackendKind::Nvenc));
     }
 
     /// Actor 拒绝重定档时，拒绝原因必须跨过接口，而不是让调用方比对档位去猜

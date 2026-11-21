@@ -62,9 +62,8 @@ pub struct EncodePreferences {
 
 /// 档位 ask 的应答（被动数据载体）：只有生效值能被回传
 pub enum ProfileApply {
-    /// 请求已被编码器接受并生效；后端为 None 表示编码器尚未就绪的纯采纳态
-    /// （会话建立前不可达）
-    Applied(StreamingProfile, VideoCodec, Option<EncodeBackendKind>),
+    /// 请求已被编码器接受并生效。codec 随应答携带
+    Applied(StreamingProfile, VideoCodec),
     /// 请求被拒绝（0 几何 / 0 帧率的暂停信号，或编码器重配失败）；
     /// 旧档位由调用方自己的基线保持
     Rejected,
@@ -307,9 +306,9 @@ impl StreamingEngine {
         // 控制面所有权在引擎：ask 直接发起，生效码率回填会话的码率回路；
         // 拒绝路径不经过回路，上界自然保持旧值
         match self.video.control().retier(request).await {
-            Ok((applied, applied_codec, backend)) => {
+            Ok((applied, applied_codec)) => {
                 session.commit_bps(applied.bitrate());
-                ProfileApply::Applied(applied, applied_codec, backend)
+                ProfileApply::Applied(applied, applied_codec)
             }
             Err(e) => {
                 log::warn!("档位变更被拒绝（{e:?}），继续沿用旧档位");
@@ -482,11 +481,7 @@ pub(crate) mod test_support {
                         let _ = if reject_change {
                             reply.send(Err(ControlStatus::ReconfigureFailed))
                         } else {
-                            reply.send(Ok((
-                                request.derive(),
-                                request.codec,
-                                Some(EncodeBackendKind::Software),
-                            )))
+                            reply.send(Ok((request.derive(), request.codec)))
                         };
                         Rec::Retier
                     }
@@ -772,7 +767,7 @@ mod tests {
         .unwrap();
 
         // 成功路径：假 Actor 回显请求档位，codec 随请求原样带出
-        let ProfileApply::Applied(applied, applied_codec, _backend) =
+        let ProfileApply::Applied(applied, applied_codec) =
             mgr.apply_profile(1600, 900, 90, 0.2, codec).await
         else {
             panic!("活跃会话上的合法请求必须生效");

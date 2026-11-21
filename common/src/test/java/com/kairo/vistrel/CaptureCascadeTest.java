@@ -147,7 +147,7 @@ public class CaptureCascadeTest {
                             channel.fps,
                             0.1,
                             "H264",
-                            "unknown"
+                            "vulkan_video"
                     )
             );
         }
@@ -315,7 +315,8 @@ public class CaptureCascadeTest {
         };
         Assertions.assertEquals(0, evaluations[0], "显存直通能力不得在构造期求值");
 
-        SessionState session = new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.1, "H264", "unknown");
+        SessionState session =
+                new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.1, "H264", "vulkan_video");
         capture.onSessionChanged(session);
         Assertions.assertEquals(1, evaluations[0], "首次会话变更时求值一次");
         Assertions.assertEquals(0, createdVrams.size(), "能力未就绪时不得尝试显存管线");
@@ -387,7 +388,9 @@ public class CaptureCascadeTest {
             }
         };
 
-        capture.onSessionChanged(new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.1, "H264", "unknown"));
+        capture.onSessionChanged(
+                new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.1, "H264", "vulkan_video")
+        );
         Assertions.assertEquals(1, createdVrams.size());
         Assertions.assertEquals(1, createdRams.size());
         Assertions.assertEquals(1920, createdVrams.get(0).width);
@@ -396,7 +399,9 @@ public class CaptureCascadeTest {
         capture.capture();
         Assertions.assertEquals(1, createdVrams.get(0).captureCalls);
         // 控制面通知变更推送（720p@30fps，Push 驱动即时生效）
-        capture.onSessionChanged(new SessionState(SessionState.Phase.STREAMING, 1280, 720, 30, 0.1, "H264", "unknown"));
+        capture.onSessionChanged(
+                new SessionState(SessionState.Phase.STREAMING, 1280, 720, 30, 0.1, "H264", "vulkan_video")
+        );
         Assertions.assertEquals(2, createdVrams.size(), "会话规格变更由推送驱动直接构造新规格 Pipeline 替换");
         Assertions.assertEquals(1, createdVrams.get(0).closeCalls, "旧 Vram Pipeline 立即被清理释放");
         Assertions.assertEquals(1, createdRams.get(0).closeCalls, "旧 Ram Pipeline 立即被清理释放");
@@ -437,19 +442,21 @@ public class CaptureCascadeTest {
             }
         };
 
-        capture.onSessionChanged(new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.1, "H264", "unknown"));
+        capture.onSessionChanged(
+                new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.1, "H264", "vulkan_video")
+        );
         Assertions.assertEquals(1, createdVrams.size());
         Assertions.assertEquals(1, createdRams.size());
         // 仅帧率变化：复用现成管线，不销毁也不重建
         capture.onSessionChanged(
-                new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 240, 0.1, "H264", "unknown")
+                new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 240, 0.1, "H264", "vulkan_video")
         );
         Assertions.assertEquals(1, createdVrams.size(), "帧率变化不应重建显存管线");
         Assertions.assertEquals(1, createdRams.size(), "帧率变化不应重建内存管线");
         Assertions.assertEquals(0, createdVrams.get(0).closeCalls, "复用期间不得销毁管线");
         // 分辨率变化仍必须重建
         capture.onSessionChanged(
-                new SessionState(SessionState.Phase.STREAMING, 2560, 1440, 240, 0.1, "H264", "unknown")
+                new SessionState(SessionState.Phase.STREAMING, 2560, 1440, 240, 0.1, "H264", "vulkan_video")
         );
         Assertions.assertEquals(2, createdVrams.size(), "分辨率变化必须重建显存管线");
         Assertions.assertEquals(1, createdVrams.get(0).closeCalls, "旧管线在重建时释放");
@@ -481,7 +488,9 @@ public class CaptureCascadeTest {
         Assertions.assertFalse(mgr.capture(), "无会话时 capture 返回 false");
         Assertions.assertEquals(0, createdVrams.size());
         // 会话建立 (1080p)
-        mgr.onSessionChanged(new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.1, "H264", "unknown"));
+        mgr.onSessionChanged(
+                new SessionState(SessionState.Phase.STREAMING, 1920, 1080, 60, 0.1, "H264", "vulkan_video")
+        );
         Assertions.assertEquals(1, createdVrams.size());
         Assertions.assertEquals(1, createdRams.size());
         FakePipeline firstVram = createdVrams.get(0);

@@ -127,7 +127,7 @@ public class FakeSessionServer implements SessionServer {
                     + height
                     + ",\"fps\":"
                     + fps
-                    + ",\"bpp\":0.1,\"bitrate\":4000000,\"codec\":\"H264\"}",
+                    + ",\"bpp\":0.1,\"bitrate\":4000000,\"codec\":\"H264\",\"backend\":\"nvenc\"}",
                     0.1
             );
         }

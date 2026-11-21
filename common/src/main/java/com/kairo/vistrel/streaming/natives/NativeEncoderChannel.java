@@ -41,8 +41,9 @@ public final class NativeEncoderChannel implements EncoderChannel, InputEventSou
         }
         int code = NativeBridge.importVramSlots(slots);
         if (code != EncoderChannel.CONTROL_OK) {
-            throw new IllegalStateException(
-                    "NativeBridge.importVramSlots 失败 (整批已回滚): " + EncoderChannel.describeControlResult(code) + " (" + code + ")"
+            throw new EncoderChannel.ControlException(
+                    "NativeBridge.importVramSlots 失败 (整批已回滚): " + EncoderChannel.describeControlResult(code) + " (" + code + ")",
+                    code
             );
         }
         return new NativeSlotLease();

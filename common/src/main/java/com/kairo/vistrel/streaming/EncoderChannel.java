@@ -88,6 +88,18 @@ public interface EncoderChannel {
     }
 
     /**
+     * 控制命令失败的异常载体，消费方按 {@link #code} 对表分支
+     */
+    class ControlException extends IllegalStateException {
+        public final int code;
+
+        public ControlException(String message, int code) {
+            super(message);
+            this.code = code;
+        }
+    }
+
+    /**
      * 显存槽位租约 (RAII)：由 {@link #importVramSlots(long[])} 成功后返回，
      * 投递与注销都挂在租约上——没注册就拿不到租约，不 close 就完不成注销。
      *
@@ -127,7 +139,7 @@ public interface EncoderChannel {
      *
      * <p>
      * <b>整批处理</b>：要么全成要么全败。任一槽位导入失败即整批回滚，
-     * 整体回退 RAM 回读采集。失败抛 {@link IllegalStateException}，
+     * 整体回退 RAM 回读采集。失败抛 {@link ControlException}，
      * 可读原因见 {@link #describeControlResult(int)}。
      *
      * @param slots 扁平协议数组，长度必须是 {@link #VRAM_SLOT_STRIDE} 的整数倍
