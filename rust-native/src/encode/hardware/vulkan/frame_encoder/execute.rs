@@ -153,22 +153,6 @@ impl FrameEncoder {
             dump_ivf(path, extent.width, extent.height, &out);
         }
 
-        // 首帧打一次码流大小 —— 「编码器看到的画面是不是黑的」最便宜的检查手段。
-        //
-        // 纯黑的 1080p KEY 帧只有几 KB，正常画面是几十到几百 KB，差一个数量级，不会看错。
-        // 不需要落盘、不需要解码、也不需要浏览器：一行日志就能把三种情况分开 ——
-        // 编码器没跑（没有这行）、输入是黑的（字节数极小）、码流是好的（字节数正常）。
-        static FIRST_FRAME: std::sync::Once = std::sync::Once::new();
-        FIRST_FRAME.call_once(|| {
-            log::info!(
-                "首帧编码完成: {} 字节（{}，编码尺寸 {}x{}）",
-                out.len(),
-                if is_idr { "关键帧" } else { "帧间帧" },
-                extent.width,
-                extent.height,
-            );
-        });
-
         // 关键帧上报口径：只有真 IDR 才算。渐进刷新的帧虽然是「I 宏块」，但不等于 IDR，
         // 接收端拿到它无法从零开始解码——谎报会让 waiting_for_keyframe 提前放行。
         Ok((out, is_idr))

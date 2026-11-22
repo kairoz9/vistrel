@@ -401,19 +401,6 @@ impl VideoDevice {
                 .instance()
                 .get_physical_device_memory_properties(pd)
         };
-        // 完整内存类型表一次性转储：读回类缓冲（码流）落在 cached 还是 write-combined
-        // 堆，直接决定逐帧 CPU 读回的代价，落点必须可审计
-        for (index, ty) in memory_properties.memory_types
-            [..memory_properties.memory_type_count as usize]
-            .iter()
-            .enumerate()
-        {
-            log::info!(
-                "内存类型 {index}: {:?}（堆 {}）",
-                ty.property_flags,
-                ty.heap_index
-            );
-        }
 
         // Intra-Refresh 的准入结论在建设备之前就已确定，feature 位也已链进 create_info；
         // 这里只做转存，不再查询——查询与启用必须是同一份数据，否则会「查到支持但没开启」
@@ -569,7 +556,6 @@ impl VideoDevice {
             .find_memory_type(requirements.memory_type_bits, required | preferred)
             .or_else(|| self.find_memory_type(requirements.memory_type_bits, required))
             .ok_or_else(|| format!("{what}找不到满足 {required:?} 的内存类型"))?;
-        self.log_memory_type(what, memory_type);
         let flags = self.inner.memory_properties.memory_types[memory_type as usize].property_flags;
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
@@ -584,20 +570,6 @@ impl VideoDevice {
             format!("{what}绑定显存失败: {e:?}")
         })?;
         Ok((memory, flags))
-    }
-
-    /// 记录主机可见分配落在哪个内存类型
-    ///
-    /// 排障用：驱动常同时暴露 cached 与 write-combined 两种 HOST_VISIBLE 堆，
-    /// 码流读回这类「GPU 写、CPU 逐帧读」的缓冲若落在非 HOST_CACHED 堆上，
-    /// 回读代价可能差一个数量级——落点必须可见，而不是靠猜
-    fn log_memory_type(&self, what: &str, index: u32) {
-        let ty = &self.inner.memory_properties.memory_types[index as usize];
-        log::info!(
-            "{what} → 内存类型 {index}（{:?}，堆 {}）",
-            ty.property_flags,
-            ty.heap_index
-        );
     }
 
     pub fn device(&self) -> &ash::Device {
