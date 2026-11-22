@@ -339,8 +339,11 @@ export class UIManager {
             options.push({ value: backend.kind, label: backendLabel(backend.kind) });
         }
         // 陈旧偏好只在拿到真实清单后校验：回执未到时保持持久化值不动
-        if (this.encoderOptions && this.encoderPref !== "auto"
-            && !this.encoderOptions.some((b) => b.kind === this.encoderPref)) {
+        if (
+            this.encoderOptions &&
+            this.encoderPref !== "auto" &&
+            !this.encoderOptions.some((b) => b.kind === this.encoderPref)
+        ) {
             this.encoderPref = "auto";
         }
         this.fillSelect(this.encoderSelect, options, this.encoderPref, !this.encoderOptions);

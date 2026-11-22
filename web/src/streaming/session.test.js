@@ -294,9 +294,7 @@ describe("信令下行分流", () => {
         session.start("");
         const ws = session.ws;
         ws.readyState = FakeWebSocket.OPEN;
-        await session.handleSignalingMessage(
-            JSON.stringify({ type: "error", message: "指定的 codec 不可行" }),
-        );
+        await session.handleSignalingMessage(JSON.stringify({ type: "error", message: "指定的 codec 不可行" }));
         expect(errors).toEqual(["指定的 codec 不可行"]);
         expect(statuses).toEqual([ConnectStatus.CONNECTING, ConnectStatus.DISCONNECTED]);
         expect(ws.closeCalls).toBe(1);
