@@ -8,6 +8,8 @@
 [![NeoForge](https://img.shields.io/badge/NeoForge-%E2%9C%93-success.svg)](#支持矩阵)
 [![Forge](https://img.shields.io/badge/Forge-%E2%9C%93-success.svg)](#支持矩阵)
 
+**中文** · [English](README.en.md)
+
 ---
 
 ## 核心特性
@@ -21,7 +23,8 @@
 - **跨版本多加载器**：覆盖三大加载器，多游戏版本（见下表）。
 
 ## 支持矩阵
-操作系统: Windows 10/11 x64、Linux x86_64
+
+**操作系统：** Windows 10/11 x64、Linux x86_64
 
 | Minecraft        | Fabric | NeoForge | Forge | Java | 硬件编码             |
 | ---------------- | ------ | -------- | ----- | ---- | -------------------- |
@@ -31,7 +34,16 @@
 | 1.20 ~ 1.20.1    | ✅     | —        | ✅    | 17   | 仅 NVENC             |
 
 - 硬件编码：26.2 及以上支持 NVIDIA（NVENC）与 AMD/Intel（Vulkan Video）；其余版本仅支持 NVIDIA（NVENC），其他显卡自动回退 OpenH264 软件编码。
-- Fabric 端需安装 [Fabric API](https://modrinth.com/mod/fabric-api)。
+- **Fabric 端必须安装 [Fabric API](https://modrinth.com/mod/fabric-api)**，最低版本要求如下表。
+
+| Minecraft      | Fabric API      | Fabric Loader      |
+| -------------- | --------------- | ------------------ |
+| 1.20 ~ 1.20.1  | `0.83.0+1.20`   | `0.15.0`           |
+| 1.21 ~ 1.21.11 | `0.100.2+1.21`  | `0.15.11`          |
+| 26.1           | `0.144.1+26.1`  | `0.18.4`           |
+| 26.2           | `0.152.2+26.2`  | `0.18.4`           |
+| 26.3           | `0.160.6+26.3`  | `0.19.3`           |
+
 
 ## 快速开始
 
