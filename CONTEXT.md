@@ -82,7 +82,7 @@ The recording of the received media streams — rendered video and Audio Loopbac
 _Avoid_: Client-side recording, Session recording, Screen recorder, Stream capture, Bitstream dump
 
 **Replay Buffer**:
-The always-on in-browser fMP4 fragment ring on a dedicated long-lived MediaRecorder, retaining the received media streams of roughly the last 30 seconds while a session is live: the first timeslice chunk (init segment) is kept for the whole session and later chunks are evicted on a 30-second wall-clock window. Discarded silently on session teardown. Zero coupling with Playout Recording — the two may run simultaneously on the same tracks.
+The always-on in-browser fMP4 fragment ring on a dedicated long-lived MediaRecorder, retaining the received media streams of roughly the last 60 seconds while a session is live: the first timeslice chunk (init segment) is kept for the whole session and later chunks are evicted on a 60-second wall-clock window. Discarded silently on session teardown. Zero coupling with Playout Recording — the two may run simultaneously on the same tracks.
 _Avoid_: Sliding window recording, Rolling buffer, Replay cache, Instant replay
 
 **Replay Clip**:

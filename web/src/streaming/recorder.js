@@ -1,7 +1,7 @@
 /**
  * Vistrel Web Client 播放流抓取
  * 一条持续重编码的 fMP4 分片流（CaptureController）承载两套用法：Playout Recording
- * 停止即落盘，回放剪辑只留 init segment 与最近 30s 墙钟窗口按需取用。两套用法各自
+ * 停止即落盘，回放剪辑只留 init segment 与最近 60s 墙钟窗口按需取用。两套用法各自
  * 注入分片保留策略并自行处置产物 Blob，CaptureController 内没有任何模式分支。
  * 线格式为顶行在前，轨道直录方向即显示方向。
  */
@@ -366,7 +366,7 @@ function clipFilename() {
 }
 
 /**
- * 回放剪辑：常驻分片流只保留 init segment 与最近 30s 墙钟窗口，
+ * 回放剪辑：常驻分片流只保留 init segment 与最近 60s 墙钟窗口，
  * 按钮触发时取当前窗口合成下载；会话拆除静默弃置——与 Playout Recording 的落盘保存语义刻意相反。
  * 与 Playout Recording 各自持有分片流实例，互不感知，可同时运行。
  */
@@ -434,7 +434,7 @@ export class ReplayClipController {
         this.startBuffer();
     }
 
-    /** 会话拆除通知：静默弃置，剪辑语义只覆盖「最近 30 秒」，断线残段没有保存价值 */
+    /** 会话拆除通知：静默弃置，剪辑语义只覆盖「最近 60 秒」，断线残段没有保存价值 */
     handleSessionTornDown() {
         this.stopBuffer();
     }

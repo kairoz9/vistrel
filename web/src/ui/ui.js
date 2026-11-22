@@ -616,7 +616,7 @@ export class UIManager {
 
     setClipAvailability(active, reason) {
         this.clipBtn.setDisabled(!active);
-        this.clipBtn.setTooltip(reason || "保存最近 30 秒画面与声音为 MP4");
+        this.clipBtn.setTooltip(reason || "保存最近 60 秒画面与声音为 MP4");
     }
 
     /** 任一遮罩可见即视为有弹窗：每次现算，读取不依赖缓存 */
