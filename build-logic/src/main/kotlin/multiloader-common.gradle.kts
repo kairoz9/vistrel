@@ -105,7 +105,7 @@ tasks.processResources {
         expand(props)
     }
 
-    filesMatching(listOf("pack.mcmeta", "fabric.mod.json", "*.mixins.json")) {
+    filesMatching(listOf("fabric.mod.json", "*.mixins.json")) {
         expand(jsonExpandProps)
     }
 
