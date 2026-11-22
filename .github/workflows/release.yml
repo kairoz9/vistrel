@@ -178,10 +178,34 @@ jobs:
           name: release-meta
           path: meta
 
+      - name: Compose per-file changelog
+        # CF Fair Play 要求每个文件各自说明「相对上一版本改了什么」。共用一份全量 changelog
+        # 对任何单个文件都不成立；首版无上一版本可 diff，故以文件身份行 + 发布说明作答。
+        # 身份行逐文件不同（版本线 / 加载器 / Java），使每个 CF 文件条目的 changelog 唯一。
+        # 全部经 env 传入：version 已由 guard 正则校验，mc/loader/java 取自本文件 matrix 字面量
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+          MC: ${{ matrix.mc }}
+          LOADER: ${{ matrix.loader }}
+          JAVA: ${{ matrix.java }}
+        run: |
+          out="changelog-$MC-$LOADER.md"
+          {
+            echo "### Vistrel $VERSION — Minecraft $MC / $LOADER (Java $JAVA)"
+            echo
+            echo "首个发布版本"
+            echo
+            cat meta/release-body.md
+          } > "$out"
+          echo "changelog: $out"
+          head -3 "$out"
+
       - name: Publish to CurseForge
-        # environment 显式 client：fabric.mod.json 为 "*" 不做推断，按发布决策 CF 文件只打 Client 环境标签
-        # name 置空 = 交给 CF 自命名（展示名即上传的 jar 文件名）；mc-publish 缺省取"触发 release 的标题"，
-        # 在本 tag-push 拓扑下（publish 与建 Release 平行）不可预期
+        # environment 显式 client：按发布决策 CF 文件只打 Client 环境标签（mod 为纯客户端，
+        # 由 fabric.mod.json environment / @Mod(dist) / mods.toml clientSideOnly 保证）
+        # name 必须显式置空而非省略：省略时 program.ts 回落到「触发 release 的标题」，
+        # 而本拓扑下 publish 与建 Release 平行、标题不可预期；空串使 curseforge-version.ts
+        # 的 `!version.name` 分支生效，展示名取上传的 jar 文件名。
         uses: Kira-NT/mc-publish@v3
         with:
           curseforge-id: ${{ vars.CURSEFORGE_PROJECT_ID }}
@@ -193,4 +217,4 @@ jobs:
           loaders: ${{ matrix.loader }}
           environment: client
           java: ${{ matrix.java }}
-          changelog-file: meta/release-body.md
+          changelog-file: changelog-${{ matrix.mc }}-${{ matrix.loader }}.md
