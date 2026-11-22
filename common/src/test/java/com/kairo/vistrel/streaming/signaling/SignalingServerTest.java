@@ -8,6 +8,8 @@ import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -376,9 +378,29 @@ class SignalingServerTest {
             server.stopAccepting();
             Assertions.assertTrue(server.isRunning(), "关入口不得停引擎");
             Assertions.assertEquals(-1, server.boundPort(), "关入口必须释放监听端口");
-            Assertions.assertThrows(java.io.IOException.class, () -> new Socket("127.0.0.1", port), "关入口后不得再接新连接");
+            // 端口刚释放时内核仍可能替客户端完成 TCP 握手（随后 RST），
+            // 契约是「不再被服务」而不是「connect 必然抛异常」
+            Assertions.assertFalse(servedAfterShutdown(port), "关入口后不得再被服务");
         } finally {
             server.stop();
+        }
+    }
+
+    /**
+     * 探测该端口是否仍会被服务：连上就发一个 HTTP 请求，读不到任何字节（含被拒 / 立即断开）即视为已关
+     *
+     * @param port 目标端口
+     * @return 收到任何响应字节时为 {@code true}
+     */
+    private static boolean servedAfterShutdown(int port) throws IOException {
+        try (Socket probe = new Socket()) {
+            probe.connect(new InetSocketAddress("127.0.0.1", port), 200);
+            probe.setSoTimeout(500);
+            probe.getOutputStream().write("GET / HTTP/1.1\r\nHost: x\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+            probe.getOutputStream().flush();
+            return probe.getInputStream().read() >= 0;
+        } catch (IOException refusedOrReset) {
+            return false;
         }
     }
 
