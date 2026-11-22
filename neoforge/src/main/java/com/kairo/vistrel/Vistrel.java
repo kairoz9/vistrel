@@ -1,13 +1,19 @@
 package com.kairo.vistrel;
 
 import com.kairo.vistrel.command.VistrelCommands;
+import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
 import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
 import net.neoforged.neoforge.common.NeoForge;
 
-@Mod(Constants.MOD_ID)
+/**
+ * NeoForge 引导入口
+ *
+ * <p>dist 过滤发生在 FML 加载期、早于类体链接，因此本类可直接引用客户端事件类型。
+ */
+@Mod(value = Constants.MOD_ID, dist = Dist.CLIENT)
 public class Vistrel {
     public Vistrel(IEventBus eventBus) {
         CommonBootstrap.init();

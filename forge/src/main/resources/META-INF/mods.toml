@@ -1,6 +1,7 @@
 modLoader = "javafml" #mandatory
 loaderVersion = "[${loader_version},)" #mandatory
 license = "${mod_license}" # Review your options at https://choosealicense.com/.
+clientSideOnly = true
 issueTrackerURL = "https://github.com/kairoz9/vistrel/issues" #optional
 
 [[mods]] #mandatory
@@ -23,11 +24,11 @@ modId = "forge"
 mandatory = true
 versionRange = "[${api_version},)"
 ordering = "NONE"
-side = "BOTH"
+side = "CLIENT"
 
 [[dependencies.${mod_id}]]
 modId = "minecraft"
 mandatory = true
 versionRange = "${minecraft_version_range}"
 ordering = "NONE"
-side = "BOTH"
+side = "CLIENT"

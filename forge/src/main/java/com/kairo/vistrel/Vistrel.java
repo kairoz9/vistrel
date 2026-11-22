@@ -1,26 +1,21 @@
 package com.kairo.vistrel;
 
-import com.kairo.vistrel.command.VistrelCommands;
-import net.minecraftforge.client.event.RegisterClientCommandsEvent;
-import net.minecraftforge.common.MinecraftForge;
-import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.fml.common.Mod;
+import net.minecraftforge.fml.loading.FMLEnvironment;
 
+/**
+ * Forge 引导入口
+ *
+ * <p>1.20 的 {@code @Mod} 无 dist 参数，故在构造器首行短路服务端；客户端符号全部
+ * 下沉至 {@link VistrelClientBootstrap}，使本类字节码不含 {@code net.minecraft.client} 引用。
+ */
 @Mod(Constants.MOD_ID)
 public class Vistrel {
     public Vistrel() {
+        if (!FMLEnvironment.dist.isClient()) {
+            return;
+        }
         CommonBootstrap.init();
-        // 注册游戏内服务控制命令：客户端命令在 game bus，树体在 common
-        MinecraftForge.EVENT_BUS.addListener(this::onRegisterClientCommands);
-        // 内容采样随客户端 tick（20Hz）
-        MinecraftForge.EVENT_BUS.addListener((TickEvent.ClientTickEvent event) -> {
-            if (event.phase == TickEvent.Phase.END) {
-                VistrelService.onClientTick();
-            }
-        });
-    }
-
-    private void onRegisterClientCommands(RegisterClientCommandsEvent event) {
-        event.getDispatcher().register(VistrelCommands.tree());
+        VistrelClientBootstrap.init();
     }
 }
