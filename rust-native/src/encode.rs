@@ -581,12 +581,14 @@ pub(crate) const fn nv12_len(width: usize, height: usize) -> usize {
     width * height * 3 / 2
 }
 
-/// 某档位下主机帧（NV12）应有的字节数：**显示尺寸** × 1.5
+/// 主机帧（NV12）在给定对齐粒度下的字节数：**编码尺寸** × 1.5
 ///
-/// 这是**跨语言的约定**：游戏侧按同一个式子算帧长。编码尺寸的
-/// 账一律走 [`nv12_len`]，不从这里推。
-pub(crate) fn display_nv12_len(profile: &StreamingProfile) -> usize {
-    nv12_len(profile.width(), profile.height())
+/// 跨语言约定：采集侧按编码尺寸出帧（尺寸由编码器回执给出）。生产路径用编码器自己的
+/// `extent()`，本函数只供测试造载荷。
+#[cfg(test)]
+pub(crate) fn host_nv12_len(profile: &StreamingProfile, align: (usize, usize)) -> usize {
+    let (width, height) = profile.coded_extent(align);
+    nv12_len(width, height)
 }
 
 #[cfg(test)]
@@ -596,19 +598,6 @@ mod tests {
     /// 几何用例共用的事实构造：码率不在断言范围，占位即可
     fn fact_profile(w: usize, h: usize, fps: usize) -> StreamingProfile {
         StreamingProfile::new(w, h, fps, 4_000_000)
-    }
-
-    /// display 与 coded 两种口径的差额必须正好是补齐行：差算错就说明还有一处在自推
-    #[test]
-    fn test_nv12_len_display_and_coded_differ_only_by_padding_rows() {
-        let profile = fact_profile(MAX_WIDTH, MAX_HEIGHT, 30);
-        let coded_height = profile.coded_extent((MAX_CODED_ALIGN, MAX_CODED_ALIGN)).1;
-        assert!(coded_height > MAX_HEIGHT, "本用例前提：2160 不能被 64 整除");
-        assert_eq!(
-            nv12_len(MAX_WIDTH, coded_height) - display_nv12_len(&profile),
-            nv12_len(MAX_WIDTH, coded_height - MAX_HEIGHT),
-            "差额必须正好是补齐行的字节数"
-        );
     }
 
     /// 显示几何按后端**输入**要求的并集向上取整：宽 %4、高 %2

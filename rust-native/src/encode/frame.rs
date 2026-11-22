@@ -460,7 +460,7 @@ mod tests {
         let pool = FramePool::new();
         pool.attach(heap_blocks());
         let mut buf = pool.acquire().expect("池里必须有余量");
-        buf.write(&[1u8; 16]).unwrap();
+        buf.write(&[1u8; 16], None).unwrap();
         inbox.push(VideoFrame {
             birth_nanos: 1,
             payload: FramePayload::Host { frame: buf },
@@ -498,7 +498,7 @@ mod tests {
         pool.attach(heap_blocks());
 
         let mut buf1 = pool.acquire().expect("池里必须有余量");
-        buf1.write(&[1u8; 128]).unwrap();
+        buf1.write(&[1u8; 128], None).unwrap();
         inbox.push(VideoFrame {
             birth_nanos: 100,
             payload: FramePayload::Host { frame: buf1 },
@@ -506,7 +506,7 @@ mod tests {
 
         // 再次 push 覆盖前一帧，前一帧必须自动通过 RAII Drop 归还给 pool
         let mut buf2 = pool.acquire().expect("池里必须有余量");
-        buf2.write(&[2u8; 128]).unwrap();
+        buf2.write(&[2u8; 128], None).unwrap();
         inbox.push(VideoFrame {
             birth_nanos: 200,
             payload: FramePayload::Host { frame: buf2 },

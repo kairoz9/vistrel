@@ -232,7 +232,7 @@ fn pool_payload(pool: &std::sync::Arc<FramePool>, source: &[u8]) -> Result<Frame
     let mut frame = pool
         .acquire()
         .ok_or_else(|| "主机帧池无可用块".to_string())?;
-    frame.write(source)?;
+    frame.write(source, None)?;
     Ok(FramePayload::Host { frame })
 }
 
@@ -589,7 +589,7 @@ fn nvenc_host_input_produces_real_bitstream() {
     let noisy = make_nv12_frame(1920, 1080, 7);
     assert_eq!(noisy.len(), 3_110_400);
     let mut frame = pool.acquire().expect("池块应可用");
-    frame.write(&noisy).expect("块写入");
+    frame.write(&noisy, None).expect("块写入");
     let (nalu, is_key) = encoder
         .encode(&FramePayload::Host { frame }, true)
         .expect("编码应成功");

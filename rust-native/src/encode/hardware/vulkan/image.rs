@@ -303,91 +303,24 @@ impl Nv12Image {
 
     /// 把一整帧 NV12 写进暂存缓冲（主机侧，不产生任何 GPU 命令）
     ///
-    /// 输入布局是 Y 平面（`w*h` 字节）紧跟交错 UV 平面（`w*h/2` 字节）。与
-    /// [`Nv12Image::record_upload`] 配对：先 `stage`，再把拷贝录进命令缓冲。
+    /// 输入布局是 Y 平面（`w*h` 字节）紧跟交错 UV 平面（`w*h/2` 字节），`w/h` **就是编码尺寸**：
+    /// 采集侧按编码尺寸出帧，补齐边在采集侧就已就位，这里只需一次整帧 memcpy。
+    /// 与 [`Nv12Image::record_upload`] 配对：先 `stage`，再把拷贝录进命令缓冲。
     ///
     /// 主机写暂存缓冲与上一帧的 GPU 读不能重叠。这一点由 `FrameEncoder` 保证——
     /// 它每帧提交后都等到栅栏，调用 `stage` 时上一帧的拷贝早已完成。
-    ///
-    /// 上传一帧 NV12，源按**显示尺寸**交付
-    ///
-    /// 主机帧固定为 `显示尺寸 × 1.5` 字节：采集侧不知道编码尺寸，也不该知道。两者的差只
-    /// 出现在高度方向（宽度按 64 对齐时 1920/2560 本就对齐），由本方法用最后一行把补齐行
-    /// 填满；这些行随后被码流里的裁剪窗口抹掉（H.264 `frame_cropping_flag`、HEVC
-    /// `conf_win_*`），解码器看不到。〔与 `crate::encode::display_nv12_len` 同一个约定〕
-    pub fn stage(&mut self, nv12: &[u8], src: vk::Extent2D) -> Result<(), String> {
-        let expected = frame_bytes(src);
+    pub fn stage(&mut self, nv12: &[u8]) -> Result<(), String> {
+        let extent = self.image.extent();
+        let expected = frame_bytes(extent);
         if nv12.len() < expected {
             return Err(format!(
-                "NV12 帧长度不足: 期望 {expected}（{}x{}）, 实际 {}",
-                src.width,
-                src.height,
+                "NV12 帧长度不足: 期望 {expected}（编码尺寸 {}x{}）, 实际 {}",
+                extent.width,
+                extent.height,
                 nv12.len()
             ));
         }
-
-        let extent = self.image.extent();
-        // 几何一致是热路径（采集侧将来对齐到同一粒度时也走这里）：一次整帧 memcpy
-        if src == extent {
-            self.staging.write(&nv12[..expected])?;
-            return Ok(());
-        }
-
-        let src_w = src.width as usize;
-        let src_y_rows = src.height as usize;
-        let y_bytes = src_w * src_y_rows;
-        let dst_y_bytes = extent.width as usize * extent.height as usize;
-        self.pad_plane(
-            &nv12[..y_bytes],
-            src_w,
-            src_y_rows,
-            0,
-            extent.height as usize,
-        )?;
-        self.pad_plane(
-            &nv12[y_bytes..],
-            src_w,
-            src_y_rows / 2,
-            dst_y_bytes,
-            extent.height as usize / 2,
-        )
-    }
-
-    /// 拷一个平面进暂存缓冲，缺的行重复最后一行
-    fn pad_plane(
-        &mut self,
-        plane: &[u8],
-        src_w: usize,
-        src_rows: usize,
-        dst_off: usize,
-        dst_rows: usize,
-    ) -> Result<(), String> {
-        let rows = src_rows.min(dst_rows);
-        if rows == 0 {
-            return Ok(());
-        }
-        let visible = src_w * rows;
-        let last_row = &plane[visible - src_w..visible];
-        let dst_w = self.image.extent().width as usize;
-        if src_w == dst_w {
-            // 行距一致：可见区一次写完，补齐行是同一条重复
-            self.staging.write_at(dst_off, &plane[..visible])?;
-            if dst_rows > rows {
-                self.staging
-                    .write_at(dst_off + visible, &last_row.repeat(dst_rows - rows))?;
-            }
-        } else {
-            for row in 0..rows {
-                self.staging.write_at(
-                    dst_off + row * dst_w,
-                    &plane[row * src_w..(row + 1) * src_w],
-                )?;
-            }
-            for row in rows..dst_rows {
-                self.staging.write_at(dst_off + row * dst_w, last_row)?;
-            }
-        }
-        Ok(())
+        self.staging.write(&nv12[..expected])
     }
 
     /// 录制「暂存缓冲 → 图像」的拷贝与布局转换
@@ -604,8 +537,8 @@ impl Nv12Image {
 #[cfg(test)]
 impl Nv12Image {
     /// 上传一帧并等到完成
-    fn upload_blocking(&mut self, nv12: &[u8], src: vk::Extent2D) -> Result<(), String> {
-        self.stage(nv12, src)?;
+    fn upload_blocking(&mut self, nv12: &[u8]) -> Result<(), String> {
+        self.stage(nv12)?;
         let device = self.device.clone();
         // SAFETY: 命令缓冲由 run_oneshot 创建并保证处于录制状态
         run_oneshot(&device, None, |cmd| unsafe { self.record_upload(cmd) })?;
@@ -739,9 +672,7 @@ impl DpbImages {
 
 // 不需要自定义 Drop：图像与显存由 `OwnedImage` 归还，它在析构前会 `device_wait_idle`。
 
-/// NV12 整帧字节数 —— 口径由传入的 `extent` 决定
-///
-/// 上传（`stage`）传显示尺寸，平面拷贝与读回传编码尺寸：两者相差补齐行，各自负责。
+/// NV12 整帧字节数（编码尺寸）
 fn frame_bytes(extent: vk::Extent2D) -> usize {
     nv12_len(extent.width as usize, extent.height as usize)
 }
@@ -838,7 +769,7 @@ mod tests {
             *value = if i % 2 == 0 { 128 } else { (i % 127) as u8 };
         }
 
-        if let Err(e) = image.upload_blocking(&nv12, extent) {
+        if let Err(e) = image.upload_blocking(&nv12) {
             println!("上传失败: {e}");
             return;
         }
@@ -864,10 +795,10 @@ mod tests {
         );
     }
 
-    /// 显示尺寸的主机帧被补齐到编码尺寸：可见区逐字节保留，补齐行重复最后一行
+    /// 主机帧按编码尺寸交付：上传即整帧 memcpy，补齐边在采集侧就已就位
     #[test]
     #[ignore = "requires GPU"]
-    fn test_vulkan_video_nv12_image_pads_display_frame() {
+    fn test_vulkan_video_nv12_image_uploads_coded_frame_verbatim() {
         let Ok(ctx) = VulkanInstance::new("Vistrel-S1c-pad") else {
             println!("Vulkan 不可用，跳过");
             return;
@@ -886,98 +817,51 @@ mod tests {
                 return;
             }
         };
-        let extent = match caps.align_extent(1920, 1080) {
-            Ok(extent) => extent,
-            Err(e) => {
-                println!("几何对齐失败，跳过: {e}");
+        // 1080p 只在高度方向补齐（1080 → 1088）；856x480 宽高都补齐（→ 896x512）
+        for (width, height) in [(1920, 1080), (856, 480)] {
+            let extent = match caps.align_extent(width, height) {
+                Ok(extent) => extent,
+                Err(e) => {
+                    println!("几何对齐失败，跳过: {e}");
+                    return;
+                }
+            };
+            let mut image = match Nv12Image::new(&device, extent) {
+                Ok(image) => image,
+                Err(e) => {
+                    println!("输入图创建失败: {e}");
+                    return;
+                }
+            };
+
+            // 每个字节都不同：行距或平面偏移算错都会在比对里暴露
+            let mut src = vec![0u8; frame_bytes(extent)];
+            for (i, byte) in src.iter_mut().enumerate() {
+                *byte = (i % 251) as u8;
+            }
+
+            if let Err(e) = image.upload_blocking(&src) {
+                println!("上传失败: {e}");
                 return;
             }
-        };
-        let display = vk::Extent2D {
-            width: 1920,
-            height: 1080,
-        };
-        if display == extent {
-            println!("该设备 1080p 已对齐，无需补齐，跳过");
-            return;
-        }
-        let mut image = match Nv12Image::new(&device, extent) {
-            Ok(image) => image,
-            Err(e) => {
-                println!("输入图创建失败: {e}");
+            if let Err(e) = image.poison_staging() {
+                println!("暂存缓冲污染失败: {e}");
                 return;
             }
-        };
+            let back = match image.readback_blocking() {
+                Ok(back) => back,
+                Err(e) => {
+                    println!("读回失败: {e}");
+                    return;
+                }
+            };
 
-        // 行号写进字节：补齐时抄错行、平面偏移算错都会在比对里暴露
-        let src_w = display.width as usize;
-        let src_rows = display.height as usize;
-        let mut src = vec![0u8; frame_bytes(display)];
-        for row in 0..src_rows {
-            src[row * src_w..(row + 1) * src_w].fill((row % 251) as u8);
-        }
-        let uv_off = src_w * src_rows;
-        for row in 0..src_rows / 2 {
-            src[uv_off + row * src_w..uv_off + (row + 1) * src_w].fill((row % 127) as u8);
-        }
-
-        if let Err(e) = image.upload_blocking(&src, display) {
-            println!("上传失败: {e}");
-            return;
-        }
-        if let Err(e) = image.poison_staging() {
-            println!("暂存缓冲污染失败: {e}");
-            return;
-        }
-        let back = match image.readback_blocking() {
-            Ok(back) => back,
-            Err(e) => {
-                println!("读回失败: {e}");
-                return;
-            }
-        };
-
-        let dst_w = extent.width as usize;
-        let dst_y_bytes = dst_w * extent.height as usize;
-        assert_eq!(back.len(), frame_bytes(extent), "读回长度必须是编码尺寸");
-        for row in 0..src_rows {
-            assert!(
-                back[row * dst_w..(row + 1) * dst_w]
-                    .iter()
-                    .all(|b| *b == (row % 251) as u8),
-                "亮度第 {row} 行被改动"
+            assert_eq!(back.len(), frame_bytes(extent), "读回长度必须是编码尺寸");
+            assert_eq!(
+                back, src,
+                "整帧必须逐字节原样落到图像上（可见区与补齐边都不该被改写）"
             );
+            println!("NV12 原样上传一致: 编码 {}x{}", extent.width, extent.height);
         }
-        let last_luma = (src_rows - 1) % 251;
-        for row in src_rows..extent.height as usize {
-            assert!(
-                back[row * dst_w..(row + 1) * dst_w]
-                    .iter()
-                    .all(|b| *b == last_luma as u8),
-                "亮度补齐行 {row} 不是最后一行的副本"
-            );
-        }
-        let uv_rows = src_rows / 2;
-        for row in 0..uv_rows {
-            assert!(
-                back[dst_y_bytes + row * dst_w..dst_y_bytes + (row + 1) * dst_w]
-                    .iter()
-                    .all(|b| *b == (row % 127) as u8),
-                "色度第 {row} 行被改动"
-            );
-        }
-        let last_chroma = (uv_rows - 1) % 127;
-        for row in uv_rows..extent.height as usize / 2 {
-            assert!(
-                back[dst_y_bytes + row * dst_w..dst_y_bytes + (row + 1) * dst_w]
-                    .iter()
-                    .all(|b| *b == last_chroma as u8),
-                "色度补齐行 {row} 不是最后一行的副本"
-            );
-        }
-        println!(
-            "NV12 补齐一致: 显示 {}x{} → 编码 {}x{}",
-            display.width, display.height, extent.width, extent.height
-        );
     }
 }
