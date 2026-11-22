@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.kairo.vistrel.streaming.ProfileCoordinator.ContentSnapshot;
-import com.kairo.vistrel.streaming.SessionServer.SessionEvent;
 import com.kairo.vistrel.streaming.SessionServer.Tier;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -22,25 +21,34 @@ class ProfileCoordinatorTest {
     private static final long SECOND = 1_000_000_000L;
 
     /**
-     * 全量记录型监听器：建立与档位变化记档位，暂停与关闭计数
+     * 唤醒时读当下状态：活跃记档位，暂停计数，关闭只记一次
      */
-    private static final class RecordingListener implements java.util.function.Consumer<SessionEvent> {
+    private static final class RecordingListener implements Runnable {
         final List<Tier> applied = new CopyOnWriteArrayList<>();
         final AtomicInteger paused = new AtomicInteger();
         final AtomicInteger closed = new AtomicInteger();
+        private volatile ProfileCoordinator worker;
+        private boolean lastLive = false;
+
+        void attach(ProfileCoordinator worker) {
+            this.worker = worker;
+        }
 
         @Override
-        public void accept(SessionEvent event) {
-            if (event instanceof SessionEvent.Established established) {
-                applied.add(established.tier());
-            } else if (event instanceof SessionEvent.TierChanged tierChanged) {
-                if (tierChanged.phase() == SessionEvent.Phase.PAUSED) {
-                    paused.incrementAndGet();
-                } else {
-                    applied.add(tierChanged.tier());
+        public void run() {
+            SessionServer.SessionState state = worker.current();
+            if (state == null) {
+                if (lastLive) {
+                    closed.incrementAndGet();
                 }
+                lastLive = false;
+                return;
+            }
+            lastLive = true;
+            if (state.phase() == SessionServer.Phase.PAUSED) {
+                paused.incrementAndGet();
             } else {
-                closed.incrementAndGet();
+                applied.add(state.tier());
             }
         }
     }
@@ -109,12 +117,21 @@ class ProfileCoordinatorTest {
         }
     }
 
+    /**
+     * 装配协调器并回挂监听器（回调里经 worker.current() 现读）
+     */
+    private static ProfileCoordinator newWorker(ProfileCoordinator.Applier applier, RecordingListener listener) {
+        ProfileCoordinator worker = new ProfileCoordinator(applier, listener);
+        listener.attach(worker);
+        return worker;
+    }
+
     @Test
     void testContentChangeStableAppliesTarget() throws Exception {
         RecordingListener listener = new RecordingListener();
         AtomicReference<String> seenRequest = new AtomicReference<>();
         CountDownLatch askLatch = new CountDownLatch(1);
-        ProfileCoordinator worker = new ProfileCoordinator(applierAnswering(seenRequest, askLatch), listener);
+        ProfileCoordinator worker = newWorker(applierAnswering(seenRequest, askLatch), listener);
         worker.start();
         try {
             // 生产时序：offer 协商成功先落账种入活跃基线（经 listener 广播初始档位），
@@ -140,7 +157,7 @@ class ProfileCoordinatorTest {
         AtomicInteger askCount = new AtomicInteger();
         AtomicReference<String> seenRequest = new AtomicReference<>();
         CountDownLatch askLatch = new CountDownLatch(1);
-        ProfileCoordinator worker = new ProfileCoordinator((width, height, fps, bpp) -> {
+        ProfileCoordinator worker = newWorker((width, height, fps, bpp) -> {
             askCount.incrementAndGet();
             seenRequest.set(width + "x" + height + "@" + fps + " bpp=" + bpp);
             askLatch.countDown();
@@ -167,7 +184,7 @@ class ProfileCoordinatorTest {
     void testViewportAbsorbedByContentSkipsAsk() throws Exception {
         RecordingListener listener = new RecordingListener();
         AtomicInteger askCount = new AtomicInteger();
-        ProfileCoordinator worker = new ProfileCoordinator((width, height, fps, bpp) -> {
+        ProfileCoordinator worker = newWorker((width, height, fps, bpp) -> {
             askCount.incrementAndGet();
             return replyJson(width, height, fps);
         }, listener);
@@ -192,7 +209,7 @@ class ProfileCoordinatorTest {
     void testSeededSnapshotDrivesOfferPlanWithoutAsk() throws Exception {
         RecordingListener listener = new RecordingListener();
         AtomicInteger askCount = new AtomicInteger();
-        ProfileCoordinator worker = new ProfileCoordinator((width, height, fps, bpp) -> {
+        ProfileCoordinator worker = newWorker((width, height, fps, bpp) -> {
             askCount.incrementAndGet();
             return replyJson(width, height, fps);
         }, listener);
@@ -215,7 +232,7 @@ class ProfileCoordinatorTest {
         RecordingListener listener = new RecordingListener();
         AtomicReference<String> seenRequest = new AtomicReference<>();
         CountDownLatch askLatch = new CountDownLatch(1);
-        ProfileCoordinator worker = new ProfileCoordinator(applierAnswering(seenRequest, askLatch), listener);
+        ProfileCoordinator worker = newWorker(applierAnswering(seenRequest, askLatch), listener);
         worker.start();
         try {
             worker.noteOfferAnswer(establishJson(2560, 1440, 90), 0.1);
@@ -233,7 +250,7 @@ class ProfileCoordinatorTest {
         RecordingListener listener = new RecordingListener();
         AtomicReference<String> seenRequest = new AtomicReference<>();
         CountDownLatch askLatch = new CountDownLatch(1);
-        ProfileCoordinator worker = new ProfileCoordinator(applierAnswering(seenRequest, askLatch), listener);
+        ProfileCoordinator worker = newWorker(applierAnswering(seenRequest, askLatch), listener);
         worker.start();
         try {
             worker.noteOfferAnswer(establishJson(1920, 1080, 60), 0.1);
@@ -258,7 +275,7 @@ class ProfileCoordinatorTest {
             askHappened.countDown();
             return applierWithNoAnswer().apply(width, height, fps, bpp);
         };
-        ProfileCoordinator worker = new ProfileCoordinator(countingReject, listener);
+        ProfileCoordinator worker = newWorker(countingReject, listener);
         worker.start();
         try {
             worker.noteOfferAnswer(establishJson(1920, 1080, 60), 0.1);
@@ -286,7 +303,7 @@ class ProfileCoordinatorTest {
             askCount.incrementAndGet();
             return "{}";
         };
-        ProfileCoordinator worker = new ProfileCoordinator(counting, listener);
+        ProfileCoordinator worker = newWorker(counting, listener);
         // 不 start：越界拒绝在工作线程之外同步完成
         worker.onClientSettings(null, null, 0.95);
         assertEquals(0, askCount.get(), "越界 BPP 不得触达 Native");
@@ -296,7 +313,7 @@ class ProfileCoordinatorTest {
     void testEqualBppRequestSkipsDuplicateAsk() throws Exception {
         RecordingListener listener = new RecordingListener();
         AtomicInteger askCount = new AtomicInteger();
-        ProfileCoordinator worker = new ProfileCoordinator((width, height, fps, bpp) -> {
+        ProfileCoordinator worker = newWorker((width, height, fps, bpp) -> {
             askCount.incrementAndGet();
             return replyJson(width, height, fps);
         }, listener);
@@ -321,7 +338,7 @@ class ProfileCoordinatorTest {
     @Test
     void testZeroGeometryPausesImmediately() {
         RecordingListener listener = new RecordingListener();
-        ProfileCoordinator worker = new ProfileCoordinator((width, height, fps, bpp) -> null, listener);
+        ProfileCoordinator worker = newWorker((width, height, fps, bpp) -> null, listener);
         // 暂停广播是会话级事实：无会话的内容丢失无事可停，不广播
         worker.onContentSnapshot(ContentSnapshot.EMPTY, 0L);
         assertEquals(0, listener.paused.get(), "无会话的内容丢失不得广播暂停");
@@ -338,7 +355,7 @@ class ProfileCoordinatorTest {
     @Test
     void testEntriesAreNoopsAfterShutdown() {
         RecordingListener listener = new RecordingListener();
-        ProfileCoordinator worker = new ProfileCoordinator(applierWithNoAnswer(), listener);
+        ProfileCoordinator worker = newWorker(applierWithNoAnswer(), listener);
         worker.start();
         worker.shutdown();
 
@@ -352,23 +369,73 @@ class ProfileCoordinatorTest {
     }
 
     @Test
-    void testPauseResumeForcesRebuild() throws Exception {
+    void testPauseResumeRepublishesStreamingWithoutAsk() throws Exception {
         RecordingListener listener = new RecordingListener();
-        AtomicReference<String> seenRequest = new AtomicReference<>();
-        CountDownLatch askLatch = new CountDownLatch(1);
-        ProfileCoordinator worker = new ProfileCoordinator(applierAnswering(seenRequest, askLatch), listener);
+        AtomicInteger askCount = new AtomicInteger();
+        ProfileCoordinator worker = newWorker((width, height, fps, bpp) -> {
+            askCount.incrementAndGet();
+            return replyJson(width, height, fps);
+        }, listener);
         worker.start();
         try {
-            // 先建立基线再最小化（0×0 暂停），随后同一几何恢复：必须走一次 ask 且带 resume 标志
+            // 先建立基线再最小化（0×0 暂停），随后同一几何恢复：相位翻转负责重建，无需再 ask
             worker.noteOfferAnswer(establishJson(1920, 1080, 60), 0.1);
             worker.onContentSnapshot(new ContentSnapshot(1920, 1080, 60, false, 0), 0L);
             worker.onContentSnapshot(ContentSnapshot.EMPTY, SECOND);
             assertEquals(1, listener.paused.get(), "最小化必须暂停");
+            assertEquals(SessionServer.Phase.PAUSED, worker.current().phase(), "暂停必须在当下事实上可见");
             worker.onContentSnapshot(new ContentSnapshot(1920, 1080, 60, false, 0), SECOND * 2);
             worker.onContentSnapshot(new ContentSnapshot(1920, 1080, 60, false, 0), SECOND * 3);
-            assertTrue(askLatch.await(2, TimeUnit.SECONDS), "恢复后的首个稳定目标必须 ask");
             awaitSize(listener.applied, 2);
-            assertEquals(tier(1920, 1080, 60), listener.applied.get(1), "恢复必须重新下发同一档位");
+            assertEquals(0, askCount.get(), "恢复按在位档位重建，不重复 ask");
+            assertEquals(tier(1920, 1080, 60), listener.applied.get(1), "恢复后重发同一档位");
+        } finally {
+            worker.shutdown();
+        }
+    }
+
+    /**
+     * 暂停与在途 ask 交错：应答只写档位、不改写相位；恢复时按最新档位重建且不重复 ask
+     * （应答若把 STREAMING 写回去，采集侧会为 0×0 画面重建管线）
+     */
+    @Test
+    void testPauseDuringInflightAskKeepsPhaseAndResumesWithAppliedTier() throws Exception {
+        RecordingListener listener = new RecordingListener();
+        AtomicInteger askCount = new AtomicInteger();
+        CountDownLatch askEntered = new CountDownLatch(1);
+        CountDownLatch releaseAsk = new CountDownLatch(1);
+        ProfileCoordinator worker = newWorker((width, height, fps, bpp) -> {
+            if (askCount.incrementAndGet() == 1) {
+                askEntered.countDown();
+                try {
+                    assertTrue(releaseAsk.await(2, TimeUnit.SECONDS), "测试必须放行在途 ask");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return replyJson(width, height, fps);
+        }, listener);
+        worker.start();
+        try {
+            worker.noteOfferAnswer(establishJson(1920, 1080, 60), 0.1);
+            // 内容稳定窗跨过：首个 ask 进入阻塞 JNI
+            worker.onContentSnapshot(new ContentSnapshot(2560, 1440, 60, false, 0), 0L);
+            worker.onContentSnapshot(new ContentSnapshot(2560, 1440, 60, false, 0), SECOND);
+            assertTrue(askEntered.await(2, TimeUnit.SECONDS), "稳定目标必须已进入阻塞 ask");
+            // ask 在途时内容丢失：暂停立即落账，采集侧已停采
+            worker.onContentSnapshot(ContentSnapshot.EMPTY, SECOND * 2);
+            assertEquals(1, listener.paused.get(), "内容丢失必须立即暂停");
+            releaseAsk.countDown();
+            Thread.sleep(200);
+            SessionServer.SessionState afterAsk = worker.current();
+            assertEquals(SessionServer.Phase.PAUSED, afterAsk.phase(), "在途应答不得把相位改回 STREAMING");
+            assertEquals(tier(2560, 1440, 60), afterAsk.tier(), "应答的档位照常落账（与 Native 实际配置一致）");
+            // 恢复：立即按这份最新档位翻回 STREAMING，且目标已等于已尝试档位，不再重复 ask
+            worker.onContentSnapshot(new ContentSnapshot(2560, 1440, 60, false, 0), SECOND * 3);
+            worker.onContentSnapshot(new ContentSnapshot(2560, 1440, 60, false, 0), SECOND * 4);
+            awaitSize(listener.applied, 2);
+            assertEquals(1, askCount.get(), "恢复不得重复下发已生效档位");
+            assertEquals(tier(2560, 1440, 60), listener.applied.get(1), "恢复后的生效档位");
         } finally {
             worker.shutdown();
         }
@@ -379,7 +446,7 @@ class ProfileCoordinatorTest {
         RecordingListener listener = new RecordingListener();
         AtomicReference<String> seenRequest = new AtomicReference<>();
         CountDownLatch askLatch = new CountDownLatch(1);
-        ProfileCoordinator worker = new ProfileCoordinator(applierAnswering(seenRequest, askLatch), listener);
+        ProfileCoordinator worker = newWorker(applierAnswering(seenRequest, askLatch), listener);
         worker.start();
         try {
             worker.noteOfferAnswer(establishJson(1920, 1080, 60), 0.1);
@@ -400,7 +467,7 @@ class ProfileCoordinatorTest {
     void testIdenticalValueProducesNoRequest() throws Exception {
         RecordingListener listener = new RecordingListener();
         AtomicInteger askCount = new AtomicInteger();
-        ProfileCoordinator worker = new ProfileCoordinator((width, height, fps, bpp) -> {
+        ProfileCoordinator worker = newWorker((width, height, fps, bpp) -> {
             askCount.incrementAndGet();
             return replyJson(width, height, fps);
         }, listener);
@@ -421,7 +488,7 @@ class ProfileCoordinatorTest {
     void testSessionCloseResetsPendingAndAppliedBaseline() throws Exception {
         RecordingListener listener = new RecordingListener();
         AtomicReference<String> seenRequest = new AtomicReference<>();
-        ProfileCoordinator worker = new ProfileCoordinator(applierAnswering(seenRequest, null), listener);
+        ProfileCoordinator worker = newWorker(applierAnswering(seenRequest, null), listener);
         worker.start();
         try {
             // 生产前提：渲染帧只在会话活跃后采样（isStreaming 门控），先落账基线再验证关闭
@@ -442,7 +509,7 @@ class ProfileCoordinatorTest {
         RecordingListener listener = new RecordingListener();
         CountDownLatch askEntered = new CountDownLatch(1);
         CountDownLatch releaseAsk = new CountDownLatch(1);
-        ProfileCoordinator worker = new ProfileCoordinator((width, height, fps, bpp) -> {
+        ProfileCoordinator worker = newWorker((width, height, fps, bpp) -> {
             askEntered.countDown();
             try {
                 assertTrue(releaseAsk.await(2, TimeUnit.SECONDS), "测试必须放行在途 ask");
@@ -479,7 +546,7 @@ class ProfileCoordinatorTest {
         RecordingListener listener = new RecordingListener();
         CountDownLatch askEntered = new CountDownLatch(1);
         CountDownLatch releaseAsk = new CountDownLatch(1);
-        ProfileCoordinator worker = new ProfileCoordinator((width, height, fps, bpp) -> {
+        ProfileCoordinator worker = newWorker((width, height, fps, bpp) -> {
             askEntered.countDown();
             try {
                 assertTrue(releaseAsk.await(2, TimeUnit.SECONDS), "测试必须放行在途 ask");

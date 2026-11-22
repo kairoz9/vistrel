@@ -7,7 +7,6 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Consumer;
 import java.util.concurrent.locks.LockSupport;
 
 /**
@@ -18,21 +17,25 @@ import java.util.concurrent.locks.LockSupport;
  *
  * <p>内容变化须经稳定窗：plan 是纯函数，快照不变则目标必不变——客户端 tick（20Hz）只做一次
  * 快照值比较，同一快照持续 1 秒才合成目标放行；窗口内反复变化只有最终稳定者被放行；
- * 与上次已尝试目标一致则跳过——拒绝后的重试风暴由 lastAttempted 统一记账；0×0 → 立即广播
- * PAUSED 并清去重锚，恢复后同一目标照常重发。
+ * 与上次已尝试目标一致则跳过——拒绝后的重试风暴由 lastAttempted 统一记账；0×0 → 立即翻
+ * PAUSED，恢复时立即翻回 STREAMING（采集先按在位档位重建），ask 只微调几何。
+ *
+ * <p>会话状态是唯一一份不可变记录（{@link SessionServer.SessionState}）：换代 / 换相位 / 换档位
+ * 都整体替换实例，在途 ask 以会话代号结账。监听器只收唤醒，消费者在动作点经 {@link #current()}
+ * 现读，因此投递顺序与线程交错不参与正确性。
  *
  * <p>线程模型：
  * <ul>
  *   <li>客户端线程每次 tick 喂内容快照：会话活跃时经 {@link #onContentSnapshot}（规划 + 稳定判定，
- *       纯内存算术，无锁无阻塞），事件落 latest-wins 槽位并唤醒工作线程；暂停事件在客户端
- *       线程就地分发。无会话时经 {@link #seedContentSnapshot} 仅更新快照，供 offer 规划使用。
+ *       纯内存算术，无锁无阻塞），目标落 latest-wins 槽位并唤醒工作线程；相位翻转在客户端
+ *       线程就地发布。无会话时经 {@link #seedContentSnapshot} 仅更新快照，供 offer 规划使用。
  *       稳定窗状态（lastSeenAtNanos / seenDirty / paused）只由客户端线程读写</li>
- *   <li>信令线程经三个入口落位会话事件：{@link #noteOfferAnswer}（offer 落账 → 建立事件）、
+ *   <li>信令线程经三个入口落位会话状态：{@link #noteOfferAnswer}（offer 落账）、
  *       {@link #onClientSettings}（外部偏好变更：视口 / BPP 任一变化立即落槽位）、
- *       {@link #onSessionClosed}（关闭复位 → 关闭事件）。lastAttempted 的跨线程写只发生在
+ *       {@link #onSessionClosed}（关闭复位）。lastAttempted 的跨线程写只发生在
  *       offer 落账与 ask 记账——Java 引用写原子，最坏滞后一帧重放行一次</li>
  *   <li>工作线程串行执行阻塞 ask（{@link Applier}，即 JNI {@code applyProfile}），
- *       应答 JSON 是档位的唯一事实源，档位变化事件广播给全部已注册监听器</li>
+ *       应答 JSON 是档位的唯一事实源，生效即替换会话状态并唤醒监听器</li>
  * </ul>
  *
  * <p>拒绝不自动重试：目标统一记为已尝试，避免编码器持续拒绝时的风暴；
@@ -87,8 +90,8 @@ public final class ProfileCoordinator {
     }
 
     private final Applier applier;
-    // 事件监听器：写少读多，广播来自工作线程 / 渲染线程 / 信令线程，各自跳线程
-    private final List<Consumer<SessionServer.SessionEvent>> listeners = new CopyOnWriteArrayList<>();
+    // 唤醒监听器：写少读多，回调各自跳线程
+    private final List<Runnable> listeners = new CopyOnWriteArrayList<>();
     // latest-wins 槽位直接存待下发档位
     private final AtomicReference<SessionServer.Tier> pending = new AtomicReference<>(null);
     private final Thread worker;
@@ -98,10 +101,13 @@ public final class ProfileCoordinator {
     private volatile int viewportWidth = 0;
     private volatile int viewportHeight = 0;
     /**
-     * 最近一次实际生效的档位；null = 无会话
-     * 换代必换实例——在途 ask 结账按引用同一性作废，值相等不代表同一会话
+     * 当前会话状态；null = 无会话。任何变化都整体替换实例
      */
-    private final AtomicReference<SessionServer.Tier> lastTier = new AtomicReference<>(null);
+    private final AtomicReference<SessionServer.SessionState> published = new AtomicReference<>(null);
+    /**
+     * 会话代号：协商落账时递增，只供在途 ask 结账识别换代（消费者不读）
+     */
+    private volatile long generation = 0L;
     // ---- 内容稳定计时：lastSeenAtNanos/seenDirty 只由渲染线程读写；lastAttempted 另有信令线程记账 ----
     private volatile ContentSnapshot latestSnapshot = ContentSnapshot.EMPTY;
     private long lastSeenAtNanos = 0L;
@@ -125,23 +131,31 @@ public final class ProfileCoordinator {
      * 单监听器便捷构造：等同构造后立即 {@link #addListener}，测试与简单装配用
      *
      * @param applier 阻塞 ask 出口，语义同主构造（{@code null} 等同空实现）
-     * @param listener 初始事件监听器；{@code null} 时不注册
+     * @param listener 初始唤醒监听器；{@code null} 时不注册
      */
-    public ProfileCoordinator(Applier applier, Consumer<SessionServer.SessionEvent> listener) {
+    public ProfileCoordinator(Applier applier, Runnable listener) {
         this(applier);
         addListener(listener);
     }
 
     /**
-     * 注册事件消费者
-     * 拒绝不外报——旧档继续生效，流本身没有变化，浏览器以视频元素与 getStats 自观测
+     * 注册唤醒监听器：回调里不得缓存状态，要读就调 {@link #current()}
      *
-     * @param listener 事件消费者；{@code null} 忽略不注册，重复注册重复收
+     * @param listener 唤醒回调；{@code null} 忽略不注册，重复注册重复收
      */
-    public void addListener(Consumer<SessionServer.SessionEvent> listener) {
+    public void addListener(Runnable listener) {
         if (listener != null) {
             listeners.add(listener);
         }
+    }
+
+    /**
+     * 当前会话状态：调用方在自己的动作点现读，不要缓存唤醒时刻的值
+     *
+     * @return 不可变状态；无会话时为 {@code null}
+     */
+    public SessionServer.SessionState current() {
+        return published.get();
     }
 
     /**
@@ -174,15 +188,12 @@ public final class ProfileCoordinator {
         boolean contentChanged = !snapshot.equals(latestSnapshot);
         latestSnapshot = snapshot;
         if (!snapshot.hasFramebuffer()) {
-            // 内容丢失：未暂停则立即下发暂停态（不等稳定窗），计时作废——
-            // latestSnapshot 为 0×0，恢复帧与之比较必然判「变化」，自然重启计时。
-            // 同时清去重锚：恢复时目标常与暂停前一字不差，必须照常下发以重建采集
+            // 内容丢失：未暂停则立即翻相位（不等稳定窗），计时作废——
+            // latestSnapshot 为 0×0，恢复帧与之比较必然判「变化」，自然重启计时
             seenDirty = false;
-            lastAttempted = null;
-            SessionServer.Tier live = lastTier.get();
-            if (!paused && live != null) {
+            if (!paused) {
                 paused = true;
-                broadcast(new SessionServer.SessionEvent.TierChanged(SessionServer.SessionEvent.Phase.PAUSED, live));
+                publishPhase(SessionServer.Phase.PAUSED);
             }
             return;
         }
@@ -199,7 +210,11 @@ public final class ProfileCoordinator {
         // lastAttempted 不在此记账——成功 / 拒绝 / 无应答由 applyTarget 统一落账，
         // 预写会让 applyTarget 的等值去重读到刚写的自己，永远放行不了
         seenDirty = false;
-        paused = false;
+        if (paused) {
+            // 恢复即刻翻回 STREAMING：采集侧先按在位档位重建，下面的 ask 只微调几何
+            paused = false;
+            publishPhase(SessionServer.Phase.STREAMING);
+        }
         // latestSnapshot 此刻已是本次快照，plan 直读内部状态
         SessionServer.Tier target = plan(viewportWidth, viewportHeight, currentBpp());
         if (target.equals(lastAttempted)) {
@@ -249,18 +264,19 @@ public final class ProfileCoordinator {
         }
         boolean bppChanged = false;
         double requestedBpp = MIN_BPP;
+        SessionServer.SessionState state = published.get();
         if (bpp != null) {
             double requested = clampBpp(bpp);
             if (!isBppInRange(requested)) {
-                Constants.LOG.warn("BPP 请求越界 ({})，保持旧档 {}", requested, lastTier.get());
-            } else if (requested != currentBpp() && lastTier.get() != null) {
+                Constants.LOG.warn("BPP 请求越界 ({})，保持旧档 {}", requested, state == null ? "无会话" : state.tier());
+            } else if (requested != currentBpp() && state != null) {
                 requestedBpp = requested;
                 bppChanged = true;
             }
         }
         // 未协商（offer 未落账）时不主动 ask：内容由 offer 的初始规划生效。
         // 会话活跃即基线已种入，此处读 lastAttempted 恒非空
-        if ((viewportChanged || bppChanged) && lastTier.get() != null) {
+        if ((viewportChanged || bppChanged) && state != null) {
             submit(planForSettings(requestedBpp));
         }
     }
@@ -270,8 +286,8 @@ public final class ProfileCoordinator {
      * 无分叉；未协商时取下限
      */
     private double currentBpp() {
-        SessionServer.Tier tier = lastTier.get();
-        return tier != null ? tier.bpp() : MIN_BPP;
+        SessionServer.SessionState state = published.get();
+        return state != null ? state.tier().bpp() : MIN_BPP;
     }
 
     /**
@@ -353,38 +369,62 @@ public final class ProfileCoordinator {
         }
         String backend =
                 obj.has("backend") && !obj.get("backend").isJsonNull() ? obj.get("backend").getAsString() : null;
-        // 落账即换代：新实例替换基线，在途 ask 结账按引用同一性作废
-        lastTier.set(applied);
+        // 落账即换代：代号递增，在途 ask 作废；落账相位取当下内容（最小化中直接 PAUSED）
+        generation++;
+        published.set(new SessionServer.SessionState(backend, phaseNow(), applied));
         lastAttempted = new SessionServer.Tier(applied.width(), applied.height(), applied.fps(), clampBpp(requestedBpp));
-        broadcast(new SessionServer.SessionEvent.Established(backend, applied));
+        wakeListeners();
     }
 
     /**
      * 信令线程入口：会话关闭（WS 断开）复位基线并清空待办，
      * 使迟到的内容事件按「无活跃会话」处理而不是沿用已失效的值
      *
-     * <p>关闭必须无条件广播：内容已暂停时 listener 已处于暂停相位，
-     * 去重会让这次复位丢失（音频不停、sessionActive 不复位）
+     * <p>关闭无条件唤醒：内容暂停时消费者已处于暂停相位，去重会让复位丢失
      */
     public void onSessionClosed() {
         if (stopped) {
             return;
         }
-        // 复位即换代：基线清空，与在途 ask 捕获的活跃实例引用必不相同
-        lastTier.set(null);
+        // 复位即换代：状态清空（在途 ask 读 null 即作废）
+        published.set(null);
         pending.set(null);
-        broadcast(new SessionServer.SessionEvent.Closed());
+        wakeListeners();
     }
 
-    private void broadcast(SessionServer.SessionEvent event) {
-        for (Consumer<SessionServer.SessionEvent> listener : listeners) {
+    /**
+     * 唤醒监听器：只喊一声，不带状态——消费者在动作点读 {@link #current()}
+     */
+    private void wakeListeners() {
+        for (Runnable listener : listeners) {
             try {
-                listener.accept(event);
+                listener.run();
             } catch (Throwable t) {
                 // 单消费者异常不得截断广播（关闭 / 暂停必须到达其余消费者）
-                Constants.LOG.error("会话事件监听器异常", t);
+                Constants.LOG.error("会话监听器异常", t);
             }
         }
+    }
+
+    /**
+     * 就地翻相位：同会话换实例（在途 ask 的应答只写档位）；无会话或已一致时空转
+     */
+    private void publishPhase(SessionServer.Phase phase) {
+        SessionServer.SessionState state;
+        do {
+            state = published.get();
+            if (state == null || state.phase() == phase) {
+                return;
+            }
+        } while (!published.compareAndSet(state, state.withPhase(phase)));
+        wakeListeners();
+    }
+
+    /**
+     * 落账相位取当下内容：最小化中建立的会话直接 PAUSED
+     */
+    private SessionServer.Phase phaseNow() {
+        return paused ? SessionServer.Phase.PAUSED : SessionServer.Phase.STREAMING;
     }
 
     private void submit(SessionServer.Tier tier) {
@@ -416,41 +456,48 @@ public final class ProfileCoordinator {
     private SessionServer.Tier planForSettings(double bpp) {
         ContentSnapshot snapshot = latestSnapshot;
         if (!snapshot.hasFramebuffer()) {
-            SessionServer.Tier applied = lastTier.get();
+            SessionServer.Tier applied = published.get().tier();
             return new SessionServer.Tier(applied.width(), applied.height(), applied.fps(), bpp);
         }
         return plan(viewportWidth, viewportHeight, bpp);
     }
 
     private void applyTarget(SessionServer.Tier target) {
-        SessionServer.Tier before = lastTier.get();
+        SessionServer.SessionState before = published.get();
         if (before == null) {
             lastAttempted = target;
             return;
         }
-        // 与上次请求一致则不 ask：外部变化（如视口收缩）被内容完全吸收时，目标一个字不变，
-        // 编码器无需重配；暂停会让 lastAttempted 归零，恢复时同一目标照常下发
+        // 与上次请求一致则不 ask：被内容吸收的外部变化不打扰编码器
         if (target.equals(lastAttempted)) {
             return;
         }
+        long gen = generation;
         String json = applier.apply(target.width(), target.height(), target.fps(), target.bpp());
-        if (lastTier.get() != before) {
-            // ask 期间换代（关闭复位 / 新 offer 落账）
+        if (generation != gen) {
+            // ask 期间换代：应答属于旧会话，不得写回
             return;
         }
         SessionServer.Tier parsed = json == null || json.isEmpty() ? null : parseTierReply(json);
         if (parsed == null) {
             // 无会话 / 应答不可解析：旧档继续生效，基线保持不动
             lastAttempted = target;
-            Constants.LOG.warn("档位 ask 无应答（{}），保持旧档 {}", target, lastTier.get());
+            SessionServer.SessionState now = published.get();
+            Constants.LOG.warn("档位 ask 无应答（{}），保持旧档 {}", target, now == null ? "无会话" : now.tier());
             return;
         }
-        // CAS 失败说明应答属于旧会话，连同广播一并作废。
-        if (!lastTier.compareAndSet(before, parsed)) {
-            return;
+        // 只写档位：相位可能已翻过，以当下实例为 CAS 目标重试；换代则放弃
+        while (true) {
+            SessionServer.SessionState now = published.get();
+            if (now == null || generation != gen) {
+                return;
+            }
+            if (published.compareAndSet(now, now.withTier(parsed))) {
+                break;
+            }
         }
         lastAttempted = target;
-        broadcast(new SessionServer.SessionEvent.TierChanged(SessionServer.SessionEvent.Phase.STREAMING, parsed));
+        wakeListeners();
     }
 
     /**

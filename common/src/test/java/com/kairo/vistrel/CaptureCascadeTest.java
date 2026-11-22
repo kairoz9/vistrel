@@ -4,7 +4,7 @@ import com.kairo.vistrel.capture.FramePacingThrottler;
 import com.kairo.vistrel.capture.VideoCaptureScheduler;
 import com.kairo.vistrel.capture.VideoPipeline;
 import com.kairo.vistrel.streaming.EncoderChannel;
-import com.kairo.vistrel.streaming.SessionServer.SessionEvent;
+import com.kairo.vistrel.streaming.SessionServer;
 import com.kairo.vistrel.streaming.SessionServer.Tier;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -12,6 +12,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 /**
  * 经 VideoCaptureScheduler 驱动的正交双管道完整级联与断路器测试
@@ -20,6 +21,31 @@ import java.util.function.LongSupplier;
  */
 public class CaptureCascadeTest {
     private static final long FRAME_INTERVAL_NANOS = 1_000_000_000L / 60;
+
+    /**
+     * 可改写的会话状态源（生产由协调器原子替换）
+     */
+    private static final class TestState implements Supplier<SessionServer.SessionState> {
+        private SessionServer.SessionState state;
+
+        TestState live(String backend, int width, int height, int fps) {
+            this.state = new SessionServer.SessionState(
+                    backend,
+                    SessionServer.Phase.STREAMING,
+                    new Tier(width, height, fps, 0.1)
+            );
+            return this;
+        }
+
+        void closed() {
+            this.state = null;
+        }
+
+        @Override
+        public SessionServer.SessionState get() {
+            return state;
+        }
+    }
 
     /**
      * 可编排的 VideoPipeline 替身
@@ -124,8 +150,9 @@ public class CaptureCascadeTest {
             FakeClock clock,
             boolean vramDirectEnabled
     ) {
+        TestState state = new TestState();
         VideoCaptureScheduler sched =
-                new VideoCaptureScheduler(channel, vramDirectEnabled, new FramePacingThrottler(60, clock)) {
+                new VideoCaptureScheduler(channel, vramDirectEnabled, new FramePacingThrottler(60, clock), state) {
             @Override
             protected VideoPipeline createVramPipeline(int width, int height) {
                 if (vram == null) {
@@ -140,12 +167,8 @@ public class CaptureCascadeTest {
             }
         };
         if (channel.streaming) {
-            sched.onSessionEvent(
-                    new SessionEvent.Established(
-                            "vulkan_video",
-                            new Tier(channel.width, channel.height, channel.fps, 0.1)
-                    )
-            );
+            state.live("vulkan_video", channel.width, channel.height, channel.fps);
+            sched.applySessionState();
         }
         return sched;
     }
@@ -290,11 +313,12 @@ public class CaptureCascadeTest {
         List<FakePipeline> createdVrams = new ArrayList<>();
         List<FakePipeline> createdRams = new ArrayList<>();
 
+        TestState state = new TestState();
         VideoCaptureScheduler capture =
                 new VideoCaptureScheduler(channel, () -> {
             evaluations[0]++;
             return capsReady[0];
-        }, new FramePacingThrottler(60, clock)) {
+        }, new FramePacingThrottler(60, clock), state) {
             @Override
             protected VideoPipeline createVramPipeline(int width, int height) {
                 FakePipeline p = new FakePipeline(width, height, true, null);
@@ -311,14 +335,14 @@ public class CaptureCascadeTest {
         };
         Assertions.assertEquals(0, evaluations[0], "显存直通能力不得在构造期求值");
 
-        SessionEvent session = new SessionEvent.Established("vulkan_video", new Tier(1920, 1080, 60, 0.1));
-        capture.onSessionEvent(session);
+        state.live("vulkan_video", 1920, 1080, 60);
+        capture.applySessionState();
         Assertions.assertEquals(1, evaluations[0], "首次会话变更时求值一次");
         Assertions.assertEquals(0, createdVrams.size(), "能力未就绪时不得尝试显存管线");
         Assertions.assertEquals(1, createdRams.size(), "应保留 RAM 兜底管线");
 
         capsReady[0] = true;
-        capture.onSessionEvent(session);
+        capture.applySessionState();
         Assertions.assertEquals(2, evaluations[0], "后续会话变更必须重新求值");
         Assertions.assertEquals(1, createdVrams.size(), "能力就绪后必须启用显存直通");
         Assertions.assertEquals(1, createdRams.get(0).closeCalls, "旧 RAM 管线应在重建时释放");
@@ -366,8 +390,9 @@ public class CaptureCascadeTest {
         FakeEncoderChannel channel = new FakeEncoderChannel();
         FakeClock clock = new FakeClock();
 
+        TestState state = new TestState();
         VideoCaptureScheduler capture =
-                new VideoCaptureScheduler(channel, true, new FramePacingThrottler(60, clock)) {
+                new VideoCaptureScheduler(channel, true, new FramePacingThrottler(60, clock), state) {
             @Override
             protected VideoPipeline createVramPipeline(int width, int height) {
                 FakePipeline p = new FakePipeline(width, height, true, null);
@@ -383,7 +408,8 @@ public class CaptureCascadeTest {
             }
         };
 
-        capture.onSessionEvent(new SessionEvent.Established("vulkan_video", new Tier(1920, 1080, 60, 0.1)));
+        state.live("vulkan_video", 1920, 1080, 60);
+        capture.applySessionState();
         Assertions.assertEquals(1, createdVrams.size());
         Assertions.assertEquals(1, createdRams.size());
         Assertions.assertEquals(1920, createdVrams.get(0).width);
@@ -392,7 +418,8 @@ public class CaptureCascadeTest {
         capture.capture();
         Assertions.assertEquals(1, createdVrams.get(0).captureCalls);
         // 控制面通知变更推送（720p@30fps，Push 驱动即时生效）
-        capture.onSessionEvent(new SessionEvent.TierChanged(SessionEvent.Phase.STREAMING, new Tier(1280, 720, 30, 0.1)));
+        state.live("vulkan_video", 1280, 720, 30);
+        capture.applySessionState();
         Assertions.assertEquals(2, createdVrams.size(), "会话规格变更由推送驱动直接构造新规格 Pipeline 替换");
         Assertions.assertEquals(1, createdVrams.get(0).closeCalls, "旧 Vram Pipeline 立即被清理释放");
         Assertions.assertEquals(1, createdRams.get(0).closeCalls, "旧 Ram Pipeline 立即被清理释放");
@@ -416,8 +443,9 @@ public class CaptureCascadeTest {
         List<FakePipeline> createdRams = new ArrayList<>();
         FakeEncoderChannel channel = new FakeEncoderChannel();
 
+        TestState state = new TestState();
         VideoCaptureScheduler capture =
-                new VideoCaptureScheduler(channel, true, new FramePacingThrottler(60, new FakeClock())) {
+                new VideoCaptureScheduler(channel, true, new FramePacingThrottler(60, new FakeClock()), state) {
             @Override
             protected VideoPipeline createVramPipeline(int width, int height) {
                 FakePipeline p = new FakePipeline(width, height, true, null);
@@ -433,22 +461,53 @@ public class CaptureCascadeTest {
             }
         };
 
-        capture.onSessionEvent(new SessionEvent.Established("vulkan_video", new Tier(1920, 1080, 60, 0.1)));
+        state.live("vulkan_video", 1920, 1080, 60);
+        capture.applySessionState();
         Assertions.assertEquals(1, createdVrams.size());
         Assertions.assertEquals(1, createdRams.size());
         // 仅帧率变化：复用现成管线，不销毁也不重建
-        capture.onSessionEvent(
-                new SessionEvent.TierChanged(SessionEvent.Phase.STREAMING, new Tier(1920, 1080, 240, 0.1))
-        );
+        state.live("vulkan_video", 1920, 1080, 240);
+        capture.applySessionState();
         Assertions.assertEquals(1, createdVrams.size(), "帧率变化不应重建显存管线");
         Assertions.assertEquals(1, createdRams.size(), "帧率变化不应重建内存管线");
         Assertions.assertEquals(0, createdVrams.get(0).closeCalls, "复用期间不得销毁管线");
         // 分辨率变化仍必须重建
-        capture.onSessionEvent(
-                new SessionEvent.TierChanged(SessionEvent.Phase.STREAMING, new Tier(2560, 1440, 240, 0.1))
-        );
+        state.live("vulkan_video", 2560, 1440, 240);
+        capture.applySessionState();
         Assertions.assertEquals(2, createdVrams.size(), "分辨率变化必须重建显存管线");
         Assertions.assertEquals(1, createdVrams.get(0).closeCalls, "旧管线在重建时释放");
+    }
+
+    /**
+     * 后端身份是会话状态：软件编码会话不得建显存管线，也不得升级成整引擎自愈重启
+     * （Capability 只说明驱动能导入槽位，消费端还得是硬件编码器）
+     */
+    @Test
+    void testSoftwareBackendSkipsVramWithoutRestart() {
+        List<FakePipeline> createdVrams = new ArrayList<>();
+        FakeEncoderChannel channel = new FakeEncoderChannel();
+        java.util.concurrent.atomic.AtomicInteger restarts = new java.util.concurrent.atomic.AtomicInteger();
+        TestState state = new TestState();
+        VideoCaptureScheduler capture =
+                new VideoCaptureScheduler(channel, true, new FramePacingThrottler(60, new FakeClock()), state) {
+            @Override
+            protected VideoPipeline createVramPipeline(int width, int height) {
+                FakePipeline p = new FakePipeline(width, height, true, null);
+                createdVrams.add(p);
+                return p;
+            }
+
+            @Override
+            protected VideoPipeline createRamPipeline(int width, int height) {
+                return new FakePipeline(width, height, true, null);
+            }
+        };
+        capture.setEncoderStallListener(restarts::incrementAndGet);
+        state.live("software", 1920, 1080, 60);
+        capture.applySessionState();
+        Assertions.assertEquals(0, createdVrams.size(), "软件编码会话不得构建显存直通管线");
+        Assertions.assertEquals(0, restarts.get(), "软件编码会话不得触发编码停滞自愈");
+        Assertions.assertTrue(capture.capture(), "RAM 回读管线应照常投递");
     }
 
     @Test
@@ -457,8 +516,9 @@ public class CaptureCascadeTest {
         List<FakePipeline> createdRams = new ArrayList<>();
         FakeEncoderChannel channel = new FakeEncoderChannel();
 
+        TestState state = new TestState();
         VideoCaptureScheduler mgr =
-                new VideoCaptureScheduler(channel, true, new FramePacingThrottler(60, new FakeClock())) {
+                new VideoCaptureScheduler(channel, true, new FramePacingThrottler(60, new FakeClock()), state) {
             @Override
             protected VideoPipeline createVramPipeline(int width, int height) {
                 FakePipeline p = new FakePipeline(width, height, true, null);
@@ -477,13 +537,15 @@ public class CaptureCascadeTest {
         Assertions.assertFalse(mgr.capture(), "无会话时 capture 返回 false");
         Assertions.assertEquals(0, createdVrams.size());
         // 会话建立 (1080p)
-        mgr.onSessionEvent(new SessionEvent.Established("vulkan_video", new Tier(1920, 1080, 60, 0.1)));
+        state.live("vulkan_video", 1920, 1080, 60);
+        mgr.applySessionState();
         Assertions.assertEquals(1, createdVrams.size());
         Assertions.assertEquals(1, createdRams.size());
         FakePipeline firstVram = createdVrams.get(0);
         Assertions.assertEquals(0, firstVram.closeCalls);
         // 会话断开：立即清理释放
-        mgr.onSessionEvent(new SessionEvent.Closed());
+        state.closed();
+        mgr.applySessionState();
         Assertions.assertEquals(1, firstVram.closeCalls, "会话断开时 Pipeline 必须被清理");
         Assertions.assertFalse(mgr.capture(), "会话断开后 capture 应当返回 false");
     }

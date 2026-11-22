@@ -55,14 +55,17 @@ public final class VistrelService {
     private static volatile AudioCaptureScheduler activeAudioScheduler = null;
     private static volatile InputInjector activeInputInjector = null;
     static volatile ProfileCoordinator activeProfileCoordinator = null;
-    // 会话活跃标志
-    private static volatile boolean sessionActive = false;
-    // 环回设备绑定正本在 AudioCaptureScheduler.LoopbackBinding：随 MC 音频库存亡，服务启停不触碰
+    /**
+     * 是否已发过接入提示：不承担会话状态
+     */
+    private static volatile boolean joinNoticeSent = false;
     /**
      * 浏览器访问地址缓存：启动期在启动线程解析一次（解析含 DNS 查询与网卡枚举）
      */
     private static volatile String accessUrl = null;
-    // 剪贴板长度上限：超长复制静默丢弃
+    /**
+     * 剪贴板长度上限：超长复制静默丢弃
+     */
     private static final int MAX_CLIPBOARD_FORWARD_LENGTH = 8192;
     /**
      * 两次自动重启的最小间隔：编码线程若反复停滞，避免重启风暴
@@ -122,20 +125,25 @@ public final class VistrelService {
         Objects.requireNonNull(inputEvents, "InputEventSource 不能为空");
 
         activeContext = new ServiceContext(config, server, encoder, inputEvents);
-        sessionActive = false;
+        joinNoticeSent = false;
 
         try {
             VistrelConfig cfg = Objects.requireNonNull(config.get(), "配置视图求值结果不能为空");
-            // 1. 组装采集调度器：显存直通能力延迟到会话建立时求值
-            VideoCaptureScheduler videoScheduler =
-                    new VideoCaptureScheduler(encoder, () -> cfg.vramDirect() && supportsVramDirect(encoder.caps()));
+            // 1. 内容档位协调器：会话状态的唯一生产者（三路输入的阻塞 ask 汇聚点，ask 只在工作线程）
+            ProfileCoordinator profileCoordinator = new ProfileCoordinator(server::applyProfile);
+            // 2. 组装采集调度器：显存直通能力延迟到会话建立时求值
+            VideoCaptureScheduler videoScheduler = new VideoCaptureScheduler(
+                    encoder,
+                    () -> cfg.vramDirect() && supportsVramDirect(encoder.caps()),
+                    profileCoordinator::current
+            );
             // 编码线程停滞时由显存管线心跳超时触发，整套推流服务自动重启自愈
             videoScheduler.setEncoderStallListener(() -> autoRestartEngine(videoScheduler));
             activeVideoScheduler = videoScheduler;
-            // 2. 唤醒音频环回会话
-            AudioCaptureScheduler audioScheduler = new AudioCaptureScheduler(encoder);
+            // 3. 唤醒音频环回会话
+            AudioCaptureScheduler audioScheduler = new AudioCaptureScheduler(encoder, profileCoordinator::current);
             activeAudioScheduler = audioScheduler;
-            // 3. 构造输入注入器（平台适配器的版本差异在此单点选择）；光标内缝在此转统一事件
+            // 4. 构造输入注入器（平台适配器的版本差异在此单点选择）；光标内缝在此转统一事件
             //? if >=26.3 {
             InputInjector injector = new InputInjector(
                     inputEvents,
@@ -148,18 +156,15 @@ public final class VistrelService {
                     inputEvents, new GlfwInputAdapter(), VistrelService::isStreaming, VistrelService::pushCursorEvent);*/
             //? }
             activeInputInjector = injector;
-            // 4. 内容档位协调器：内容/视口/BPP 三路输入的阻塞 ask 汇聚点（ask 只在工作线程）。
-            // 会话事件只有一个生产者（协调器）：采集、音频与接入标记都直接订阅它的广播，
-            // 信令层只负责把关闭事件投给它
-            ProfileCoordinator profileCoordinator = new ProfileCoordinator(server::applyProfile);
-            profileCoordinator.addListener(videoScheduler::onSessionEvent);
-            profileCoordinator.addListener(audioScheduler::onSessionEvent);
-            profileCoordinator.addListener(VistrelService::onSessionEvent);
+            // 5. 监听装配（唤醒不带状态）
+            profileCoordinator.addListener(videoScheduler::applySessionState);
+            profileCoordinator.addListener(audioScheduler::applySessionState);
+            profileCoordinator.addListener(VistrelService::applySessionState);
             // 协调器注入信令面：offer 规划/落账与 WS 关闭复位都由信令面回调触发
             server.setProfileCoordinator(profileCoordinator);
             profileCoordinator.start();
             activeProfileCoordinator = profileCoordinator;
-            // 5. 配置并启动 WebRTC 网络信令服务
+            // 6. 配置并启动 WebRTC 网络信令服务
             server.setPassword(cfg.password());
             server.setAudioBitrate(cfg.audioBitrate());
             server.setTextInputSink(injector::enqueueText);
@@ -223,7 +228,7 @@ public final class VistrelService {
             return null;
         }
         running = false;
-        sessionActive = false;
+        joinNoticeSent = false;
         VideoCaptureScheduler videoScheduler = activeVideoScheduler;
         AudioCaptureScheduler audioScheduler = activeAudioScheduler;
         ProfileCoordinator profileCoordinator = activeProfileCoordinator;
@@ -342,20 +347,19 @@ public final class VistrelService {
         Constants.LOG.info("Vistrel 服务已停止");
     }
 
-    private static void onSessionEvent(SessionServer.SessionEvent event) {
-        if (event instanceof SessionServer.SessionEvent.Established) {
-            boolean wasActive = sessionActive;
-            sessionActive = true;
-            // 内容路径同样可能迎来首个真实接入（offer 成功走信令层，这里兜恢复/重协商）
-            if (!wasActive) {
-                com.kairo.vistrel.command.VistrelCommands.feedback("§e远程会话已接入");
-            }
-            return;
+    /**
+     * 会话状态变更唤醒：只做接入提示的边沿检测
+     */
+    private static void applySessionState() {
+        ProfileCoordinator coordinator = activeProfileCoordinator;
+        boolean live = coordinator != null && coordinator.current() != null;
+        if (!live) {
+            joinNoticeSent = false;
+        } else if (!joinNoticeSent) {
+            joinNoticeSent = true;
+            // 一次会话只提示一次
+            com.kairo.vistrel.command.VistrelCommands.feedback("§e远程会话已接入");
         }
-        if (event instanceof SessionServer.SessionEvent.Closed) {
-            sessionActive = false;
-        }
-        // 档位与内容暂停：会话仍在线，接入标记不动
     }
 
     /**
@@ -495,7 +499,8 @@ public final class VistrelService {
      * @return true 表示服务运行中且远程会话已接入；false 表示两者任一不成立
      */
     public static boolean isStreaming() {
-        return running && sessionActive;
+        ProfileCoordinator coordinator = activeProfileCoordinator;
+        return running && coordinator != null && coordinator.current() != null;
     }
 
     /**

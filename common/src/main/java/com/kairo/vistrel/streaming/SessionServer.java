@@ -64,12 +64,11 @@ public interface SessionServer {
     default void setProfileCoordinator(ProfileCoordinator worker) {}
 
     /**
-     * 是否为硬件编码（nvenc / vulkan_video）。
-     *
-     * @param backend 协商应答携带的线上后端词汇
+     * 内容相位：STREAMING 内容在流动；PAUSED 会话在线但内容丢失
      */
-    public static boolean isHardwareBackend(String backend) {
-        return "nvenc".equals(backend) || "vulkan_video".equals(backend);
+    enum Phase {
+        STREAMING,
+        PAUSED
     }
 
     /**
@@ -80,30 +79,43 @@ public interface SessionServer {
     record Tier(int width, int height, int fps, double bpp) {}
 
     /**
-     * 会话控制面广播事件：事件不可变，消费者按类型分发，跨会话边界无撕裂窗口
+     * 会话控制面状态：后端身份、内容相位与生效档位；{@code null} = 无会话
+     *
+     * <p>后端身份只在协商落账时写入，此后只经 {@link #withPhase} / {@link #withTier} 原样携带。
+     * 消费者在动作点经 {@code ProfileCoordinator#current()} 读当下状态。
+     *
+     * @param backend 协商应答的线上后端词汇（nvenc / vulkan_video / software）
+     * @param phase   内容相位
+     * @param tier    生效档位
      */
-    sealed interface SessionEvent {
+    record SessionState(String backend, Phase phase, Tier tier) {
         /**
-         * 会话已建立（协商落账）：后端身份与初始档位原子携带
+         * 同会话的相位替换，其余字段原样保留
+         *
+         * @param next 目标相位
+         * @return 新实例
          */
-        record Established(String backend, Tier tier) implements SessionEvent {}
+        public SessionState withPhase(Phase next) {
+            return new SessionState(backend, next, tier);
+        }
 
         /**
-         * 档位或内容相位变化。相位只表达内容在不在流动，会话本身仍在线
+         * 同会话的档位替换，其余字段原样保留
+         *
+         * @param next 目标档位
+         * @return 新实例
          */
-        record TierChanged(Phase phase, Tier tier) implements SessionEvent {}
+        public SessionState withTier(Tier next) {
+            return new SessionState(backend, phase, next);
+        }
 
         /**
-         * 会话已关闭：停止采集、停投递，等待下一次协商
+         * 是否为硬件编码（nvenc / vulkan_video）：显存直通槽位只有硬件编码器能消费
+         *
+         * @return 协商落到硬编时为 true
          */
-        record Closed() implements SessionEvent {}
-
-        /**
-         * 内容相位：STREAMING 内容在流动；PAUSED 会话在线但内容丢失（仅停视频采集）
-         */
-        enum Phase {
-            STREAMING,
-            PAUSED
+        public boolean hardware() {
+            return "nvenc".equals(backend) || "vulkan_video".equals(backend);
         }
     }
 }

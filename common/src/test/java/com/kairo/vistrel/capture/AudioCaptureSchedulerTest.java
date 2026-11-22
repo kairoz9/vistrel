@@ -2,8 +2,8 @@ package com.kairo.vistrel.capture;
 
 import com.kairo.vistrel.capture.AudioCaptureScheduler.LoopbackBinding;
 import com.kairo.vistrel.streaming.EncoderChannel;
-import com.kairo.vistrel.streaming.SessionServer.SessionEvent;
-import com.kairo.vistrel.streaming.SessionServer.Tier;
+import com.kairo.vistrel.streaming.SessionServer;
+import java.util.function.Supplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
@@ -14,6 +14,41 @@ import java.nio.ByteBuffer;
  * AudioCaptureScheduler 单元测试 (基于 EncoderChannel 替身，0 JNI 依赖)
  */
 public class AudioCaptureSchedulerTest {
+    /**
+     * 可改写的会话状态源（生产由协调器原子替换）
+     */
+    private static final class TestState implements Supplier<SessionServer.SessionState> {
+        private SessionServer.SessionState state;
+
+        TestState live() {
+            this.state = new SessionServer.SessionState(
+                    "nvenc",
+                    SessionServer.Phase.STREAMING,
+                    new SessionServer.Tier(1920, 1080, 60, 0.1)
+            );
+            return this;
+        }
+
+        TestState paused() {
+            this.state = new SessionServer.SessionState(
+                    "nvenc",
+                    SessionServer.Phase.PAUSED,
+                    new SessionServer.Tier(1920, 1080, 60, 0.1)
+            );
+            return this;
+        }
+
+        TestState closed() {
+            this.state = null;
+            return this;
+        }
+
+        @Override
+        public SessionServer.SessionState get() {
+            return state;
+        }
+    }
+
     private static final class TestEncoderChannel implements EncoderChannel {
         int audioPushes = 0;
         int lastSamples = 0;
@@ -53,11 +88,13 @@ public class AudioCaptureSchedulerTest {
     @Test
     void testAudioCaptureSchedulerSessionBindingAndLifecycle() {
         TestEncoderChannel channel = new TestEncoderChannel();
-        AudioCaptureScheduler scheduler = new AudioCaptureScheduler(channel, (dev, buf, samples) -> {});
+        TestState state = new TestState();
+        AudioCaptureScheduler scheduler = new AudioCaptureScheduler(channel, (dev, buf, samples) -> {}, state);
 
         Assertions.assertFalse(LoopbackBinding.current().isBound());
         // 模拟外部控制面通知会话接入（采集线程在首个接入会话时启动）
-        scheduler.onSessionEvent(new SessionEvent.Established("nvenc", new Tier(1920, 1080, 60, 0.1)));
+        state.live();
+        scheduler.applySessionState();
         // 测试模拟绑定环回设备 (句柄 0x12345678L)
         LoopbackBinding.open(0x12345678L);
         Assertions.assertTrue(LoopbackBinding.current().isBound());
@@ -69,8 +106,10 @@ public class AudioCaptureSchedulerTest {
     @Test
     void testSynchronousCleanupJoinsThread() throws Exception {
         TestEncoderChannel channel = new TestEncoderChannel();
-        AudioCaptureScheduler scheduler = new AudioCaptureScheduler(channel, (dev, buf, samples) -> {});
-        scheduler.onSessionEvent(new SessionEvent.Established("nvenc", new Tier(1920, 1080, 60, 0.1)));
+        TestState state = new TestState();
+        AudioCaptureScheduler scheduler = new AudioCaptureScheduler(channel, (dev, buf, samples) -> {}, state);
+        state.live();
+        scheduler.applySessionState();
 
         LoopbackBinding.open(0x11223344L);
         Assertions.assertTrue(LoopbackBinding.current().isBound());
@@ -87,15 +126,51 @@ public class AudioCaptureSchedulerTest {
     }
 
     @Test
+    void testPausedContentKeepsAudioStreaming() throws Exception {
+        TestEncoderChannel channel = new TestEncoderChannel();
+        TestState state = new TestState();
+        AudioCaptureScheduler scheduler = new AudioCaptureScheduler(channel, (dev, buf, samples) -> {}, state);
+        state.live();
+        scheduler.applySessionState();
+        LoopbackBinding.open(0x55667788L);
+        LoopbackBinding.markContextReady();
+        scheduler.onContextReady();
+        long deadline = System.currentTimeMillis() + 1000;
+        while (channel.audioPushes == 0 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+        Assertions.assertTrue(channel.audioPushes > 0, "会话在线时应投递音频");
+        // 内容丢失（最小化）：只停视频采集，音频不得中断
+        int pushesOnPause = channel.audioPushes;
+        state.paused();
+        scheduler.applySessionState();
+        deadline = System.currentTimeMillis() + 1000;
+        while (channel.audioPushes == pushesOnPause && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+        Assertions.assertTrue(channel.audioPushes > pushesOnPause, "内容暂停不得中断音频");
+        // 会话关闭：停止投递
+        state.closed();
+        scheduler.applySessionState();
+        Thread.sleep(150);
+        int pushesOnClose = channel.audioPushes;
+        Thread.sleep(100);
+        Assertions.assertEquals(pushesOnClose, channel.audioPushes, "会话关闭后不得继续投递");
+        scheduler.cleanup();
+    }
+
+    @Test
     void testContextReadyGateAndSafeBufferLimit() throws Exception {
         TestEncoderChannel channel = new TestEncoderChannel();
         java.util.concurrent.atomic.AtomicInteger renderCount = new java.util.concurrent.atomic.AtomicInteger(0);
 
+        TestState state = new TestState();
         AudioCaptureScheduler scheduler = new AudioCaptureScheduler(channel, (dev, buf, samples) -> {
             renderCount.incrementAndGet();
-        });
+        }, state);
         // 仅开启推流和绑定设备，此时 context 未就绪
-        scheduler.onSessionEvent(new SessionEvent.Established("nvenc", new Tier(1920, 1080, 60, 0.1)));
+        state.live();
+        scheduler.applySessionState();
         LoopbackBinding.open(0x99887766L);
         // 等待 60ms (3 个时钟周期)，断言在 context 未 ready 时绝不能有任何渲染与投递
         Thread.sleep(60);

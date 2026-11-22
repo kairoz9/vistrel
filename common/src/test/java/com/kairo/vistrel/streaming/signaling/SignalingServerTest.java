@@ -106,20 +106,21 @@ class SignalingServerTest {
     }
 
     /**
-     * 协调器监听记录：Answer 落账广播的建立事件与档位变化事件（生效档位）
+     * 唤醒时读当下状态（生效档位）
      */
-    private static final class RecordingWorkerListener
-            implements java.util.function.Consumer<SessionServer.SessionEvent>
-    {
+    private static final class RecordingWorkerListener implements Runnable {
         final List<SessionServer.Tier> applied = new CopyOnWriteArrayList<>();
+        private volatile ProfileCoordinator worker;
+
+        void attach(ProfileCoordinator worker) {
+            this.worker = worker;
+        }
 
         @Override
-        public void accept(SessionServer.SessionEvent event) {
-            if (event instanceof SessionServer.SessionEvent.Established established) {
-                applied.add(established.tier());
-            } else if (event instanceof SessionServer.SessionEvent.TierChanged tierChanged
-                    && tierChanged.phase() == SessionServer.SessionEvent.Phase.STREAMING) {
-                applied.add(tierChanged.tier());
+        public void run() {
+            SessionServer.SessionState state = worker.current();
+            if (state != null && state.phase() == SessionServer.Phase.STREAMING) {
+                applied.add(state.tier());
             }
         }
     }
@@ -488,10 +489,13 @@ class SignalingServerTest {
      */
     private static ProfileCoordinator newWorker(
             ProfileCoordinator.ContentSnapshot snapshot,
-            java.util.function.Consumer<SessionServer.SessionEvent> listener,
+            RecordingWorkerListener listener,
             ProfileCoordinator.Applier applier
     ) {
         ProfileCoordinator worker = new ProfileCoordinator(applier, listener);
+        if (listener != null) {
+            listener.attach(worker);
+        }
         if (snapshot != null) {
             worker.onContentSnapshot(snapshot, 0L);
         }

@@ -2,14 +2,16 @@ package com.kairo.vistrel.capture;
 
 import com.kairo.vistrel.Constants;
 import com.kairo.vistrel.streaming.EncoderChannel;
-import com.kairo.vistrel.streaming.SessionServer.SessionEvent;
+import com.kairo.vistrel.streaming.SessionServer;
 import org.lwjgl.openal.ALC10;
 import org.lwjgl.openal.SOFTLoopback;
 import org.lwjgl.system.MemoryStack;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.IntBuffer;
+import java.util.Objects;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Supplier;
 
 /**
  * OpenAL 内存环回音频采集调度器
@@ -110,14 +112,19 @@ public class AudioCaptureScheduler {
     };
     private int pingPongIndex = 0;
     private volatile boolean isStreaming = false;
+    /**
+     * 当前会话状态的读取口：唤醒入口即求值
+     */
+    private final Supplier<SessionServer.SessionState> sessionState;
 
     /**
      * 生产构造：采样渲染直接走 OpenAL Soft 环回入口 {@code alcRenderSamplesSOFT}
      *
-     * @param channel 音频 PCM 投递通道
+     * @param channel      音频 PCM 投递通道
+     * @param sessionState 当前会话状态的读取口（生产为 {@code coordinator::current}）
      */
-    public AudioCaptureScheduler(EncoderChannel channel) {
-        this(channel, SOFTLoopback::alcRenderSamplesSOFT);
+    public AudioCaptureScheduler(EncoderChannel channel, Supplier<SessionServer.SessionState> sessionState) {
+        this(channel, SOFTLoopback::alcRenderSamplesSOFT, sessionState);
     }
 
     /**
@@ -125,10 +132,16 @@ public class AudioCaptureScheduler {
      *
      * @param channel        音频 PCM 投递通道
      * @param sampleRenderer 环回采样渲染出口；{@code null} 回落 {@code alcRenderSamplesSOFT}
+     * @param sessionState   当前会话状态的读取口
      */
-    public AudioCaptureScheduler(EncoderChannel channel, SampleRenderer sampleRenderer) {
+    public AudioCaptureScheduler(
+            EncoderChannel channel,
+            SampleRenderer sampleRenderer,
+            Supplier<SessionServer.SessionState> sessionState
+    ) {
         this.channel = channel;
         this.sampleRenderer = sampleRenderer != null ? sampleRenderer : SOFTLoopback::alcRenderSamplesSOFT;
+        this.sessionState = Objects.requireNonNull(sessionState, "会话状态读取口不能为空");
     }
 
     /**
@@ -151,21 +164,16 @@ public class AudioCaptureScheduler {
     }
 
     /**
-     * 会话事件入口（经 {@code ProfileCoordinator} 的监听回调触发）：关闭事件停止投递
-     * （采集线程挂起待命，不退出）；内容暂停（PAUSED）会话仍在线，音频保持原状；
-     * 建立与档位变化（会话活跃）置位、启动采集线程并在 context 已就绪时即刻唤醒节拍循环
-     *
-     * @param event 最新会话控制面事件
+     * 会话状态变更入口（协调器唤醒）：无会话停止投递（线程挂起待命）；
+     * 会话在线即置位启动，内容暂停只停视频、音频照常
      */
-    public void onSessionEvent(SessionEvent event) {
-        if (event instanceof SessionEvent.Closed) {
+    public void applySessionState() {
+        SessionServer.SessionState state = this.sessionState.get();
+        if (state == null) {
             this.isStreaming = false;
             return;
         }
-        // 内容暂停（PAUSED）：会话仍在线，音频保持原状
-        if (event instanceof SessionEvent.TierChanged tierChanged && tierChanged.phase() == SessionEvent.Phase.PAUSED) {
-            return;
-        }
+        // 内容相位只管视频：最小化 / 无 framebuffer 时会话仍在线，音频不中断
         this.isStreaming = true;
         start();
         if (LoopbackBinding.current().contextReady()) {
