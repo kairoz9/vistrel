@@ -72,7 +72,7 @@ jobs:
         working-directory: rust-native
 
       - name: Upload Linux native artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: native-linux
           path: >-
@@ -112,7 +112,7 @@ jobs:
         working-directory: rust-native
 
       - name: Upload Windows native artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: native-windows
           path: rust-native/target/x86_64-pc-windows-msvc/release/vistrel.dll
@@ -146,7 +146,7 @@ jobs:
         working-directory: web
 
       - name: Upload web dist
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: web-dist
           path: web/dist
@@ -205,7 +205,7 @@ jobs:
 
       - name: Upload distributable jars
         if: inputs.upload_jars
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: distributable-jars
           path: dist/

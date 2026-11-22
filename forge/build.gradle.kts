@@ -68,6 +68,8 @@ dependencies {
 jarJar.register {
     // with(jar) 与 withType<Jar> 的 LICENSE 块各带一份 → EXCLUDE 去重
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    // 未重映射的胖包，不可发布
+    archiveClassifier = "dev-all"
 }
 val mixinExtrasDep = dependencies.create(libs.mixinextras.forge.get()) as ExternalModuleDependency
 mixinExtrasDep.isTransitive = false // 只嵌本体，不带传递依赖
@@ -78,22 +80,27 @@ jarJar.configure(mixinExtrasDep) {
 }
 
 tasks.jar {
+    // 未重映射，不可发布
+    archiveClassifier = "dev"
     manifest {
         attributes("MixinConfigs" to "$modId.mixins.json,$modId.forge.mixins.json")
     }
 }
 
-// SRG 重映射：1.20 系生产运行时是 SRG 命名，官方映射编译的 jar 必须经 renamer 重映射才能发布，
-// 发布以 -srg 产物为准；JIJ 内嵌随 jarJar 进 -srg
+// SRG 重映射：1.20 系生产运行时是 SRG 命名，官方映射编译的 jar 必须经 renamer 重映射才能发布
 renamer.mappings.from(minecraft.dependency.toSrgFile)
 val fatJar = tasks.named<Jar>("jarJar")
 val srgJar = renamer.classes(fatJar) {
     archiveClassifier = "srg"
 }
 
-// 只收 -srg 发布产物与 sources jar
+// 只收 SRG 发布产物与 sources jar；发布产物去 classifier 取标准名
 tasks.named<Copy>("buildAndCollect") {
-    from(srgJar.flatMap { it.output }, tasks.named<Jar>("sourcesJar").flatMap { it.archiveFile })
+    val releaseJarName = "${base.archivesName.get()}-${version}.jar"
+    from(srgJar.flatMap { it.output }) {
+        rename { releaseJarName }
+    }
+    from(tasks.named<Jar>("sourcesJar").flatMap { it.archiveFile })
 }
 
 // mixin @At 目标走 refmap：编译期 Mixin AP 生成，dev 经 remapRefMap 换算，生产随 jar 重映射生效；
@@ -105,6 +112,14 @@ val mixinRefmaps = renamer.enableMixinRefmaps {
     jar(fatJar)
 }
 minecraft.runs.configureEach { mixinRefmaps.run(this) }
+
+// Mixin AP 经 -AoutRefMapFile= 把 refmap 写到 build/tmp/compileJava/，该路径不在 compileJava
+// 的默认输出内；不显式声明则构建缓存恢复后 refmap 缺失，jarJar 打出的 jar 不含 refmap，
+// 生产环境 mixin 无法解析 @At 目标
+tasks.named<JavaCompile>("compileJava") {
+    outputs.file(layout.buildDirectory.file("tmp/compileJava/compileJava-refmap.json"))
+    outputs.file(layout.buildDirectory.file("tmp/compileJava/compileJava-mappings.tsrg"))
+}
 
 // refmap 键只进 forge 产物
 tasks.named("processResources") {

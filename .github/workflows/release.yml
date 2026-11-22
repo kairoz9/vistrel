@@ -1,6 +1,8 @@
 name: Release
 
 on:
+  # 推 tag 默认只构建、不发布：真实发布需先置仓库变量 RELEASE_PUBLISH_ENABLED=true。
+  # 这样「推 tag 验证产物」与「正式发版」是同一入口，靠变量区分，无需临时取消运行。
   push:
     tags: [ 'v*' ]
   workflow_dispatch:
@@ -30,7 +32,28 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
+      publish: ${{ steps.gate.outputs.publish }}
     steps:
+      - name: Resolve publish gate
+        id: gate
+        # 发布需同时满足：非 dry_run 且仓库变量 RELEASE_PUBLISH_ENABLED 为 true。
+        # 推 tag 走 push 事件，inputs.dry_run 为空（≠ true），故真实发布由变量唯一决定；
+        # 手动 dispatch 时 dry_run=true 直接压过变量，两条路径语义一致。
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          ENABLED: ${{ vars.RELEASE_PUBLISH_ENABLED }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::dry_run=true，只构建不发布"
+          elif [ "$ENABLED" != "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::RELEASE_PUBLISH_ENABLED 未设为 true，只构建不发布"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::发布已启用，将创建 Release 并上传 CurseForge"
+          fi
+
       - name: Resolve and validate tag
         id: tag
         # tag 经环境变量传入而非直接内插，杜绝 workflow_dispatch 输入的脚本注入
@@ -74,24 +97,14 @@ jobs:
             cat > release-body.md <<EOF
           ## Vistrel ${version}
 
-          WebRTC 像素流串流 mod：远程玩家浏览器零安装，直连游玩本地 Minecraft 客户端。
-
-          ### 支持矩阵
-          | MC 版本 | 加载器 | Java |
-          | --- | --- | --- |
-          | 1.20 | Fabric / Forge | 17 |
-          | 1.21 ~ 1.21.11 | Fabric / NeoForge | 21 |
-          | 26.1 ~ 26.3 | Fabric / NeoForge | 25 |
-
-          ### 安全提示
-          首次启动后 mod 在本机 30808 端口开启 HTTP/WebSocket 信令服务（即浏览器访问入口）；请仅在局域网或可信网络使用，勿暴露到公网。
+          Source code, issue tracker and full documentation: [github.com/kairoz9/vistrel](https://github.com/kairoz9/vistrel)
 
           NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.
           EOF
           fi
 
       - name: Upload release metadata
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: release-meta
           path: release-body.md
@@ -132,8 +145,8 @@ jobs:
           sha256sum -c SHA256SUMS
 
       - name: Create GitHub Release
-        if: inputs.dry_run != true
-        uses: softprops/action-gh-release@v2
+        if: needs.guard.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.guard.outputs.tag }}
           body_path: meta/release-body.md
@@ -144,8 +157,8 @@ jobs:
   publish-cf:
     name: Publish to CurseForge (${{ matrix.loader }} ${{ matrix.mc }})
     needs: [guard, build]
-    # CF 项目未建 / 未配置凭据时整组跳过，GitHub Release 链路不受影响
-    if: vars.CURSEFORGE_PROJECT_ID != '' && inputs.dry_run != true
+    # CF 项目未建 / 未配置凭据 / 发布未启用时整组跳过，GitHub Release 链路不受影响
+    if: vars.CURSEFORGE_PROJECT_ID != '' && needs.guard.outputs.publish == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -179,33 +192,29 @@ jobs:
           path: meta
 
       - name: Compose per-file changelog
-        # CF Fair Play 要求每个文件各自说明「相对上一版本改了什么」。共用一份全量 changelog
-        # 对任何单个文件都不成立；首版无上一版本可 diff，故以文件身份行 + 发布说明作答。
-        # 身份行逐文件不同（版本线 / 加载器 / Java），使每个 CF 文件条目的 changelog 唯一。
-        # 全部经 env 传入：version 已由 guard 正则校验，mc/loader/java 取自本文件 matrix 字面量
         env:
           VERSION: ${{ needs.guard.outputs.version }}
           MC: ${{ matrix.mc }}
           LOADER: ${{ matrix.loader }}
-          JAVA: ${{ matrix.java }}
         run: |
           out="changelog-$MC-$LOADER.md"
           {
-            echo "### Vistrel $VERSION — Minecraft $MC / $LOADER (Java $JAVA)"
-            echo
-            echo "首个发布版本"
-            echo
-            cat meta/release-body.md
+            if [ "$VERSION" = "0.1.0" ]; then
+              # 首版说明紧接标题：首行是 `## Vistrel <version>`，其下空行分隔正文
+              head -1 meta/release-body.md
+              echo
+              echo "Initial release."
+              tail -n +2 meta/release-body.md
+            else
+              cat meta/release-body.md
+            fi
           } > "$out"
           echo "changelog: $out"
-          head -3 "$out"
+          head -5 "$out"
 
       - name: Publish to CurseForge
-        # environment 显式 client：按发布决策 CF 文件只打 Client 环境标签（mod 为纯客户端，
-        # 由 fabric.mod.json environment / @Mod(dist) / mods.toml clientSideOnly 保证）
+        # environment 显式 client
         # name 必须显式置空而非省略：省略时 program.ts 回落到「触发 release 的标题」，
-        # 而本拓扑下 publish 与建 Release 平行、标题不可预期；空串使 curseforge-version.ts
-        # 的 `!version.name` 分支生效，展示名取上传的 jar 文件名。
         uses: Kira-NT/mc-publish@v3
         with:
           curseforge-id: ${{ vars.CURSEFORGE_PROJECT_ID }}
