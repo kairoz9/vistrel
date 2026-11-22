@@ -23,7 +23,7 @@ public final class NativeSessionServer implements SessionServer {
                         String codec,
                         String backend
                 ) {
-                    return NativeBridge.negotiateOffer(offerSdpJson, width, height, fps, bpp, codec, backend);
+                    return NativeBridge.negotiateOffer(offerSdpJson, width, height, fps, (float) bpp, codec, backend);
                 }
 
                 @Override
@@ -148,6 +148,7 @@ public final class NativeSessionServer implements SessionServer {
 
     @Override
     public String applyProfile(int width, int height, int fps, double bpp) {
-        return NativeBridge.applyProfile(width, height, fps, bpp);
+        // JNI 声明为 float：原生侧按 f32 派生码率，边界上收窄一次
+        return NativeBridge.applyProfile(width, height, fps, (float) bpp);
     }
 }

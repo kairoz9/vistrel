@@ -185,7 +185,7 @@ public class NativeBridge {
             int width,
             int height,
             int fps,
-            double bpp,
+            float bpp,
             String codec,
             String backend
     );
@@ -205,7 +205,7 @@ public class NativeBridge {
      * @param bpp    客户端画质档位 (BPP)
      * @return 实际生效档位 JSON；被拒绝或无活跃会话返回空串
      */
-    public static native String applyProfile(int width, int height, int fps, double bpp);
+    public static native String applyProfile(int width, int height, int fps, float bpp);
 
     /**
      * 注入客户端 ICE Candidate
