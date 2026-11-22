@@ -405,7 +405,7 @@ public class OpenGlRamPipeline implements VideoPipeline {
                     try {
                         long pushStart = CaptureProfiler.begin();
                         try {
-                            channel.pushSystemFrame(mapped);
+                            channel.pushSystemFrame(mapped, width, height);
                             delivered = true;
                         } finally {
                             CaptureProfiler.end(CaptureProfiler.Stage.RAM_PUSH, pushStart);

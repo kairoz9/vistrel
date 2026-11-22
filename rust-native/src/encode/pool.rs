@@ -75,13 +75,30 @@ impl HostBlock {
         }
     }
 
+    /// 可写视图（长度即容量）：块由 `FrameBuf` 独占，写入期间没有读者
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        let capacity = self.capacity();
+        match self {
+            // SAFETY: 锁页内存由本块独占、覆盖 `capacity` 字节，`&mut self` 排除别名
+            Self::Cuda(host) => unsafe {
+                std::slice::from_raw_parts_mut(host.as_ptr() as *mut u8, capacity)
+            },
+            // SAFETY: 持久映射基址覆盖 `size()` 字节，本块存活期内恒有效
+            Self::Vulkan(buf) => unsafe { std::slice::from_raw_parts_mut(buf.as_ptr(), capacity) },
+            Self::Heap(vec) => vec.as_mut_slice(),
+            #[cfg(test)]
+            Self::FakeDevice { buf, .. } => buf.as_mut_slice(),
+        }
+    }
+
     pub(crate) fn capacity(&self) -> usize {
         match self {
             Self::Cuda(host) => host.capacity(),
             Self::Vulkan(buf) => buf.size() as usize,
-            Self::Heap(vec) => vec.capacity(),
+            // 堆块按槽长分配且从不缩短，长度即可写容量（与 `as_mut_slice` 同一口径）
+            Self::Heap(vec) => vec.len(),
             #[cfg(test)]
-            Self::FakeDevice { buf, .. } => buf.capacity(),
+            Self::FakeDevice { buf, .. } => buf.len(),
         }
     }
 
@@ -200,6 +217,7 @@ impl FramePool {
         Some(FrameBuf {
             block: Some(block),
             len: 0,
+            display: None,
             pool: Arc::clone(self),
         })
     }
@@ -262,6 +280,10 @@ impl FramePool {
 pub(crate) struct FrameBuf {
     block: Option<HostBlock>,
     len: usize,
+    /// 采集几何：随帧写入声明（`None` = 调用方直给成品布局，见 [`FrameBuf::write`]）
+    ///
+    /// 判断的是几何本身而非字节数：两种几何可能长度相同而行距不同
+    display: Option<(usize, usize)>,
     pool: Arc<FramePool>,
 }
 
@@ -271,8 +293,88 @@ impl FrameBuf {
         self.block.as_ref().expect("帧缓冲已归还")
     }
 
-    /// 写入整帧：容量不足直接报错，不截断
-    pub(crate) fn write(&mut self, src: &[u8]) -> Result<(), String> {
+    /// 就地补齐到编码尺寸：右侧复制行尾采样、底部复制最后一行
+    ///
+    /// 编码尺寸只有编码线程知道；校验先于补齐——免补的帧也可能是旧几何的错帧
+    pub(crate) fn pad_in_place(&mut self, coded: (usize, usize)) -> Result<(), String> {
+        let Some((display_w, display_h)) = self.display else {
+            return Err("帧未声明采集几何，无法补齐".to_string());
+        };
+        let (coded_w, coded_h) = coded;
+        if display_w == 0
+            || display_h == 0
+            || display_w % 2 != 0
+            || display_h % 2 != 0
+            || coded_w % 2 != 0
+            || coded_h % 2 != 0
+            || coded_w < display_w
+            || coded_h < display_h
+        {
+            return Err(format!(
+                "几何非法: 采集 {display_w}x{display_h} / 编码 {coded_w}x{coded_h}（需偶数，且编码尺寸不小于采集尺寸）"
+            ));
+        }
+        let src_len = nv12_len(display_w, display_h);
+        if self.len != src_len {
+            return Err(format!(
+                "主机帧长度不符: 期望 {src_len}（采集 {display_w}x{display_h}, NV12）, 实际 {}",
+                self.len
+            ));
+        }
+        if (display_w, display_h) == (coded_w, coded_h) {
+            return Ok(());
+        }
+        let total = nv12_len(coded_w, coded_h);
+        let buf = self.block.as_mut().expect("帧缓冲已归还").as_mut_slice();
+        if total > buf.len() {
+            return Err(format!(
+                "主机帧容量不足: 需要 {total} 字节, 容量 {}",
+                buf.len()
+            ));
+        }
+        let buf = &mut buf[..total];
+        // 先 UV（高地址）后 Y：Y 的目标会覆写 UV 的源区
+        expand_plane(
+            buf,
+            PlaneMove {
+                src_off: display_w * display_h,
+                src_w: display_w,
+                src_rows: display_h / 2,
+                dst_off: coded_w * coded_h,
+                dst_w: coded_w,
+                dst_rows: coded_h / 2,
+                sample: 2,
+            },
+        );
+        expand_plane(
+            buf,
+            PlaneMove {
+                src_off: 0,
+                src_w: display_w,
+                src_rows: display_h,
+                dst_off: 0,
+                dst_w: coded_w,
+                dst_rows: coded_h,
+                sample: 1,
+            },
+        );
+        self.len = total;
+        Ok(())
+    }
+
+    /// 本帧声明的采集几何；`None` = 尚未写入 / 调用方直给了成品布局
+    pub(crate) fn display(&self) -> Option<(usize, usize)> {
+        self.display
+    }
+
+    /// 写入整帧并声明它的采集几何：容量不足直接报错，不截断
+    ///
+    /// 几何由写入方一并声明而不是事后补登记——分家就会静默落进「成品布局」那一支。
+    pub(crate) fn write(
+        &mut self,
+        src: &[u8],
+        display: Option<(usize, usize)>,
+    ) -> Result<(), String> {
         let block = self.block.as_mut().expect("帧缓冲已归还");
         let capacity = block.capacity();
         if src.len() > capacity {
@@ -299,19 +401,19 @@ impl FrameBuf {
             }
             // 持久映射缓冲自带长度校验与流式直写
             HostBlock::Vulkan(buf) => buf.write(src),
+            // 堆块整块可写（长度即容量）：只覆盖前缀，不缩短可写视图
             HostBlock::Heap(vec) => {
-                vec.clear();
-                vec.extend_from_slice(src);
+                vec[..src.len()].copy_from_slice(src);
                 Ok(())
             }
             #[cfg(test)]
             HostBlock::FakeDevice { buf, .. } => {
-                buf.clear();
-                buf.extend_from_slice(src);
+                buf[..src.len()].copy_from_slice(src);
                 Ok(())
             }
         }?;
         self.len = src.len();
+        self.display = display;
         Ok(())
     }
 
@@ -384,7 +486,7 @@ pub(crate) mod test_support {
     /// 测试里池的余量与容量都是既定前提，失败直接 panic
     pub(crate) fn host_payload(pool: &Arc<FramePool>, bytes: Vec<u8>) -> FramePayload {
         let mut frame = pool.acquire().expect("池里必须有余量");
-        frame.write(&bytes).expect("写入主机帧失败");
+        frame.write(&bytes, None).expect("写入主机帧失败");
         FramePayload::Host { frame }
     }
 }
@@ -392,7 +494,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::{StreamingProfile, display_nv12_len};
+    use crate::encode::{StreamingProfile, host_nv12_len};
 
     /// 归还进当前域后必须能再取到：池深固定，取空即 None
     #[test]
@@ -410,21 +512,132 @@ mod tests {
         assert_eq!(pool.stale_len(), 0);
     }
 
+    /// 长度与采集几何不符时必须拒：短了读不到，长了会被按 display 行距重读而错位
+    #[test]
+    fn test_pad_in_place_rejects_length_mismatch() {
+        let pool = FramePool::new();
+        pool.attach(heap_blocks());
+        let display = (4usize, 4usize);
+        let coded = (8usize, 8usize);
+        let exact = nv12_len(display.0, display.1);
+
+        let mut short = pool.acquire().expect("装批后池里必须有块");
+        short
+            .write(&vec![0u8; exact - 1], Some(display))
+            .expect("容量内写入");
+        let err = short.pad_in_place(coded).unwrap_err();
+        assert!(err.contains("长度不符"), "短帧必须被拒: {err}");
+        drop(short);
+
+        let mut long = pool.acquire().expect("归还后必须能再取到");
+        long.write(&vec![0u8; exact + 1], Some(display))
+            .expect("容量内写入");
+        let err = long.pad_in_place(coded).unwrap_err();
+        assert!(err.contains("长度不符"), "超长帧必须被拒: {err}");
+        drop(long);
+
+        // 采集几何已等于编码尺寸（NVENC / 软编）：免补也不能跳过校验
+        let mut aligned = pool.acquire().expect("归还后必须能再取到");
+        aligned
+            .write(&vec![0u8; exact - 1], Some(display))
+            .expect("容量内写入");
+        let err = aligned.pad_in_place(display).unwrap_err();
+        assert!(err.contains("长度不符"), "免补的路径同样必须校验: {err}");
+    }
+
+    /// 未声明采集几何的帧不得就地补齐（成品布局的帧应直接交给编码器）
+    #[test]
+    fn test_pad_in_place_requires_display() {
+        let pool = FramePool::new();
+        pool.attach(heap_blocks());
+        let mut frame = pool.acquire().expect("装批后池里必须有块");
+        frame
+            .write(&vec![0u8; nv12_len(4, 4)], None)
+            .expect("容量内写入");
+        let err = frame.pad_in_place((8, 8)).unwrap_err();
+        assert!(err.contains("未声明采集几何"), "未声明几何必须报错: {err}");
+    }
+
+    /// 就地补齐：右侧复制行尾采样（UV 成对）、底部复制最后一行，整块恰为编码尺寸
+    #[test]
+    fn test_pad_in_place_layout_matches_coded_extent() {
+        let pool = FramePool::new();
+        pool.attach(heap_blocks());
+        let mut frame = pool.acquire().expect("装批后池里必须有块");
+
+        // 采集 4x4 → 编码 8x8（两个方向都要补）
+        let (display_w, display_h) = (4usize, 4usize);
+        let (coded_w, coded_h) = (8usize, 8usize);
+        let mut src = vec![0u8; nv12_len(display_w, display_h)];
+        for y in 0..display_h {
+            for x in 0..display_w {
+                src[y * display_w + x] = (y + 1) as u8;
+            }
+        }
+        let uv = &mut src[display_w * display_h..];
+        for row in 0..display_h / 2 {
+            for i in 0..display_w {
+                uv[row * display_w + i] = if i % 2 == 0 {
+                    100 + row as u8
+                } else {
+                    200 + row as u8
+                };
+            }
+        }
+
+        frame
+            .write(&src, Some((display_w, display_h)))
+            .expect("容量内写入必须成功");
+        frame
+            .pad_in_place((coded_w, coded_h))
+            .expect("就地补齐必须成功");
+
+        let out = frame.as_slice();
+        assert_eq!(
+            out.len(),
+            nv12_len(coded_w, coded_h),
+            "落盘长度必须是编码尺寸"
+        );
+        for row in 0..coded_h {
+            let value = (row.min(display_h - 1) + 1) as u8;
+            assert!(
+                out[row * coded_w..(row + 1) * coded_w]
+                    .iter()
+                    .all(|b| *b == value),
+                "Y 第 {row} 行必须是该行采样铺满（含右侧与底部补齐）"
+            );
+        }
+        let y_bytes = coded_w * coded_h;
+        for row in 0..coded_h / 2 {
+            let sample = row.min(display_h / 2 - 1) as u8;
+            let expected = [
+                100 + sample,
+                200 + sample,
+                100 + sample,
+                200 + sample,
+                100 + sample,
+                200 + sample,
+                100 + sample,
+                200 + sample,
+            ];
+            assert_eq!(
+                &out[y_bytes + row * coded_w..y_bytes + (row + 1) * coded_w],
+                &expected,
+                "UV 第 {row} 行必须按采样整对复制，否则 U/V 串位"
+            );
+        }
+    }
+
     /// 写入后字节视图必须是同一次拷贝，容量超标必须报错而不是截断
     /// 容量按 coded 尺寸算而不是 display：GPU 侧 CSC 要读补齐行
     #[test]
     fn test_host_slot_bytes_cover_coded_extent() {
         // 码率与本用例无关（只验几何），占位即可
         let max = StreamingProfile::new(MAX_WIDTH, MAX_HEIGHT, 30, 4_000_000);
-        let coded = max.coded_extent((MAX_CODED_ALIGN, MAX_CODED_ALIGN));
         assert_eq!(
             HOST_SLOT_BYTES,
-            nv12_len(coded.0, coded.1),
-            "单块容量必须恰好是最大档位的 coded NV12"
-        );
-        assert!(
-            HOST_SLOT_BYTES >= display_nv12_len(&max),
-            "生产侧按 display 推的帧必须装得下"
+            host_nv12_len(&max, (MAX_CODED_ALIGN, MAX_CODED_ALIGN)),
+            "单块容量必须恰好是最大档位的编码尺寸 NV12"
         );
     }
 
@@ -434,12 +647,12 @@ mod tests {
         pool.attach(heap_blocks());
         let mut frame = pool.acquire().unwrap();
         let src = vec![7u8; 4096];
-        frame.write(&src).expect("容量内写入必须成功");
+        frame.write(&src, None).expect("容量内写入必须成功");
         assert_eq!(frame.as_slice(), src.as_slice());
         assert_eq!(frame.len(), src.len());
 
         let too_big = vec![0u8; HOST_SLOT_BYTES + 1];
-        assert!(frame.write(&too_big).is_err(), "超容量必须报错");
+        assert!(frame.write(&too_big, None).is_err(), "超容量必须报错");
     }
 
     /// 同域换批不产生 stale；跨域的 stale 路径由硬件后端用例（真设备换代）覆盖
@@ -464,5 +677,43 @@ mod tests {
         pool.attach(Vec::new());
         assert_eq!(pool.len(), POOL_DEPTH);
         assert!(pool.acquire().is_some());
+    }
+}
+
+/// 一个平面在块内的迁移与补齐：源布局 → 目标布局
+struct PlaneMove {
+    src_off: usize,
+    src_w: usize,
+    src_rows: usize,
+    dst_off: usize,
+    dst_w: usize,
+    dst_rows: usize,
+    /// 右补的采样组宽：Y 为 1，交织 UV 为 2（必须成对，否则 U/V 串位）
+    sample: usize,
+}
+
+/// 把一个平面原地展开到更大的几何：右侧复制行尾采样、底部复制最后一行
+///
+/// 源与目标同处一块内存：倒序逐行展开时目标偏移 ≥ 源偏移，每行读到的源都还没被覆写
+/// （行内重叠交给 `copy_within` 的 memmove 语义）。
+fn expand_plane(buf: &mut [u8], m: PlaneMove) {
+    // pad_in_place 已校验这些不变量，不成立只可能是调用写错
+    assert!(m.dst_off >= m.src_off && m.dst_w >= m.src_w && m.dst_rows >= m.src_rows);
+    assert!(m.sample > 0 && m.src_w >= m.sample && m.src_rows > 0);
+    // 逐行从后往前：写进高地址的字节只属于已处理过的行
+    for y in (0..m.src_rows).rev() {
+        let src = m.src_off + y * m.src_w;
+        let dst = m.dst_off + y * m.dst_w;
+        buf.copy_within(src..src + m.src_w, dst);
+        // 右侧补齐：整组复制行尾采样（UV 必须成对，否则 U/V 串位）
+        let (visible, pad) = buf[dst..dst + m.dst_w].split_at_mut(m.src_w);
+        for (i, byte) in pad.iter_mut().enumerate() {
+            *byte = visible[m.src_w - m.sample + i % m.sample];
+        }
+    }
+    // 底部补齐：复制最后一条已写满的行
+    let last = m.dst_off + (m.src_rows - 1) * m.dst_w;
+    for y in m.src_rows..m.dst_rows {
+        buf.copy_within(last..last + m.dst_w, m.dst_off + y * m.dst_w);
     }
 }

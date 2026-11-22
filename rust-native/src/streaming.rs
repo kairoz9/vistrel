@@ -469,7 +469,8 @@ pub(crate) mod test_support {
                         } else {
                             // 假 Actor 无会话常量可依：派生 codec 占位取 H264，
                             // 断言只看几何；真实行为由 encode/actor.rs 的用例覆盖
-                            reply.send(Ok(request.derive(VideoCodec::H264)))
+                            let profile = request.derive(VideoCodec::H264);
+                            reply.send(Ok(profile))
                         };
                         Rec::Retier
                     }
@@ -480,11 +481,8 @@ pub(crate) mod test_support {
                         reply,
                         ..
                     } => {
-                        let _ = reply.send(Ok((
-                            request.derive(codec),
-                            codec,
-                            EncodeBackendKind::Software,
-                        )));
+                        let profile = request.derive(codec);
+                        let _ = reply.send(Ok((profile, codec, EncodeBackendKind::Software)));
                         Rec::Prepare(request, preferred_backend)
                     }
                     ControlCommand::ImportVramSlots { reply, .. } => {
@@ -639,11 +637,8 @@ mod tests {
                     } => {
                         let _ = entry_tx.send(());
                         let _ = release_rx.recv();
-                        let _ = reply.send(Ok((
-                            request.derive(codec),
-                            codec,
-                            EncodeBackendKind::Software,
-                        )));
+                        let profile = request.derive(codec);
+                        let _ = reply.send(Ok((profile, codec, EncodeBackendKind::Software)));
                     }
                     ControlCommand::Shutdown => break,
                     _ => {}

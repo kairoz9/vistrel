@@ -284,11 +284,9 @@ mod tests {
             }
             match cmd {
                 ControlCommand::PrepareEncoder { reply, .. } => {
-                    let _ = reply.send(Ok((
-                        StreamingProfile::default(),
-                        VideoCodec::H264,
-                        EncodeBackendKind::Software,
-                    )));
+                    let default = StreamingProfile::default();
+                    let _ =
+                        reply.send(Ok((default, VideoCodec::H264, EncodeBackendKind::Software)));
                 }
                 ControlCommand::ImportVramSlots { reply, .. } => {
                     let _ = reply.send(ControlStatus::Ok);
@@ -297,7 +295,8 @@ mod tests {
                     let _ = reply.send(ControlStatus::Ok);
                 }
                 ControlCommand::Retier { reply, .. } => {
-                    let _ = reply.send(Ok(StreamingProfile::default()));
+                    let default = StreamingProfile::default();
+                    let _ = reply.send(Ok(default));
                 }
                 ControlCommand::Shutdown
                 | ControlCommand::BitrateChange(_)
@@ -406,11 +405,8 @@ mod tests {
             } = cmd
             {
                 let _ = recorded_tx.send((codec, preferred_backend));
-                let _ = reply.send(Ok((
-                    StreamingProfile::default(),
-                    codec,
-                    EncodeBackendKind::Software,
-                )));
+                let default = StreamingProfile::default();
+                let _ = reply.send(Ok((default, codec, EncodeBackendKind::Software)));
             }
         });
         let request = TierRequest {

@@ -101,7 +101,7 @@ public class CaptureCascadeTest {
         long lastVramSignalVal = -1L;
 
         @Override
-        public void pushSystemFrame(ByteBuffer buffer) {
+        public void pushSystemFrame(ByteBuffer buffer, int width, int height) {
             pushes++;
         }
 
@@ -211,7 +211,7 @@ public class CaptureCascadeTest {
     void testVramConstructionFailureDemotesPermanentlyToRam() {
         FakeEncoderChannel channel = new FakeEncoderChannel();
         ByteBuffer ramBuf = ByteBuffer.allocateDirect(16);
-        FakePipeline ram = new FakePipeline(1920, 1080, true, () -> channel.pushSystemFrame(ramBuf));
+        FakePipeline ram = new FakePipeline(1920, 1080, true, () -> channel.pushSystemFrame(ramBuf, 1920, 1080));
         FakeClock clock = new FakeClock();
         // vram 传入 null，会触发 createVramPipeline 抛出异常
         VideoCaptureScheduler capture = scheduler(null, ram, channel, clock, true);
@@ -266,7 +266,7 @@ public class CaptureCascadeTest {
         // 运行期恒返回 Failed
         FakePipeline vram = new FakePipeline(1920, 1080, false, null);
         ByteBuffer ramBuf = ByteBuffer.allocateDirect(16);
-        FakePipeline ram = new FakePipeline(1920, 1080, true, () -> channel.pushSystemFrame(ramBuf));
+        FakePipeline ram = new FakePipeline(1920, 1080, true, () -> channel.pushSystemFrame(ramBuf, 1920, 1080));
         FakeClock clock = new FakeClock();
 
         VideoCaptureScheduler capture = scheduler(vram, ram, channel, clock, true);
@@ -612,7 +612,7 @@ public class CaptureCascadeTest {
         ByteBuffer ramBuf = ByteBuffer.allocateDirect(16);
         FakePipeline vram = new FakePipeline(1920, 1080, true, null);
         vram.runtimeException = new IllegalStateException("测试：显存直通内部异常");
-        FakePipeline ram = new FakePipeline(1920, 1080, true, () -> channel.pushSystemFrame(ramBuf));
+        FakePipeline ram = new FakePipeline(1920, 1080, true, () -> channel.pushSystemFrame(ramBuf, 1920, 1080));
         FakeClock clock = new FakeClock();
 
         VideoCaptureScheduler capture = scheduler(vram, ram, channel, clock, true);
@@ -644,7 +644,7 @@ public class CaptureCascadeTest {
         FakeEncoderChannel channel = new FakeEncoderChannel();
         ByteBuffer ramBuf = ByteBuffer.allocateDirect(16);
         FakePipeline vram = new FakePipeline(1920, 1080, true, null);
-        FakePipeline ram = new FakePipeline(1920, 1080, true, () -> channel.pushSystemFrame(ramBuf));
+        FakePipeline ram = new FakePipeline(1920, 1080, true, () -> channel.pushSystemFrame(ramBuf, 1920, 1080));
         FakeClock clock = new FakeClock();
 
         VideoCaptureScheduler capture = scheduler(vram, ram, channel, clock, true);

@@ -12,8 +12,10 @@ public interface EncoderChannel {
      * 投递系统内存帧 (RGBA DirectByteBuffer)。
      *
      * @param buffer 包含未压缩 RGBA 像素数据的堆外缓冲区
+     * @param width  可见区宽度（像素）
+     * @param height 可见区高度（像素）
      */
-    void pushSystemFrame(ByteBuffer buffer);
+    void pushSystemFrame(ByteBuffer buffer, int width, int height);
 
     /**
      * 投递音频 PCM 数据帧。

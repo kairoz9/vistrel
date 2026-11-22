@@ -16,7 +16,7 @@ use crate::encode::hardware::slots::{ActorStage, SlotStateBlock};
 use crate::encode::pool::{FramePool, HostBlock};
 use crate::encode::{
     FramePayload, StampedVideoPacket, StreamingProfile, TierRequest, VideoCodec, VideoPacket,
-    display_nv12_len,
+    nv12_len,
 };
 
 use super::encoder::{EncodeBackendKind, VideoEncoder};
@@ -582,7 +582,7 @@ impl EncoderActor {
     ///
     /// 编码器由控制面（Profile 确立 / 槽位注册）预先配置完成，本方法只做编码与入箱。
     /// 入箱是同步的：门控、连接与过期判定都在会话侧取帧之后，本线程不等待网络。
-    fn encode_frame(&mut self, payload: &FramePayload, birth_nanos: u64) {
+    fn encode_frame(&mut self, payload: &mut FramePayload, birth_nanos: u64) {
         let Some(encoder) = &mut self.encoder else {
             // 未配置编码器时消费掉的帧同样没上链路，与编码失败并账。
             // 显存槽位的所有权位与编码器解耦：帧已被取走，位必须归还
@@ -595,25 +595,36 @@ impl EncoderActor {
             return;
         };
 
-        // 采集侧送来的字节数必须与编码器此刻的几何一致：本处是档位的唯一事实源头，
-        // 换分辨率后采集侧若还按旧尺寸送帧，就在这里拦下而不是换出一屏错行距花屏
+        // 长度与布局由 `pad_in_place` 判；本处只判它无从知道的事：这帧是不是当前档位产出的
         if let FramePayload::Host { frame } = payload {
-            let expected = display_nv12_len(&self.profile);
-            if frame.len() != expected {
-                let (width, height) = (self.profile.width(), self.profile.height());
-                self.inbox.outcomes().record_with(
-                    FrameOutcome::GeometryMismatch,
+            let coded = encoder.coded_extent();
+            let display = (self.profile.width(), self.profile.height());
+            let err = match frame.display() {
+                // 换档后在途的旧帧：比编码尺寸小也会被补齐成「合法」的一屏
+                Some(declared) if declared != display => Some(format!(
+                    "本帧采集几何 {declared:?} 与当前档位 {display:?} 不同步"
+                )),
+                Some(_) => frame.pad_in_place(coded).err(),
+                // 未声明几何（成品布局）：只能校长度
+                None => (frame.len() != nv12_len(coded.0, coded.1)).then(|| {
                     format!(
-                        "本帧 {} 字节，期望 {expected}（编码器 {width}x{height}）",
-                        frame.len()
-                    ),
-                );
+                        "本帧 {} 字节，成品布局应为编码尺寸 {coded:?} 的 {} 字节",
+                        frame.len(),
+                        nv12_len(coded.0, coded.1)
+                    )
+                }),
+            };
+            if let Some(e) = err {
+                self.inbox
+                    .outcomes()
+                    .record_with(FrameOutcome::GeometryMismatch, e);
                 return;
             }
         }
 
         let force_keyframe = std::mem::take(&mut self.pending_keyframe);
         self.slot_state.set_stage(ActorStage::EncodeFrame);
+        let payload = &*payload;
         match encoder.encode(payload, force_keyframe) {
             Ok((nalu, is_keyframe)) if !nalu.is_empty() => {
                 self.output.post(StampedVideoPacket::now(VideoPacket {
@@ -659,7 +670,7 @@ impl EncoderActor {
     /// 在入口丢弃并
     /// 归还所有权位；主机帧自带像素、不引用表，照常编码。正常期两类帧都进编码。
     /// 帧的归还在 `FrameBuf::drop` 里完成（析构即归还），各出口都不会泄漏或提前释放
-    fn handle_frame(&mut self, frame: VideoFrame) {
+    fn handle_frame(&mut self, mut frame: VideoFrame) {
         if self.rejecting_frames
             && let FramePayload::VramSlot { slot_idx, .. } = &frame.payload
         {
@@ -670,12 +681,17 @@ impl EncoderActor {
             );
             return;
         }
-        self.encode_frame(&frame.payload, frame.birth_nanos);
+        self.encode_frame(&mut frame.payload, frame.birth_nanos);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// 采集侧按编码尺寸出帧：软编不补齐（对齐粒度 1），测试载荷即编码尺寸 × 1.5
+    fn host_bytes(profile: &StreamingProfile) -> usize {
+        crate::encode::host_nv12_len(profile, (1, 1))
+    }
+
     use bytes::Bytes;
 
     use crate::encode::VideoCodec;
@@ -993,8 +1009,8 @@ mod tests {
             state.encoder = Some(encoder);
         }
 
-        let payload = host_payload(&pool, vec![128u8; display_nv12_len(&state.profile)]);
-        state.encode_frame(&payload, 0);
+        let mut payload = host_payload(&pool, vec![128u8; host_bytes(&state.profile)]);
+        state.encode_frame(&mut payload, 0);
         // payload 离开作用域时自动通过 RAII 归还给关联的池
         drop(payload);
 
@@ -1028,23 +1044,23 @@ mod tests {
                 .map(|f| f.packet.is_keyframe)
                 .expect("必须产出编码产物")
         };
-        let payload_bytes = || vec![0u8; display_nv12_len(&profile)];
+        let payload_bytes = || vec![0u8; host_bytes(&profile)];
 
         // 初值请求让首帧出 IDR；第二帧无挂起请求，回到 P 帧
-        let first = host_payload(&pool, payload_bytes());
-        state.encode_frame(&first, 0);
+        let mut first = host_payload(&pool, payload_bytes());
+        state.encode_frame(&mut first, 0);
         drop(first);
         assert!(keyframe_of(&output), "首帧必须携带挂起的初值请求出 IDR");
 
-        let second = host_payload(&pool, payload_bytes());
-        state.encode_frame(&second, 16);
+        let mut second = host_payload(&pool, payload_bytes());
+        state.encode_frame(&mut second, 16);
         drop(second);
         assert!(!keyframe_of(&output), "请求已兑现，第二帧不得再出 IDR");
 
         // 控制命令置位：第三帧以 IDR 编码
         assert!(state.apply(ControlCommand::RequestKeyframe));
-        let third = host_payload(&pool, payload_bytes());
-        state.encode_frame(&third, 33);
+        let mut third = host_payload(&pool, payload_bytes());
+        state.encode_frame(&mut third, 33);
         drop(third);
         assert!(keyframe_of(&output), "RequestKeyframe 后下一帧必须出 IDR");
     }
@@ -1066,8 +1082,8 @@ mod tests {
         }
 
         // 按旧几何的一半长度送帧（典型现场：换分辨率后采集侧还按旧尺寸回读）
-        let payload = host_payload(&pool, vec![128u8; display_nv12_len(&profile) / 2]);
-        state.encode_frame(&payload, 0);
+        let mut payload = host_payload(&pool, vec![128u8; host_bytes(&profile) / 2]);
+        state.encode_frame(&mut payload, 0);
         drop(payload);
 
         assert!(output.take().is_none(), "布局不符的帧不得产出编码产物");
@@ -1090,8 +1106,8 @@ mod tests {
             state.encoder = Some(encoder);
         }
 
-        let p1 = host_payload(&pool, vec![0u8; display_nv12_len(&p1_profile)]);
-        state.encode_frame(&p1, 0);
+        let mut p1 = host_payload(&pool, vec![0u8; host_bytes(&p1_profile)]);
+        state.encode_frame(&mut p1, 0);
         drop(p1);
         assert!(output.take().is_some());
 
@@ -1107,9 +1123,9 @@ mod tests {
             );
         }
 
-        let frame_bytes = display_nv12_len(&new_profile);
-        let p2 = host_payload(&pool, vec![0u8; frame_bytes]);
-        state.encode_frame(&p2, 16);
+        let frame_bytes = host_bytes(&new_profile);
+        let mut p2 = host_payload(&pool, vec![0u8; frame_bytes]);
+        state.encode_frame(&mut p2, 16);
         drop(p2);
         assert!(output.take().is_some(), "换尺寸后必须仍能产出编码产物");
         if let Some(encoder) = &state.encoder {
@@ -1212,7 +1228,7 @@ mod tests {
         // 0. 调整 Profile 为 720p (1280x720)
         let request = tier(1280, 720, 60);
         let profile = request.derive(VideoCodec::H264);
-        let frame_bytes = display_nv12_len(&profile);
+        let frame_bytes = host_bytes(&profile);
         let (ack0_tx, ack0_rx) = tokio::sync::oneshot::channel();
         assert!(
             ctl_tx
@@ -1510,7 +1526,7 @@ mod tests {
 
         // 窗口内主机帧：自带像素不引用表，照收。
         // `Admitted` 由会话写循环记账，Actor 层以发件箱产物为准
-        let host = host_payload(&pool, vec![100u8; display_nv12_len(&p720)]);
+        let host = host_payload(&pool, vec![100u8; host_bytes(&p720)]);
         inbox.push(VideoFrame {
             birth_nanos: 1,
             payload: host,
@@ -1618,7 +1634,7 @@ mod tests {
         assert!(actor.encoder.is_none(), "弃置后不得残留任何编码器");
 
         // 主机帧被消费但不产出码流：无编码器可跑
-        let host = host_payload(&pool, vec![100u8; display_nv12_len(&p720)]);
+        let host = host_payload(&pool, vec![100u8; host_bytes(&p720)]);
         inbox.push(VideoFrame {
             birth_nanos: 1,
             payload: host,

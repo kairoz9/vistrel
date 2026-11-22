@@ -54,7 +54,7 @@ public class AudioCaptureSchedulerTest {
         int lastSamples = 0;
 
         @Override
-        public void pushSystemFrame(ByteBuffer buffer) {}
+        public void pushSystemFrame(ByteBuffer buffer, int width, int height) {}
 
         @Override
         public void pushAudioPcm(ByteBuffer buffer, int samplesPerChannel) {

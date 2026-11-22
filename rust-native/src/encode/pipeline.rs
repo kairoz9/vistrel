@@ -174,20 +174,18 @@ impl VideoPipeline {
 
     /// 投递一帧主机内存画面：从池里取一块写进去，交给编码线程
     ///
-    /// `birth_nanos` 由采集侧给：它是端到端延迟的起点，必须在拷贝之前取。
+    /// `birth_nanos` 是端到端延迟的起点，必须在拷贝之前取。`display` 是本帧形状，
+    /// 由调用方随帧报。补齐不在这里——编码尺寸只有编码线程知道。
     ///
-    /// 取不到块说明编码器正把这一代块都用光（或正换代），此时丢帧：既不等，也不另起
-    /// 一条普通内存的旁路——后端只接受池里的块，旁路换来的不是一帧画面而是一条错误。
-    pub fn push_host_frame(&self, birth_nanos: u64, bytes: &[u8]) {
-        // 字节数与编码器几何是否相符，由编码线程按当前档位校验（见 `EncoderActor::encode_frame`）：
-        // 档位的事实源头在那里，同一处判才不会有陈旧值
+    /// 取不到块说明块全在途（或正换代）：丢帧，不等也不另起旁路。
+    pub fn push_host_frame(&self, birth_nanos: u64, bytes: &[u8], display: (usize, usize)) {
         let Some(mut frame) = self.pool.acquire() else {
             // 丢帧是既定策略，计数与限频日志都在账本里做
             self.inbox.outcomes().record(FrameOutcome::PoolEmpty);
             return;
         };
-        // 容量校验在 write 内做（块统一按最大几何分配）；失败时帧随 Drop 自动归还
-        match frame.write(bytes) {
+        // 容量校验在写内做（块统一按最大几何分配）；失败时帧随 Drop 自动归还
+        match frame.write(bytes, Some(display)) {
             Ok(()) => self.inbox.push(VideoFrame {
                 birth_nanos,
                 payload: FramePayload::Host { frame },
@@ -238,5 +236,74 @@ impl VideoPipeline {
             std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
         }
         let _ = handle.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::frame::FrameInbox;
+    use crate::encode::nv12_len;
+    use crate::encode::pool::{HOST_SLOT_BYTES, HostBlock};
+    use tokio::sync::Notify;
+
+    /// 投递只落原始字节与采集几何：编码尺寸不在生产者视野里，补齐在编码线程做
+    #[test]
+    fn test_push_host_frame_carries_display_and_raw_bytes() {
+        let doorbell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&doorbell)));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let pipeline =
+            VideoPipeline::assemble(ControlSender::new(tx, doorbell), Arc::clone(&inbox));
+        pipeline
+            .pool
+            .attach(vec![HostBlock::Heap(vec![0u8; HOST_SLOT_BYTES])]);
+        assert_eq!(pipeline.pool.len(), 1, "attach 之后池里必须有块");
+
+        let display = (8usize, 8usize);
+        let source = vec![7u8; nv12_len(display.0, display.1)];
+        pipeline.push_host_frame(0, &source, display);
+
+        let mut written = host_frame(&inbox, &pipeline);
+        assert_eq!(
+            written.len(),
+            nv12_len(display.0, display.1),
+            "投递阶段不补齐：字节数就是采集尺寸"
+        );
+        assert_eq!(
+            written.display(),
+            Some(display),
+            "帧必须带上生产者的采集几何，编码线程据此校验与补齐"
+        );
+
+        // 编码线程拿到的编码尺寸才是补齐的目标
+        let coded = (16usize, 16usize);
+        written
+            .pad_in_place(coded)
+            .expect("采集几何合法的帧必须能就地补齐");
+        assert_eq!(
+            written.len(),
+            nv12_len(coded.0, coded.1),
+            "补齐后字节数按编码尺寸"
+        );
+    }
+
+    /// 取出收件箱里的主机帧（唯一一帧，取完即空）
+    fn host_frame(
+        inbox: &Arc<FrameInbox>,
+        pipeline: &VideoPipeline,
+    ) -> crate::encode::pool::FrameBuf {
+        let outcomes = pipeline.inbox.outcomes();
+        let frame = inbox.take().unwrap_or_else(|| {
+            panic!(
+                "必须入箱；pool_empty={} write_failed={}",
+                outcomes.count(FrameOutcome::PoolEmpty),
+                outcomes.count(FrameOutcome::WriteFailed)
+            )
+        });
+        match frame.payload {
+            FramePayload::Host { frame } => frame,
+            _ => panic!("主机帧必须是 Host 载荷"),
+        }
     }
 }

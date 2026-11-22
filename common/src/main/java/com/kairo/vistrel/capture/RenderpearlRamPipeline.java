@@ -292,7 +292,7 @@ public class RenderpearlRamPipeline implements VideoPipeline {
                             if (data != null) {
                                 long pushStart = CaptureProfiler.begin();
                                 try {
-                                    channel.pushSystemFrame(data);
+                                    channel.pushSystemFrame(data, width, height);
                                     delivered = true;
                                 } finally {
                                     CaptureProfiler.end(CaptureProfiler.Stage.RAM_PUSH, pushStart);
@@ -318,7 +318,7 @@ public class RenderpearlRamPipeline implements VideoPipeline {
                             if (data != null) {
                                 long pushStart = CaptureProfiler.begin();
                                 try {
-                                    channel.pushSystemFrame(data);
+                                    channel.pushSystemFrame(data, width, height);
                                     delivered = true;
                                 } finally {
                                     CaptureProfiler.end(CaptureProfiler.Stage.RAM_PUSH, pushStart);

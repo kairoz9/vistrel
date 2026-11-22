@@ -9,8 +9,8 @@ import java.nio.ByteBuffer;
  */
 public final class NativeEncoderChannel implements EncoderChannel, InputEventSource {
     @Override
-    public void pushSystemFrame(ByteBuffer buffer) {
-        NativeBridge.pushSystemFrame(buffer);
+    public void pushSystemFrame(ByteBuffer buffer, int width, int height) {
+        NativeBridge.pushSystemFrame(buffer, width, height);
     }
 
     @Override

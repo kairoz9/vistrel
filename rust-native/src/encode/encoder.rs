@@ -313,7 +313,10 @@ impl VideoEncoder {
         self.backend.benchmark_stages()
     }
 
-    #[cfg(test)]
+    /// 编码尺寸：显示几何按后端 `coded_align` 向上对齐
+    ///
+    /// 与显示尺寸并列的**事实**，随协商/换档回执交给采集侧（采集侧按它建纹理与
+    /// 回读缓冲）。任何别处不得自行推导——同一事实推导两次必然分叉
     pub(crate) fn coded_extent(&self) -> (usize, usize) {
         let align = self.backend.coded_align();
         self.profile
@@ -343,7 +346,9 @@ mod tests {
     /// 取一块并写满 `color`，交给编码器
     fn host_frame(pool: &Arc<FramePool>, bytes: usize, color: u8) -> FramePayload {
         let mut frame = pool.acquire().expect("池里必须有余量");
-        frame.write(&vec![color; bytes]).expect("写入必须成功");
+        frame
+            .write(&vec![color; bytes], None)
+            .expect("写入必须成功");
         FramePayload::Host { frame }
     }
 

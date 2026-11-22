@@ -299,8 +299,10 @@ public class NativeBridge {
      * Native 在本次调用内就拷贝完，返回后缓冲区可立即复用。
      *
      * @param buffer RGBA（byte0=R）像素的堆外 DirectBuffer
+     * @param width  可见区宽度（像素）
+     * @param height 可见区高度（像素）
      */
-    public static native void pushSystemFrame(java.nio.ByteBuffer buffer);
+    public static native void pushSystemFrame(java.nio.ByteBuffer buffer, int width, int height);
 
     /**
      * 设置音频推流比特率 (kbps)

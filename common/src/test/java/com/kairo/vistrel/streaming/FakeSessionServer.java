@@ -15,7 +15,7 @@ public class FakeSessionServer implements SessionServer {
         public boolean vramDirectSupported = false;
 
         @Override
-        public void pushSystemFrame(ByteBuffer buffer) {
+        public void pushSystemFrame(ByteBuffer buffer, int width, int height) {
             systemFramesPushed++;
         }
 

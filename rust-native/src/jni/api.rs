@@ -644,13 +644,15 @@ const _: jni::NativeMethod = native_method! {
     java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
     export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_pushSystemFrame",
     error_policy = LogErrorAndDefault,
-    static fn push_system_frame(buffer: JByteBuffer) -> void,
+    static fn push_system_frame(buffer: JByteBuffer, width: jint, height: jint) -> void,
 };
 
 fn push_system_frame<'caller>(
     env: &mut Env<'caller>,
     _class: JClass<'caller>,
     buffer: JByteBuffer<'caller>,
+    width: jint,
+    height: jint,
 ) -> jni::errors::Result<()> {
     let state = get_global();
     let birth_nanos = elapsed_birth_nanos();
@@ -675,6 +677,14 @@ fn push_system_frame<'caller>(
 
     // 帧数据拷进 CPU 帧池的可复用缓冲后即刻返回，软编在 Actor 线程异步执行；
     // PBO DirectBuffer 仅在本 JNI 调用期内有效，拷贝必须就地完成。
+    // 宽高来自调用方的采集缓冲：非法或字节数与几何不符就整帧拒绝
+    let display = match validate_display_extent(width, height, cap) {
+        Ok(display) => display,
+        Err(e) => {
+            log::warn!("pushSystemFrame 几何非法（{width}x{height}, {cap} 字节）: {e}");
+            return Ok(());
+        }
+    };
     // SAFETY: ptr 来自 get_direct_buffer_address 的成功返回，长度取 DirectBuffer
     // 的有效容量 cap；切片仅在本 JNI 调用栈内被同步拷贝消费，不会逃逸到 Buffer 失效之后
     let slice = unsafe { std::slice::from_raw_parts(ptr, cap) };
@@ -682,8 +692,25 @@ fn push_system_frame<'caller>(
     let Some(engine) = state.streaming_engine.load_full() else {
         return Ok(());
     };
-    engine.video().push_host_frame(birth_nanos, slice);
+    engine.video().push_host_frame(birth_nanos, slice, display);
     Ok(())
+}
+
+/// 采集几何的信任边界校验：偶数、非零，且字节数与该几何的 NV12 长度恰好相等
+fn validate_display_extent(
+    width: jint,
+    height: jint,
+    bytes: usize,
+) -> Result<(usize, usize), String> {
+    let (w, h) = (width.max(0) as usize, height.max(0) as usize);
+    if w == 0 || h == 0 || w % 2 != 0 || h % 2 != 0 {
+        return Err(format!("宽高必须为偶数且非零（{w}x{h}）"));
+    }
+    let expected = crate::encode::nv12_len(w, h);
+    if bytes != expected {
+        return Err(format!("字节数不符：期望 {expected}，实际 {bytes}"));
+    }
+    Ok((w, h))
 }
 
 const _: jni::NativeMethod = native_method! {
