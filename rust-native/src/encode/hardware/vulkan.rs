@@ -27,7 +27,7 @@ use crate::encode::hardware::slots::{
     SlotStateBlock, SlotTable, VramSlotDescriptor, ensure_batch_geometry,
 };
 use crate::encode::pool::{HOST_SLOT_BYTES, HostBlock, POOL_DEPTH};
-use crate::encode::{FramePayload, StreamingProfile, VideoCodec, display_nv12_len};
+use crate::encode::{FramePayload, StreamingProfile, VideoCodec, nv12_len};
 
 use ash::vk;
 use bytes::Bytes;
@@ -303,11 +303,15 @@ impl VideoEncodeBackend for VulkanVideoBackend {
 
     /// 批量导入外部显存槽位并导入为 Vulkan Image/ImageView 与时间线信号量
     fn import_vram_slots(&mut self, descriptors: &mut [VramSlotDescriptor]) -> Result<(), String> {
-        // 显存直通要求生产侧按 **coded 尺寸** 建纹理：CSC 的分派范围按 coded 算，尺寸不符
-        // 会越界读显存。这里在注册期一次拦下，让采集侧直接降级到 CPU 回读，而不是逐帧
+        // 槽位可以是编码尺寸，也可以是采集尺寸（CSC 按源尺寸夹取，把补齐边复制出来）。
+        // 其余尺寸没有这套保证，注册期一次拦下，让采集侧直接降级到 CPU 回读，而不是逐帧
         // 失败 30 次后被断路器踢掉——后者会让第一秒的画面白丢
         let extent = self.encoder.extent();
-        ensure_batch_geometry(descriptors, extent.width, extent.height)?;
+        ensure_batch_geometry(
+            descriptors,
+            (extent.width, extent.height),
+            Some((self.profile.width() as u32, self.profile.height() as u32)),
+        )?;
         // 先克隆句柄再借 slots：`VideoDevice` 只是 Arc 计数 +1，两个字段的借用因此不重叠
         let device = self.device.clone();
         self.slots
@@ -379,15 +383,16 @@ impl VideoEncodeBackend for VulkanVideoBackend {
     ) -> Result<(Bytes, bool), String> {
         match payload {
             FramePayload::Host { frame } => {
-                // 主机帧一律 NV12 且按**显示尺寸**交付：Y 平面 w*h 之后紧跟交织 UV 平面 w*h/2
-                let display_w = self.profile.width();
-                let display_h = self.profile.height();
-                let host_bytes = display_nv12_len(&self.profile);
+                // 主机帧一律 NV12，按**编码尺寸**交付：Y 平面 w*h 之后紧跟交织 UV 平面 w*h/2
+                let extent = self.encoder.extent();
+                let host_bytes = nv12_len(extent.width as usize, extent.height as usize);
                 let nv12 = frame.as_slice();
                 // 对不上说明采集管线与编码器档位不同步——直接报错，不去猜怎么补
                 if nv12.len() < host_bytes {
                     return Err(format!(
-                        "主机帧长度不足: 期望 {host_bytes}（显示尺寸 {display_w}x{display_h}, NV12）, 实际 {}",
+                        "主机帧长度不足: 期望 {host_bytes}（编码尺寸 {}x{}, NV12）, 实际 {}",
+                        extent.width,
+                        extent.height,
                         nv12.len()
                     ));
                 }

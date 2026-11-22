@@ -42,8 +42,11 @@ pub(super) const CSC_SPIRV: &[u8] = include_bytes!("../../../../shaders/rgba_to_
 /// 着色器里的 `local_size_x` / `local_size_y`
 pub(super) const LOCAL_SIZE: u32 = 16;
 
-/// 推送常量：图像宽高（`PushConstants { uint width; uint height; }`）
-pub(super) const PUSH_CONSTANT_SIZE: u32 = 8;
+/// 推送常量：目标宽高 + 源宽高（`PushConstants { uint width, height, src_width, src_height; }`）
+///
+/// 源可以小于目标（槽位按采集尺寸建、编码器要编码尺寸），着色器按源尺寸夹取，
+/// 多出来的列/行是边缘复制的补齐边。
+pub(super) const PUSH_CONSTANT_SIZE: u32 = 16;
 
 /// 一次分派要绑定的描述符数量：源图 + Y 平面 + UV 平面
 const DESCRIPTOR_COUNT: u32 = 3;
@@ -669,11 +672,13 @@ impl ColorConverter {
     /// 与 [`ColorConverter::copy_nv12_from_buffer`] 的差别在于源：那边源已是 NV12，
     /// 只做缓冲拷贝；这边源是 RGBA 显存图，要过一遍着色器。外部图的先前用途本设备
     /// 不可知，所以源 stage 取 `ALL_COMMANDS`、源 access 取空。
+    /// @param source 源图（槽位）尺寸：小于目标时右侧与底部按边缘复制补齐
     pub fn convert_from_view(
         &mut self,
         image: vk::Image,
         view: vk::ImageView,
         old_layout: vk::ImageLayout,
+        source: vk::Extent2D,
         wait: Option<(vk::Semaphore, u64)>,
     ) -> Result<vk::ImageLayout, String> {
         if self.pending {
@@ -703,6 +708,8 @@ impl ColorConverter {
         let mut push_bytes = [0u8; PUSH_CONSTANT_SIZE as usize];
         push_bytes[0..4].copy_from_slice(&extent.width.to_le_bytes());
         push_bytes[4..8].copy_from_slice(&extent.height.to_le_bytes());
+        push_bytes[8..12].copy_from_slice(&source.width.to_le_bytes());
+        push_bytes[12..16].copy_from_slice(&source.height.to_le_bytes());
 
         let device = self.device.device();
         // SAFETY: 上一次提交已确认完成（`pending` 为假才走到这里），命令缓冲可以重置；
@@ -911,6 +918,7 @@ mod tests {
                 source_image,
                 source_view,
                 vk::ImageLayout::GENERAL,
+                extent,
                 None,
             ) {
                 Ok(layout) => layout,
@@ -943,6 +951,176 @@ mod tests {
             let reference = reference_nv12(&rgba, extent);
             assert_nv12_matches(&gpu, &reference, &format!("外部视图路径 第{pass}轮"));
         }
+    }
+
+    /// 源小于目标时，右侧与底部必须是边缘复制式补齐
+    ///
+    /// 显存直通的槽位由游戏侧按采集尺寸建，编码器输入是编码尺寸（对齐后更大）。
+    /// 补齐在着色器里按源尺寸夹取完成，产物必须与主机帧补齐（`write_padded`）一致，
+    /// 否则两条路径的画面会在右/下边缘出现不同接缝
+    #[test]
+    #[ignore = "requires GPU"]
+    fn test_vulkan_video_csc_pads_smaller_source() {
+        let Ok(ctx) = VulkanInstance::new("Vistrel-S3-pad") else {
+            println!("Vulkan 不可用，跳过");
+            return;
+        };
+        let Ok(caps) = caps::probe_codec(&ctx, VideoCodec::H264) else {
+            println!("H.264 能力探测失败，跳过");
+            return;
+        };
+        let device = match VideoDevice::new(&ctx, VideoCodec::H264) {
+            Ok(device) => device,
+            Err(e) => {
+                println!("设备创建失败，跳过: {e}");
+                return;
+            }
+        };
+        // 采集 1920x1080 → 编码（对齐后）更大；无对齐则无事可测
+        let coded = match caps.align_extent(1920, 1080) {
+            Ok(extent) => extent,
+            Err(e) => {
+                println!("几何对齐失败，跳过: {e}");
+                return;
+            }
+        };
+        let display = vk::Extent2D {
+            width: 1920,
+            height: 1080,
+        };
+        if coded == display {
+            println!("驱动不对齐 1920x1080，补齐路径无可测，跳过");
+            return;
+        }
+        let mut converter = match ColorConverter::new(&device, coded) {
+            Ok(c) => c,
+            Err(e) => {
+                assert!(
+                    !device.format_support().all(),
+                    "硬件满足 CSC 准入条件，但构造失败: {e}"
+                );
+                println!("CSC 不可用，跳过: {e}");
+                return;
+            }
+        };
+        let mut nv12_image = match Nv12Image::new(&device, coded) {
+            Ok(i) => i,
+            Err(e) => {
+                println!("输入图创建失败: {e}");
+                return;
+            }
+        };
+
+        let (dw, dh) = (display.width as usize, display.height as usize);
+        let (cw, ch) = (coded.width as usize, coded.height as usize);
+        let mut source_rgba = vec![0u8; dw * dh * 4];
+        for y in 0..dh {
+            for x in 0..dw {
+                let i = (y * dw + x) * 4;
+                source_rgba[i] = (x * 7 % 256) as u8;
+                source_rgba[i + 1] = (y * 13 % 256) as u8;
+                source_rgba[i + 2] = ((x + y) * 3 % 256) as u8;
+                source_rgba[i + 3] = 255;
+            }
+        }
+        // CPU 参考：先把源按边缘复制铺满编码尺寸，再走与正常路径相同的参考实现
+        let mut padded_rgba = vec![0u8; cw * ch * 4];
+        for y in 0..ch {
+            for x in 0..cw {
+                let sx = x.min(dw - 1);
+                let sy = y.min(dh - 1);
+                let src = (sy * dw + sx) * 4;
+                let dst = (y * cw + x) * 4;
+                padded_rgba[dst..dst + 4].copy_from_slice(&source_rgba[src..src + 4]);
+            }
+        }
+
+        let source = OwnedImage::new(
+            &device,
+            ImageSpec::new(
+                vk::Format::R8G8B8A8_UNORM,
+                display,
+                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+                "CSC 补齐测试源图",
+            ),
+        )
+        .expect("测试源图创建不应失败");
+        let mut staging = device
+            .host_buffer(
+                (dw * dh * 4) as u64,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                "CSC 补齐测试暂存",
+            )
+            .expect("测试暂存缓冲创建不应失败");
+        staging.write(&source_rgba).expect("测试暂存写入不应失败");
+        let (source_image, source_view) = (source.image(), source.view());
+        let upload_to_dst = image_barrier(
+            source_image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            StageAccess::all_commands(),
+            StageAccess::transfer_write(),
+        );
+        let upload_to_general = image_barrier(
+            source_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::GENERAL,
+            StageAccess::transfer_write(),
+            StageAccess::compute_read(),
+        );
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_extent(vk::Extent3D {
+                width: display.width,
+                height: display.height,
+                depth: 1,
+            });
+        let raw = device.device();
+        // SAFETY: 屏障与拷贝仅引用本测试创建的源图与暂存缓冲；命令缓冲的生命周期
+        // 由 `run_oneshot` 全权管理，提交与等待都在它内部完成
+        if let Err(e) = run_oneshot(&device, None, move |cmd| unsafe {
+            record_image_barriers(raw, cmd, &[upload_to_dst]);
+            raw.cmd_copy_buffer_to_image(
+                cmd,
+                staging.buffer(),
+                source_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+            record_image_barriers(raw, cmd, &[upload_to_general]);
+        }) {
+            println!("测试源图上传失败: {e}");
+            return;
+        }
+
+        // 环境不支持在上面的准入判断里已跳过；走到这里后的失败都是代码问题，必须响亮
+        let layout = converter
+            .convert_from_view(
+                source_image,
+                source_view,
+                vk::ImageLayout::GENERAL,
+                display,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("补齐转换失败: {e}"));
+        assert_eq!(layout, vk::ImageLayout::GENERAL);
+
+        let (y_img, uv_img) = converter.plane_images();
+        let wait = converter.pending_semaphore();
+        nv12_image
+            .upload_from_planes_blocking(y_img, uv_img, wait)
+            .unwrap_or_else(|e| panic!("平面拷贝失败: {e}"));
+        converter.finish();
+        let gpu = nv12_image
+            .readback_blocking()
+            .unwrap_or_else(|e| panic!("读回失败: {e}"));
+        let reference = reference_nv12(&padded_rgba, coded);
+        assert_nv12_matches(&gpu, &reference, "源小于目标的补齐路径");
     }
 
     /// 与 CPU 参考逐像素比对，容差 1（UNORM 舍入方向可能不同）

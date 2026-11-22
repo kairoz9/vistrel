@@ -332,8 +332,14 @@ impl VideoEncodeBackend for NvencBackend {
 
         // 几何核验先于任何状态变更：不符批次整批拒绝时既有槽位表原样保留，
         // 与 import_all 的全成全败同层
+        //
+        // NVENC 无设备粒度对齐，编码尺寸即采集尺寸：只收一种几何
         let profile = self.session.profile();
-        ensure_batch_geometry(descriptors, profile.width() as u32, profile.height() as u32)?;
+        ensure_batch_geometry(
+            descriptors,
+            (profile.width() as u32, profile.height() as u32),
+            None,
+        )?;
 
         // 阶段零：整表清空——注册句柄先归还再释放 CUarray，否则驱动会拿着已销毁的
         // 显存去注销。只清槽位：系统内存输入缓冲不经注册表，不受影响。

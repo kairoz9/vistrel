@@ -15,10 +15,16 @@ layout(binding = 1, r8) uniform writeonly image2D out_y;
 // 绑定 2：输出 NV12 平面 1 (UV 平面, 8-bit 双通道, 半分辨率 W/2 x H/2)
 layout(binding = 2, rg8) uniform writeonly image2D out_uv;
 
-// 推送常量：图像分辨率边界
+// 推送常量：目标（编码尺寸）与源（可见区）分辨率
+//
+// 源可以比目标小：目标右侧与底部的补齐边复制源的最后一列 / 最后一行，与主机帧
+// 补齐（`FrameBuf::write_padded`）同一语义。显存直通的槽位按采集尺寸建，
+// 编码尺寸由这里补出来。
 layout(push_constant) uniform PushConstants {
     uint width;
     uint height;
+    uint src_width;
+    uint src_height;
 } pc;
 
 // BT.709 Limited Range 色彩空间转换常量 (ITU-R BT.709)
@@ -40,9 +46,10 @@ void main() {
         return;
     }
 
-    // 读取 4 个相邻像素并做边界保护。源图是 Vulkan 渲染附件，顶行在前——按原序采样
-    ivec2 max_coord = ivec2(pc.width - 1, pc.height - 1);
-    vec3 c00 = texelFetch(u_rgba, base_coord + ivec2(0, 0), 0).rgb;
+    // 读取 4 个相邻像素并做边界保护。源图是 Vulkan 渲染附件，顶行在前——按原序采样。
+    // 夹到**源**尺寸而非目标尺寸：源以外的坐标取最后一列/行，即边缘复制式补齐
+    ivec2 max_coord = ivec2(min(pc.width, pc.src_width) - 1, min(pc.height, pc.src_height) - 1);
+    vec3 c00 = texelFetch(u_rgba, min(base_coord + ivec2(0, 0), max_coord), 0).rgb;
     vec3 c10 = texelFetch(u_rgba, min(base_coord + ivec2(1, 0), max_coord), 0).rgb;
     vec3 c01 = texelFetch(u_rgba, min(base_coord + ivec2(0, 1), max_coord), 0).rgb;
     vec3 c11 = texelFetch(u_rgba, min(base_coord + ivec2(1, 1), max_coord), 0).rgb;

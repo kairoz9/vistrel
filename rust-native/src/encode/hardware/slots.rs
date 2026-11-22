@@ -118,25 +118,35 @@ impl Drop for VramSlotDescriptor {
     }
 }
 
-/// 显存槽位导入的公共不变量：整批纹理几何必须与编码器输入尺寸一致
+/// 显存槽位导入的公共不变量：整批纹理几何必须是编码尺寸或采集尺寸
 ///
-/// 各后端在导入期以自己的参照尺寸调用本函数，并在任何状态变更之前整批拒绝
-/// 不符批次，让尺寸不符在注册期即以逐槽可诊断的错误拦下，而不是等到逐帧
-/// 编码时才失败。参照尺寸由后端自供——NVENC 为会话显示尺寸（无设备粒度
-/// 对齐），Vulkan 为 coded extent（纵向可能按对齐填充，如 1080 建成 1088）。
+/// 任何状态变更之前整批拒绝，让尺寸不符在注册期就以逐槽可诊断的错误拦下，而不是
+/// 等到逐帧编码时才失败。
+///
+/// `display` 为 `None` 表示本后端无对齐（NVENC / 软编），只收编码尺寸。有对齐时也收
+/// 采集尺寸：槽位由游戏侧按采集尺寸建，1080 → 1088 的补齐由 CSC 着色器夹取完成。
 pub(crate) fn ensure_batch_geometry(
     descriptors: &[VramSlotDescriptor],
-    expected_width: u32,
-    expected_height: u32,
+    coded: (u32, u32),
+    display: Option<(u32, u32)>,
 ) -> Result<(), String> {
-    if let Some(desc) = descriptors
-        .iter()
-        .find(|d| d.width != expected_width || d.height != expected_height)
-    {
+    if let Some(desc) = descriptors.iter().find(|d| {
+        let geometry = (d.width, d.height);
+        geometry != coded && Some(geometry) != display
+    }) {
+        let expected = match display {
+            Some((display_w, display_h)) => format!(
+                "不是编码尺寸 {}x{} 也不是采集尺寸 {display_w}x{display_h}：显存直通不接受其他几何",
+                coded.0, coded.1
+            ),
+            None => format!(
+                "与编码尺寸 {}x{} 不一致：该后端无对齐，只接受编码尺寸",
+                coded.0, coded.1
+            ),
+        };
         return Err(format!(
-            "槽位 {} 尺寸 {}x{} 与编码器输入尺寸 {}x{} 不一致：\
-             显存直通要求生产侧按编码器输入尺寸建纹理",
-            desc.slot_idx, desc.width, desc.height, expected_width, expected_height
+            "槽位 {} 尺寸 {}x{}{expected}",
+            desc.slot_idx, desc.width, desc.height
         ));
     }
     Ok(())
@@ -405,15 +415,26 @@ mod tests {
     /// 空批放行（空批由调用方的空检查拒绝，不归本函数管）
     #[test]
     fn test_ensure_batch_geometry() {
-        assert!(ensure_batch_geometry(&[], 1920, 1080).is_ok());
+        let coded = (1920u32, 1088u32);
+        let display = (1920u32, 1080u32);
+        assert!(ensure_batch_geometry(&[], coded, Some(display)).is_ok());
 
-        let ok = vec![geo_desc(0, 1920, 1080), geo_desc(1, 1920, 1080)];
-        assert!(ensure_batch_geometry(&ok, 1920, 1080).is_ok());
+        // 两种都收：编码尺寸（生产侧知道对齐结果）与采集尺寸（由 CSC 夹取补齐）
+        let coded_batch = vec![geo_desc(0, 1920, 1088), geo_desc(1, 1920, 1088)];
+        assert!(ensure_batch_geometry(&coded_batch, coded, Some(display)).is_ok());
+        let display_batch = vec![geo_desc(0, 1920, 1080), geo_desc(1, 1920, 1080)];
+        assert!(ensure_batch_geometry(&display_batch, coded, Some(display)).is_ok());
+
+        // 无对齐的后端（NVENC / 软编）：采集尺寸不再合法
+        let err = ensure_batch_geometry(&display_batch, coded, None).unwrap_err();
+        assert!(err.contains("1920x1080"), "错误必须报出不符槽位尺寸: {err}");
+        assert!(err.contains("1920x1088"), "错误必须报出期望尺寸: {err}");
+        assert!(!err.contains("采集尺寸"), "无对齐时不得提及采集尺寸");
 
         let bad = vec![geo_desc(0, 1920, 1080), geo_desc(2, 1280, 720)];
-        let err = ensure_batch_geometry(&bad, 1920, 1080).unwrap_err();
+        let err = ensure_batch_geometry(&bad, coded, Some(display)).unwrap_err();
         assert!(err.contains("槽位 2"), "错误必须指认首个不符槽位: {err}");
-        assert!(err.contains("1280x720") && err.contains("1920x1080"));
+        assert!(err.contains("1280x720") && err.contains("1920x1088"));
     }
 
     #[test]

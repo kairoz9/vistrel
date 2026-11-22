@@ -579,14 +579,10 @@ impl FrameEncoder {
         let parts = Av1FrameParts::new(CONSTANT_Q_INDEX);
         // `setup_idx` / `ref_idx` 同时充当 VBI 槽号：两套编号一致，见 `build`。
         //
-        // render_size 传**编码尺寸**，不用显示尺寸。AV1 没有 cropping 语法，`render_size`
-        // 是唯一的显示尺寸表达方式，但它只影响显示，而硬件解码器对「render 小于 frame」
-        // 的支持没有保证（部分实现会忽略，部分会走一条未充分测试的路径）。1080p 下差
-        // 8 行 = 0.7%，客户端本来就 `object-fit: contain`，不值得为此换一条没人验证过的
-        // 解码路径。要恢复「码流声明 1080」时再传 `session.display_extent()`。
         // render_size 传**显示尺寸**：AV1 没有 cropping 语法，这是它唯一能表达「显示区域」
-        // 的字段；来源侧仍按编码尺寸编码（补齐全在主机帧上传时做）。H.264 / HEVC 在同一
-        // 后端用裁剪窗口达到同样效果，见 `h264.rs` / `hevc.rs`。
+        // 的字段；画面本身按编码尺寸编码（补齐边在采集侧就已就位）。1080p 下差 8 行 =
+        // 0.7%，且硬件解码器对「render 小于 frame」的支持并无保证，所以只作声明、不改
+        // 编码几何。H.264 / HEVC 用裁剪窗口达到同样效果，见 `h264.rs` / `hevc.rs`。
         let frame = build(
             &parts,
             is_key,

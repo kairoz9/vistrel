@@ -203,7 +203,8 @@ pub struct FrameEncoder {
     timeline_value: u64,
     /// 等待超时的永久毒化标记（毒化后的行为约束与拆构风险见 `execute` 模块文档）
     poisoned: bool,
-    /// 显示尺寸（=协商档位）；主机帧按它交付，与编码尺寸的差由补齐行 + 码流裁剪窗口吸收
+    /// 显示尺寸（=协商档位）：只用于 AV1 的 `render_size` 声明显示区域；
+    /// 主机帧本身按编码尺寸交付
     display: vk::Extent2D,
     #[cfg(test)]
     last_timings: FrameProfileTimings,
@@ -681,7 +682,7 @@ impl FrameEncoder {
     ) -> Result<(Vec<u8>, bool), String> {
         #[cfg(test)]
         let t_stage = std::time::Instant::now();
-        self.image.stage(nv12, self.display)?;
+        self.image.stage(nv12)?;
         #[cfg(test)]
         {
             self.last_timings.stage_ns = t_stage.elapsed().as_nanos() as u64;
@@ -731,11 +732,27 @@ impl FrameEncoder {
     ) -> Result<(Vec<u8>, bool), String> {
         // 槽位几何必须与编码尺寸一致：分派范围按编码尺寸算，尺寸不符会越界读显存
         let extent = self.image.extent();
-        if slot.width != extent.width || slot.height != extent.height {
+        // 槽位可以是采集尺寸（CSC 按源尺寸夹取，把补齐边复制出来），也可以是编码尺寸；
+        // 其余尺寸一律拒绝——着色器只保证「源不大于目标」时的补齐语义
+        let slot_extent = vk::Extent2D {
+            width: slot.width,
+            height: slot.height,
+        };
+        let display = vk::Extent2D {
+            width: self.display.width,
+            height: self.display.height,
+        };
+        if slot_extent != extent && slot_extent != display {
             return Err(format!(
-                "槽位 {} 尺寸 {}x{} 与编码尺寸 {}x{} 不一致：显存直通要求生产侧按 coded 尺寸\
-                 建纹理（1080 会对齐到 1088）",
-                slot.slot_idx, slot.width, slot.height, extent.width, extent.height
+                "槽位 {} 尺寸 {}x{} 既不是编码尺寸 {}x{} 也不是采集尺寸 {}x{}：\
+                 显存直通只接受这两者",
+                slot.slot_idx,
+                slot.width,
+                slot.height,
+                extent.width,
+                extent.height,
+                display.width,
+                display.height
             ));
         }
         let csc = match self.csc.as_mut() {
@@ -746,7 +763,8 @@ impl FrameEncoder {
         };
         // 生产侧写完这一帧之前，CSC 不能读源图。等待交给计算队列，主机不在这里阻塞
         let wait = slot.frame_wait(sync_value);
-        let new_layout = csc.convert_from_view(slot.image(), slot.view(), slot.layout(), wait)?;
+        let new_layout =
+            csc.convert_from_view(slot.image(), slot.view(), slot.layout(), slot_extent, wait)?;
         let (y, uv) = csc.plane_images();
         slot.set_layout(new_layout);
         self.pending_upload = Some(PendingUpload::Planes { y, uv });
