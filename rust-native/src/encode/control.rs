@@ -48,6 +48,9 @@ pub(crate) enum ControlStatus {
     QueueFull = 7,
     /// 注销槽位前排空失败：编码器可能仍在导入的资源上等待，引用与槽位表均未释放
     ReleaseFailed = 8,
+    /// 硬编建成失败：探测认证过的候选后端全部建不起来。与 `NoHardwareEncoder`
+    /// 的区别是后者表示「本机探测不到硬编」，本码表示「探测说有，实际建不出来」
+    EncoderBuildFailed = 9,
 }
 
 /// 控制命令

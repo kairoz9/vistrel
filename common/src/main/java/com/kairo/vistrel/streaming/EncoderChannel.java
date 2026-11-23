@@ -70,6 +70,7 @@ public interface EncoderChannel {
     int CONTROL_RECONFIGURE_FAILED = 6;
     int CONTROL_QUEUE_FULL = 7;
     int CONTROL_RELEASE_FAILED = 8;
+    int CONTROL_ENCODER_BUILD_FAILED = 9;
 
     /**
      * 控制结果码转可读原因
@@ -85,6 +86,7 @@ public interface EncoderChannel {
             case CONTROL_RECONFIGURE_FAILED -> "档位重配被编码线程拒绝 (编码器重配失败，档位保持不变)";
             case CONTROL_QUEUE_FULL -> "控制队列已满 (编码线程已卡住不消费)";
             case CONTROL_RELEASE_FAILED -> "注销前排空失败 (导入引用与槽位表已保留)";
+            case CONTROL_ENCODER_BUILD_FAILED -> "编码器建成失败 (候选后端全部创建失败，详见日志)";
             default -> "未知错误码 " + code;
         };
     }

@@ -21,14 +21,15 @@ public class ControlCodeTableTest {
         Assertions.assertEquals(6, EncoderChannel.CONTROL_RECONFIGURE_FAILED);
         Assertions.assertEquals(7, EncoderChannel.CONTROL_QUEUE_FULL);
         Assertions.assertEquals(8, EncoderChannel.CONTROL_RELEASE_FAILED);
+        Assertions.assertEquals(9, EncoderChannel.CONTROL_ENCODER_BUILD_FAILED);
     }
 
     /**
-     * 0..8 每个码都要有人话，不能落进 default 的「未知错误码」
+     * 0..9 每个码都要有人话，不能落进 default 的「未知错误码」
      */
     @Test
     void testEveryKnownCodeHasAReason() {
-        for (int code = 0; code <= 8; code++) {
+        for (int code = 0; code <= 9; code++) {
             Assertions.assertFalse(
                     EncoderChannel.describeControlResult(code).startsWith("未知错误码"),
                     "码 " + code + " 缺少可读原因"

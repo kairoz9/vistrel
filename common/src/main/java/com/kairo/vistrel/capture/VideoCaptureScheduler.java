@@ -193,9 +193,11 @@ public class VideoCaptureScheduler {
                 }
             } catch (EncoderChannel.ControlException t) {
                 this.vramPipeline = null;
-                if (t.code == EncoderChannel.CONTROL_NO_HARDWARE_ENCODER) {
+                if (t.code == EncoderChannel.CONTROL_NO_HARDWARE_ENCODER
+                        || t.code == EncoderChannel.CONTROL_ENCODER_BUILD_FAILED) {
                     // 编码器不在了：降级采集救不了没有编码器的流，唯一恢复路径
-                    // 是整引擎自愈重启（重新探测硬件并重新协商）
+                    // 是整引擎自愈重启（重新探测硬件并重新协商）。
+                    // 建成失败（探测说有、实际建不出来）与探测不到硬编同属「无编码器可用」
                     Constants.LOG.error("显存直通构建失败：{}，触发编码停滞自愈", t.getMessage());
                     this.encoderStallListener.run();
                 } else {

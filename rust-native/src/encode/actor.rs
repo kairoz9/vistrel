@@ -94,29 +94,19 @@ impl EncoderActor {
         slot_state: &'static SlotStateBlock,
         hardware_builder: Arc<HardwareBuilder>,
     ) -> Self {
-        // 占位档位与它的派生输入保持一致（Default = 下限画质 H264），
-        // 首个定档命令落地前它是软编打底的生效事实
-        let profile = StreamingProfile::default();
-        // 软编随时就绪，作为系统默认底座（同时由它带上第一批堆块）
-        let (encoder, blocks) = match VideoEncoder::new_software(profile, VideoCodec::H264) {
-            Ok((encoder, blocks)) => (Some(encoder), blocks),
-            Err(_) => (None, Vec::new()),
-        };
-        let actor = Self {
+        Self {
             inbox,
             pending_keyframe: true,
-            encoder,
+            encoder: None,
             output,
             bitrate: 0,
-            profile,
+            profile: StreamingProfile::default(),
             codec: VideoCodec::H264,
             pool,
             slot_state,
             hardware_builder,
             rejecting_frames: false,
-        };
-        actor.attach(blocks);
-        actor
+        }
     }
 
     /// 把后端新分配的块装进池
@@ -190,6 +180,8 @@ impl EncoderActor {
         match cmd {
             ControlCommand::Shutdown => {
                 self.slot_state.set_stage(ActorStage::Shutdown);
+                // 编码器随 Actor 一起析构：先摘掉引用，避免后续路径误用已排空的编码器
+                self.encoder = None;
                 return false;
             }
             ControlCommand::BitrateChange(bitrate) => {
@@ -370,76 +362,89 @@ impl EncoderActor {
     }
 
     /// 协商落账：按定档请求与协商定死的 codec 配好编码器。档位派生在此发生，
-    /// 目标后端未变时只重配不重建；`Ok` 携带实际生效的档位、codec 与后端身份
-    /// （建败回退软编时如实上报）
+    /// 同一后端在位时只重配不重建；`Ok` 携带实际生效的档位、codec 与后端身份
     fn prepare_encoder(
         &mut self,
         request: TierRequest,
         codec: VideoCodec,
         preferred_backend: Option<EncodeBackendKind>,
     ) -> Result<(StreamingProfile, VideoCodec, EncodeBackendKind), ControlStatus> {
-        let target = preferred_backend.unwrap_or_else(Self::auto_backend);
-        // 目标即软编时请求先顶格（几何钳 + codec 钳 H264）：重配与重建两条路吃同一份钳制
-        let mut request = request;
-        let mut codec = codec;
-        if target == EncodeBackendKind::Software {
-            request = Self::software_ceiling_request(request);
-            codec = VideoCodec::H264;
-        }
-        let profile = request.derive(codec);
-        let same_backend = self
-            .encoder
-            .as_ref()
-            .is_some_and(|e| e.backend_kind() == target);
+        let candidates = Self::candidate_backends(preferred_backend);
 
-        let mut reconfigured = false;
-        let mut fresh_blocks = Vec::new();
-        if same_backend && let Some(encoder) = self.encoder.as_mut() {
+        // 在位后端仍是首选候选时只重配不重建（省一次设备上下文构建）
+        let preferred = candidates[0];
+        // 目标即软编时请求先顶格（几何钳 + codec 钳 H264）：重配与重建两条路吃同一份钳制
+        let (request, codec) = Self::clamp_for(preferred, request, codec);
+        let profile = request.derive(codec);
+        if self.current_backend() == Some(preferred)
+            && let Some(encoder) = self.encoder.as_mut()
+        {
             match encoder.reconfigure(profile, codec) {
-                Ok(blocks) => {
-                    reconfigured = true;
-                    fresh_blocks = blocks;
+                Ok(fresh_blocks) => {
+                    self.attach(fresh_blocks);
+                    self.profile = profile;
+                    self.codec = codec;
+                    return Ok(self.finish_prepare());
                 }
-                Err(e) => {
-                    log::warn!("编码器重配被拒，按新档位重建: {}", e);
-                }
+                Err(e) => log::warn!("编码器重配被拒，按候选列表重建: {}", e),
             }
         }
-        // 重配可能换了内存域（如 Vulkan 换了设备），此时后端交回新批
-        self.attach(fresh_blocks);
 
-        let mut code = if reconfigured {
-            self.profile = profile;
-            self.codec = codec;
-            ControlStatus::Ok
-        } else {
-            self.rebuild_encoder(request, codec, target)
-        };
-        // 协商期兜底：目标硬编建不起来时按软编目标重建（顶格 + H264）——auto 路径必须
-        // 有底座；指定后端被替换由协商层按回执拒绝。
-        if code != ControlStatus::Ok && target != EncodeBackendKind::Software {
-            code = self.rebuild_encoder(request, codec, EncodeBackendKind::Software);
+        // 候选依次尝试：探测清单本来就是「这台机器认证可用」的集合，跳过其中可用项
+        // 直接报错等于浪费探测结果；全部失败才是真正的建成失败
+        let mut last_error = ControlStatus::EncoderBuildFailed;
+        for candidate in candidates {
+            let (candidate_request, candidate_codec) = Self::clamp_for(candidate, request, codec);
+            let code = self.rebuild_encoder(candidate_request, candidate_codec, candidate);
+            if code == ControlStatus::Ok {
+                return Ok(self.finish_prepare());
+            }
+            // 软编是最后一个候选，它也会失败只可能是 OpenH264 库缺失
+            last_error = code;
         }
-        if code != ControlStatus::Ok {
-            return Err(code);
-        }
+        log::error!("协商落账失败：候选后端全部创建失败（{last_error:?}）");
+        Err(last_error)
+    }
 
+    /// 建成后收尾：码率复位并读取实际生效的身份
+    ///
+    /// `Ok` 却无编码器意味着不变量已破坏，按拒绝收口而不是编造一个后端。
+    fn finish_prepare(&mut self) -> (StreamingProfile, VideoCodec, EncodeBackendKind) {
         // 码率复位到**生效档位**的上限
         self.bitrate = self.profile.bitrate();
         Self::apply_bitrate(&mut self.encoder, self.bitrate);
-        // Ok 即编码器已就绪，档位、codec 与后端身份如实读取；None 意味着
-        // 「Ok 却无编码器」的不变量已破坏，按拒绝收口而不是编造一个后端
         let backend = self
             .current_backend()
-            .ok_or(ControlStatus::ReconfigureFailed)?;
-        Ok((self.profile, self.codec, backend))
+            .expect("rebuild/reconfigure 成功即必须有编码器在位");
+        (self.profile, self.codec, backend)
     }
 
-    /// 无显式偏好时的后端目标：能力快照的默认胜者；快照缺席（未探测/无硬件）即软编
-    fn auto_backend() -> EncodeBackendKind {
-        crate::encode::hardware_caps()
-            .map(|p| p.backend_type)
-            .unwrap_or(EncodeBackendKind::Software)
+    /// 本次协商的后端候选序列（按尝试次序）
+    ///
+    /// 自动偏好按探测清单原序（厂商优先级）逐个尝试，软编恒收尾——软编永远是可行的
+    /// 兜底目标，因为它不需要驱动背书。
+    fn candidate_backends(preferred: Option<EncodeBackendKind>) -> Vec<EncodeBackendKind> {
+        if let Some(kind) = preferred {
+            return vec![kind];
+        }
+        let mut candidates: Vec<_> = crate::encode::hardware_backends()
+            .map(|list| list.iter().map(|p| p.backend_type).collect())
+            .unwrap_or_default();
+        candidates.push(EncodeBackendKind::Software);
+        candidates
+    }
+
+    /// 按目标后端钳制定档请求：软编只出 H.264 且几何顶格，硬编原样透传
+    fn clamp_for(
+        target: EncodeBackendKind,
+        request: TierRequest,
+        codec: VideoCodec,
+    ) -> (TierRequest, VideoCodec) {
+        if target == EncodeBackendKind::Software {
+            (Self::software_ceiling_request(request), VideoCodec::H264)
+        } else {
+            (request, codec)
+        }
     }
 
     /// 当前编码器后端身份；编码器尚未就绪时为 `None`（回执层如实呈现为「未定」）
@@ -491,8 +496,10 @@ impl EncoderActor {
         };
 
         if !built {
+            // 建成失败与「重配被拒」是两回事：后者档位没变、编码器仍在，前者意味着
+            // 此刻没有可用的编码器。分开上报才能让调用方区分「继续用旧档」与「真正故障」
             log::error!("编码器建立失败，档位维持 {:?}", self.profile);
-            return ControlStatus::ReconfigureFailed;
+            return ControlStatus::EncoderBuildFailed;
         }
 
         self.profile = profile;
@@ -870,10 +877,9 @@ mod tests {
         assert_eq!(pool.stale_len(), 0, "换域时旧设备块必须已释放");
     }
 
-    /// Ok 必须携带实际生效的档位、codec 与后端身份：偏好硬编但构建失败静默回退软编时，
-    /// 回执身份是软编而非偏好值——调用方无需再问「是不是硬编」
+    /// **软编只能是目标，不能是回退**：指定硬编建不起来时必须显式失败，绝不静默换成软编
     #[test]
-    fn test_prepare_reports_fallback_backend_identity() {
+    fn test_prepare_fails_instead_of_falling_back_to_software() {
         crate::encode::software::init_api_for_tests();
 
         let bell = Arc::new(Notify::new());
@@ -886,6 +892,7 @@ mod tests {
         );
         let request = tier(1280, 720, 60);
 
+        // 指定硬编建败：显式失败，不落软编
         assert_eq!(
             prepare_kind(
                 &mut actor,
@@ -893,56 +900,65 @@ mod tests {
                 VideoCodec::H264,
                 Some(EncodeBackendKind::Nvenc)
             ),
-            Ok((
-                request.derive(VideoCodec::H264),
-                VideoCodec::H264,
-                EncodeBackendKind::Software
-            )),
-            "偏好硬编失败回退软编后，Ok 的身份必须是软编"
+            Err(ControlStatus::EncoderBuildFailed),
+            "指定硬编建不起来时必须显式失败"
+        );
+        assert!(
+            actor.encoder.is_none(),
+            "失败路径不得残留任何编码器（尤其是静默换上的软编）"
         );
 
-        // 换档回执只回档位：codec 是协商定死的会话常量，不随档位回执走
-        let outcome = switch_profile(&mut actor, request);
+        // 显式指定软编仍能建成：软编作为**目标**永远合法
         assert_eq!(
-            outcome,
-            Ok(request.derive(VideoCodec::H264)),
-            "换档回执必须是实际生效的档位"
+            prepare(
+                &mut actor,
+                request,
+                VideoCodec::H264,
+                Some(EncodeBackendKind::Software)
+            ),
+            ControlStatus::Ok,
+            "软编作为显式目标是合法路径，不受上一条影响"
         );
+        assert_eq!(actor.current_backend(), Some(EncodeBackendKind::Software));
     }
 
-    /// 偏好的硬编构建失败回退软编时，回执档位必须钳进软编能力：codec 落 H264、
-    /// 几何顶格——应答值与实际码流从此不再分叉
+    /// 自动路径按探测清单依次尝试：首选建败即换下一个候选，不因单点失败就放弃
+    ///
+    /// 探测清单本来就是「本机认证可用」的集合，跳过其中可用项直接报错等于浪费探测结果。
     #[test]
-    fn test_prepare_fallback_clamps_profile_to_software_ceiling() {
+    fn test_prepare_auto_tries_next_candidate_after_build_failure() {
         crate::encode::software::init_api_for_tests();
 
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
         let output = test_outbox();
+        // 硬编一律建败，软编（走 install_software，不经该工厂）能成
         let (mut actor, _pool) = test_actor_with_builder(
             inbox,
             Arc::clone(&output),
             Arc::new(|_profile, _codec, _kind, _slot_state| Err("硬编构建失败".to_string())),
         );
-        let request = tier(2560, 1440, 120);
+        let request = tier(1280, 720, 60);
 
-        let (effective, codec, backend) = prepare_kind(
-            &mut actor,
-            request,
-            VideoCodec::H265,
-            Some(EncodeBackendKind::Nvenc),
-        )
-        .expect("回退软编仍须成功");
-        assert_eq!(backend, EncodeBackendKind::Software);
+        // 无显式偏好 = 自动：硬编候选全败后落到软编（清单的最后一个候选）
+        let (effective, codec, backend) = prepare_kind(&mut actor, request, VideoCodec::H264, None)
+            .expect("自动路径必须走完候选列表");
+        assert_eq!(
+            backend,
+            EncodeBackendKind::Software,
+            "硬编候选全败后，自动路径落到软编候选"
+        );
+        // 软编候选会把请求钳进自己的能力域：几何顶格 + codec 落 H264
+        let (w, h, f) = crate::encode::clamp_to_software_ceiling(1280, 720, 60);
+        assert_eq!(
+            (effective.width(), effective.height(), effective.fps()),
+            (w, h, f),
+            "软编候选必须带上顶格钳制后的几何"
+        );
         assert_eq!(
             codec,
             VideoCodec::H264,
-            "软编只出 H264 码流，回执 codec 必须钳制"
-        );
-        let (w, h, f) = crate::encode::clamp_to_software_ceiling(2560, 1440, 120);
-        assert_eq!(
-            (effective.width(), effective.height(), effective.fps()),
-            (w, h, f)
+            "软编只出 H264，回执 codec 必须钳制"
         );
     }
 
@@ -1225,15 +1241,18 @@ mod tests {
             })
             .unwrap();
 
-        // 0. 调整 Profile 为 720p (1280x720)
+        // 0. 协商落账建编码器（Actor 构造后没有编码器，必须先建再推帧）：
+        //    720p 软编打底，同时装好帧池的堆块
         let request = tier(1280, 720, 60);
         let profile = request.derive(VideoCodec::H264);
         let frame_bytes = host_bytes(&profile);
         let (ack0_tx, ack0_rx) = tokio::sync::oneshot::channel();
         assert!(
             ctl_tx
-                .blocking_send(ControlCommand::Retier {
+                .blocking_send(ControlCommand::PrepareEncoder {
                     request,
+                    codec: VideoCodec::H264,
+                    preferred_backend: Some(EncodeBackendKind::Software),
                     reply: ack0_tx,
                 })
                 .is_ok(),
@@ -1241,8 +1260,8 @@ mod tests {
         );
         assert_eq!(
             wait_reply(ack0_rx),
-            Ok(profile),
-            "应答必须是 Actor 实际生效的档位"
+            Ok((profile, VideoCodec::H264, EncodeBackendKind::Software)),
+            "协商落账必须返回实际生效的档位、codec 与后端身份"
         );
 
         // 1. 推送一帧（push 内部已唤醒）
