@@ -3,5 +3,7 @@ node_modules
 pnpm-lock.yaml
 pnpm-workspace.yaml
 public/icons
+# 第三方声明由 cargo-about 生成，不做结构重排
+public/THIRD-PARTY-NOTICES.html
 # HTML 为手写模板：内含中文段落与 inline 标记，prettier 的结构重排会切碎句子
 index.html
