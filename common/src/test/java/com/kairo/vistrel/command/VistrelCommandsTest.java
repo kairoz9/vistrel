@@ -2,6 +2,7 @@ package com.kairo.vistrel.command;
 
 import com.kairo.vistrel.config.VistrelConfig;
 import com.kairo.vistrel.VistrelService;
+import com.kairo.vistrel.streaming.EncoderCaps;
 import com.kairo.vistrel.streaming.FakeSessionServer;
 import com.kairo.vistrel.util.Addresses;
 import net.minecraft.network.chat.Style;
@@ -13,6 +14,7 @@ import org.junit.jupiter.api.Test;
 import net.minecraft.server.Bootstrap;
 import org.junit.jupiter.api.BeforeAll;*/
 //? }
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -172,6 +174,78 @@ class VistrelCommandsTest {
             Assertions.assertFalse(stopped.contains("http://"), stopped);
             // 未启动时没有编码能力可报，不该出现编码行
             Assertions.assertFalse(stopped.contains("编码"), stopped);
+        }
+    }
+
+    /**
+     * 编码信息行报告的是**会话实际建成**的后端：本机能力清单说 nvenc，
+     * 但协商落到软编时状态行必须报告软编
+     */
+    @Test
+    void testStatusReportsBuiltBackendNotProbeWinner() {
+        VistrelService.stop();
+        FakeSessionServer.FakeEncoderChannel channel = new FakeSessionServer.FakeEncoderChannel();
+        // 能力判定仍认为本机可硬编（显存直通门控据此放行）
+        channel.vramDirectSupported = true;
+        FakeSessionServer server = new FakeSessionServer();
+        VistrelService.start(() -> new VistrelConfig(30808, "old123", 128, false, true), server, channel, channel);
+        try {
+            server.simulateClientConnected(1280, 720, 60, "software");
+            String status = VistrelCommands.statusMessage().getString();
+            Assertions.assertTrue(status.contains("软件编码"), status);
+            Assertions.assertFalse(status.contains("NVENC"), "会话落到软编时不得报告硬编: " + status);
+            Assertions.assertFalse(status.contains("使用显卡"), "软编不产出显卡行: " + status);
+        } finally {
+            VistrelService.stop();
+        }
+    }
+
+    /**
+     * 无活跃会话时不报告任何编码后端：没有「当前后端」就显示无，
+     * 回落到本机能力会把「没在推流」显示成「用 NVENC 在推流」
+     */
+    @Test
+    void testStatusShowsNoBackendWithoutSession() {
+        VistrelService.stop();
+        FakeSessionServer.FakeEncoderChannel channel = new FakeSessionServer.FakeEncoderChannel();
+        channel.vramDirectSupported = true;
+        VistrelService.start(
+                () -> new VistrelConfig(30808, "old123", 128, false, true),
+                new FakeSessionServer(),
+                channel,
+                channel
+        );
+        try {
+            String status = VistrelCommands.statusMessage().getString();
+            Assertions.assertTrue(status.contains("无活跃会话"), status);
+            Assertions.assertFalse(status.contains("NVENC"), "无会话时不得报告任何后端: " + status);
+            Assertions.assertFalse(status.contains("软件编码"), "无会话时不得报告任何后端: " + status);
+        } finally {
+            VistrelService.stop();
+        }
+    }
+
+    /**
+     * 硬编时携带探测到的显卡名：codec 段按能力条目渲染，显卡段单独成行
+     */
+    @Test
+    void testStatusRendersBuiltHardwareBackendWithGpuName() {
+        VistrelService.stop();
+        FakeSessionServer.FakeEncoderChannel channel = new FakeSessionServer.FakeEncoderChannel();
+        channel.capsOverride = new EncoderCaps(
+                EncoderCaps.State.CAPABILITIES,
+                List.of(new EncoderCaps.Backend("vulkan_video", List.of("H264", "H265"), "AMD Radeon RX 7900 XTX"))
+        );
+        FakeSessionServer server = new FakeSessionServer();
+        VistrelService.start(() -> new VistrelConfig(30808, "old123", 128, false, true), server, channel, channel);
+        try {
+            server.simulateClientConnected(1280, 720, 60, "vulkan_video");
+            String status = VistrelCommands.statusMessage().getString();
+            Assertions.assertTrue(status.contains("Vulkan Video"), status);
+            Assertions.assertTrue(status.contains("H.264") && status.contains("H.265"), status);
+            Assertions.assertTrue(status.contains("AMD Radeon RX 7900 XTX"), status);
+        } finally {
+            VistrelService.stop();
         }
     }
 
