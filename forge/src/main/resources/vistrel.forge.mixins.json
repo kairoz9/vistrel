@@ -1,7 +1,7 @@
 {
   "required": true,
   "minVersion": "0.8",
-  "package": "com.kairo.vistrel.mixin",
+  "package": "kairo.vistrel.mixin",
   "compatibilityLevel": "JAVA_${java_version}",
   "mixins": [],
   "client": [

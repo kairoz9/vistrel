@@ -17,7 +17,7 @@ use jni::sys::jint;
 // 之后每次分发不再重复 GetStaticMethodID；签名错位在编译期即报错
 bind_java_type! {
     rust_type = NativeBridge,
-    java_type = com.kairo.vistrel.streaming.natives.NativeBridge,
+    java_type = kairo.vistrel.streaming.natives.NativeBridge,
     methods {
         static fn on_local_ice_candidate(candidate_json: JString) -> void,
 

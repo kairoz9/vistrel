@@ -17,7 +17,7 @@
     "environment": "client",
     "entrypoints": {
         "main": [
-            "com.kairo.vistrel.Vistrel"
+            "kairo.vistrel.Vistrel"
         ]
     },
     "mixins": [

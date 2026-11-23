@@ -29,8 +29,8 @@ use webrtc::peer_connection::RTCIceCandidateInit;
 // 这两个出口沿用默认的 `ThrowRuntimeExAndDefault` 抛异常，由 Java 按失败走熔断。
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_startEngine",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_startEngine",
     error_policy = LogErrorAndDefault,
     static fn start_engine(openh264_lib: JString, udp_bind: JString) -> void,
 };
@@ -113,8 +113,8 @@ fn start_engine<'caller>(
 }
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_stopEngine",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_stopEngine",
     error_policy = LogErrorAndDefault,
     static fn stop_engine() -> void,
 };
@@ -135,8 +135,8 @@ fn stop_engine<'caller>(
 }
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_negotiateOffer",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_negotiateOffer",
     error_policy = LogErrorAndDefault,
     static fn negotiate_offer(offer_json: JString, width: jint, height: jint, fps: jint, bpp: jfloat, codec: JString, backend: JString) -> JString,
 };
@@ -302,8 +302,8 @@ async fn handle_negotiate_offer(
 }
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_applyProfile",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_applyProfile",
     error_policy = LogErrorAndDefault,
     static fn apply_profile(
         width: jint,
@@ -384,8 +384,8 @@ async fn handle_apply_profile(
 }
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_addIceCandidate",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_addIceCandidate",
     error_policy = LogErrorAndDefault,
     static fn add_ice_candidate(candidate_json: JString) -> void,
 };
@@ -420,8 +420,8 @@ fn add_ice_candidate<'caller>(
 }
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_closeSession",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_closeSession",
     error_policy = LogErrorAndDefault,
     static fn close_session() -> void,
 };
@@ -440,8 +440,8 @@ fn close_session<'caller>(
 }
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_pollInputEvents",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_pollInputEvents",
     error_policy = LogErrorAndDefault,
     static fn poll_input_events(out_buffer: JByteBuffer, max_events: jint) -> jint,
 };
@@ -478,8 +478,8 @@ fn poll_input_events<'caller>(
 }
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_queryEncoderCaps",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_queryEncoderCaps",
     error_policy = LogErrorAndDefault,
     static fn query_encoder_caps() -> JString,
 };
@@ -498,8 +498,8 @@ fn query_encoder_caps<'caller>(
 }
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_importVramSlots",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_importVramSlots",
     static fn import_vram_slots(flat: jlong[]) -> jint,
 };
 
@@ -544,8 +544,8 @@ fn import_vram_slots<'caller>(
 }
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_pushVramSlot",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_pushVramSlot",
     error_policy = LogErrorAndDefault,
     static fn push_vram_slot(slot_idx: jint, sync_value: jlong) -> void,
 };
@@ -568,8 +568,8 @@ fn push_vram_slot<'caller>(
 }
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_slotStateBlock",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_slotStateBlock",
     static fn slot_state_block() -> JByteBuffer,
 };
 
@@ -597,8 +597,8 @@ fn slot_state_block<'caller>(
 }
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_clearVramSlots",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_clearVramSlots",
     static fn clear_vram_slots() -> jint,
 };
 
@@ -631,8 +631,8 @@ fn clear_vram_slots<'caller>(
 }
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_pushSystemFrame",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_pushSystemFrame",
     error_policy = LogErrorAndDefault,
     static fn push_system_frame(buffer: JByteBuffer, width: jint, height: jint) -> void,
 };
@@ -704,8 +704,8 @@ fn validate_display_extent(
 }
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_setAudioBitrate",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_setAudioBitrate",
     error_policy = LogErrorAndDefault,
     static fn set_audio_bitrate(bitrate_kbps: jint) -> void,
 };
@@ -723,8 +723,8 @@ fn set_audio_bitrate<'caller>(
 }
 
 const _: jni::NativeMethod = native_method! {
-    java_type = "com.kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_com_kairo_vistrel_streaming_natives_NativeBridge_pushAudioPcm",
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_pushAudioPcm",
     error_policy = LogErrorAndDefault,
     static fn push_audio_pcm(buffer: JByteBuffer, samples_per_channel: jint) -> void,
 };

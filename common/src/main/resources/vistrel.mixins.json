@@ -2,9 +2,9 @@
   "required": false,
   "minVersion": "0.8",
   "priority": 900,
-  "package": "com.kairo.vistrel.mixin",
+  "package": "kairo.vistrel.mixin",
   "compatibilityLevel": "JAVA_${java_version}",
-  "plugin": "com.kairo.vistrel.mixin.VistrelMixinPlugin",
+  "plugin": "kairo.vistrel.mixin.VistrelMixinPlugin",
   "mixins": [],
   "client": [
     "MixinMinecraft",
