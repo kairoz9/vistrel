@@ -52,7 +52,7 @@ export class InputController {
     /**
      * @param {object} options
      * @param {HTMLElement} options.targetElement 输入汇聚点 DOM（如 #game-surface）：指针锁定载体，且汇聚点外的输入一律丢弃
-     * @param {HTMLVideoElement} options.videoElement 远端画面元素，GUI 态透传坐标按其内容区换算
+     * @param {HTMLElement} options.viewportElement 显示视口 DOM（#videoViewport）：GUI 态透传坐标按它的矩形归一化
      * @param {() => RTCDataChannel | null} options.getDataChannel 获取活动 input DataChannel 的提供者
      * @param {(text: string) => void} options.sendTextInput 输入文本下发回调（经信令 WS）
      * @param {() => void} options.onUserInteraction 用户交互触发回调 (例如解除音频静音)
@@ -61,7 +61,7 @@ export class InputController {
      */
     constructor({
         targetElement,
-        videoElement,
+        viewportElement,
         getDataChannel,
         sendTextInput,
         onUserInteraction,
@@ -69,7 +69,7 @@ export class InputController {
         onUnlockHint,
     }) {
         this.target = targetElement;
-        this.video = videoElement;
+        this.viewport = viewportElement;
         this.getDataChannel = getDataChannel;
         this.sendTextInput = sendTextInput;
         this.onUserInteraction = onUserInteraction;
@@ -231,62 +231,17 @@ export class InputController {
     }
 
     /**
-     * 视频内容矩形：object-fit: contain 留边后实际画面区域（相对容器坐标）
-     */
-    videoContentRect() {
-        if (!this.video || !this.video.videoWidth || !this.video.videoHeight) {
-            return null;
-        }
-        const rect = this.video.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) {
-            return null;
-        }
-        const scale = Math.min(rect.width / this.video.videoWidth, rect.height / this.video.videoHeight);
-        const contentW = this.video.videoWidth * scale;
-        const contentH = this.video.videoHeight * scale;
-        return {
-            x: (rect.width - contentW) / 2,
-            y: (rect.height - contentH) / 2,
-            w: contentW,
-            h: contentH,
-        };
-    }
-
-    /**
-     * GUI 态透传：系统光标在画面内的实际位置换算为归一化坐标下发
+     * GUI 态透传：系统光标位置换算为归一化坐标下发。
      *
-     * 坐标系随 Display Fit Mode 而变（ui 层把模式写在 video 的 object-fit 上）：
-     * - contain：留边后按内容区归一化
-     * - cover：可见区是帧内居中裁切的子区域，先反解帧坐标再归一化
-     * - none：帧按原始像素尺寸居中显示，不缩放，直接按帧坐标归一化
+     * 视口矩形只承载显示区域（显示适配已落到其布局尺寸），与游戏窗口一对一映射，
+     * 三种模式共用一条公式；落在 letterbox 黑边上的坐标按边缘钳制。
      */
     sendAbsoluteMousePosition(clientX, clientY) {
-        if (!this.video || !this.video.videoWidth || !this.video.videoHeight) return;
-        const rect = this.video.getBoundingClientRect();
+        if (!this.viewport) return;
+        const rect = this.viewport.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return;
-        const fitMode = this.video.style.objectFit || "contain";
-        let normX;
-        let normY;
-        if (fitMode === "none") {
-            // 原始尺寸：1:1 居中，小于容器时四周留空，大于容器时居中裁切
-            const offsetX = (rect.width - this.video.videoWidth) / 2;
-            const offsetY = (rect.height - this.video.videoHeight) / 2;
-            normX = (clientX - rect.left - offsetX) / this.video.videoWidth;
-            normY = (clientY - rect.top - offsetY) / this.video.videoHeight;
-        } else if (fitMode === "cover") {
-            const scale = Math.max(rect.width / this.video.videoWidth, rect.height / this.video.videoHeight);
-            const visibleW = rect.width / scale;
-            const visibleH = rect.height / scale;
-            const offsetX = (this.video.videoWidth - visibleW) / 2;
-            const offsetY = (this.video.videoHeight - visibleH) / 2;
-            normX = ((clientX - rect.left) / scale + offsetX) / this.video.videoWidth;
-            normY = ((clientY - rect.top) / scale + offsetY) / this.video.videoHeight;
-        } else {
-            const content = this.videoContentRect();
-            if (!content) return;
-            normX = (clientX - rect.left - content.x) / content.w;
-            normY = (clientY - rect.top - content.y) / content.h;
-        }
+        const normX = (clientX - rect.left) / rect.width;
+        const normY = (clientY - rect.top) / rect.height;
         this.sendAbsolutePosition(clamp01(normX), clamp01(normY));
     }
 

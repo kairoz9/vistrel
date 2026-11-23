@@ -3,6 +3,7 @@ import { MetricRow, StatusDot, Modal, DiscreteSlider, Button } from "./component
 import { DraggablePanel } from "./draggable-panel.js";
 import { copyTextWithFallback, openExternalUrl } from "../utils.js";
 import { notice, pin, toast, unpin } from "./notice.js";
+import { computeViewportSize, resolveFrameGeometry } from "./video-geometry.js";
 
 const VISTREL_HUD_KEY = "vistrel_hud_pos";
 // 上次的画质档位、显示适配与编码偏好：几何与帧率归服务端内容推导，客户端只保留这些偏好
@@ -74,9 +75,13 @@ function backendLabel(backend) {
 export class UIManager {
     constructor() {
         this.video = document.getElementById("remoteVideo");
-        this.video.addEventListener("resize", () => {
-            this.setStreamExtent(this.video.videoWidth, this.video.videoHeight);
-        });
+        this.videoViewportElement = document.getElementById("videoViewport");
+        // 显示几何由 Answer 初值与推送更新给出；解码帧可能因编码对齐更大
+        this.displayWidth = 0;
+        this.displayHeight = 0;
+        this.video.addEventListener("resize", () => this.handleVideoResize());
+        // 可见区尺寸随窗口变化，显示视口的 contain/cover 布局必须跟着重算
+        window.addEventListener("resize", () => this.updateVideoGeometry());
         this.audio = document.getElementById("remoteAudio");
         this.videoContainer = document.getElementById("video-container");
         // 输入汇聚点：边内 DOM 属游戏，边外一律视为页面 UI
@@ -399,7 +404,7 @@ export class UIManager {
     }
 
     /**
-     * HUD 画质徽标：实际到达的流分辨率（视频元素事实，非服务端配置值），
+     * HUD 画质徽标：画面实际可见的分辨率（显示几何；未知时退回解码帧尺寸），
      * 协商前 / 无帧时为占位符。实测帧率与编解码器由 stats 行另行展示
      */
     setStreamExtent(width, height) {
@@ -410,6 +415,67 @@ export class UIManager {
         }
     }
 
+    /** 登记当前生效的显示几何：初值随 Answer 下发，此后由服务端推送；同一几何重复到达直接忽略 */
+    setDisplayGeometry(width, height) {
+        const nextWidth = width > 0 ? width : 0;
+        const nextHeight = height > 0 ? height : 0;
+        if (nextWidth === this.displayWidth && nextHeight === this.displayHeight) return;
+        this.displayWidth = nextWidth;
+        this.displayHeight = nextHeight;
+        this.setStreamExtent(nextWidth, nextHeight);
+        this.updateVideoGeometry();
+    }
+
+    /**
+     * 视频尺寸变化：重算显示视口与视频元素盒，HUD 报告显示区域而非编码尺寸。
+     * 显示几何与解码尺寸各自独立更新，任一侧变化都按当下两者重算裁切比。
+     */
+    handleVideoResize() {
+        this.updateVideoGeometry();
+        if (this.displayWidth > 0 && this.displayHeight > 0) {
+            this.setStreamExtent(this.displayWidth, this.displayHeight);
+        } else {
+            this.setStreamExtent(this.video.videoWidth, this.video.videoHeight);
+        }
+    }
+
+    /**
+     * 按显示几何与显示适配模式同步 DOM 尺寸：视口只承载显示区域，
+     * 视频盒按「编码尺寸 / 显示尺寸」放大，右/下补齐边落到视口外被裁掉。
+     */
+    updateVideoGeometry() {
+        const video = this.video;
+        const viewport = this.videoViewportElement;
+        const surface = this.gameSurface;
+        if (!video || !viewport || !surface) return;
+
+        const geometry = resolveFrameGeometry(
+            video.videoWidth,
+            video.videoHeight,
+            this.displayWidth,
+            this.displayHeight,
+        );
+        const surfaceRect = surface.getBoundingClientRect();
+        const size =
+            geometry &&
+            computeViewportSize(
+                surfaceRect.width,
+                surfaceRect.height,
+                geometry.displayWidth,
+                geometry.displayHeight,
+                this.fitMode,
+            );
+        if (!size) {
+            viewport.style.width = "0px";
+            viewport.style.height = "0px";
+            return;
+        }
+        viewport.style.width = `${size.width}px`;
+        viewport.style.height = `${size.height}px`;
+        video.style.width = `${size.width * geometry.scaleX}px`;
+        video.style.height = `${size.height * geometry.scaleY}px`;
+    }
+
     get fitMode() {
         return this.fitModeSlider.value.value;
     }
@@ -418,24 +484,30 @@ export class UIManager {
         return this.bppSlider.value;
     }
 
-    /** 显示适配只改浏览器内呈现（object-fit），绝不触达编码帧 */
+    /** 显示适配只改浏览器内呈现（显示视口布局），绝不触达编码帧 */
     applyFitMode() {
-        if (this.video) {
-            this.video.style.objectFit = this.fitMode;
-        }
+        this.updateVideoGeometry();
         this.saveProfilePreference();
     }
 
     /**
-     * 视频显示区视口的物理像素上限（CSS 尺寸 × DPR 在源头算好，服务端零换算）。
-     * 取视频元素的显示区而非窗口：letterbox 黑边不计入上限
+     * 可见画面区的物理像素上限（CSS × DPR，服务端零换算）：取显示视口与汇聚点的交集，
+     * letterbox 与 cover/none 的溢出都不计入；首帧前视口未布局，按汇聚点上报。
      */
     videoViewport() {
-        if (!this.video) return null;
-        const rect = this.video.getBoundingClientRect();
+        const viewport = this.videoViewportElement;
+        const surface = this.gameSurface;
+        if (!surface) return null;
+        const surfaceRect = surface.getBoundingClientRect();
+        const viewportRect = viewport ? viewport.getBoundingClientRect() : null;
+        const rect = viewportRect && viewportRect.width > 0 && viewportRect.height > 0 ? viewportRect : surfaceRect;
+        const left = Math.max(rect.left, surfaceRect.left);
+        const top = Math.max(rect.top, surfaceRect.top);
+        const right = Math.min(rect.left + rect.width, surfaceRect.left + surfaceRect.width);
+        const bottom = Math.min(rect.top + rect.height, surfaceRect.top + surfaceRect.height);
         const dpr = window.devicePixelRatio || 1;
-        const width = Math.round(rect.width * dpr);
-        const height = Math.round(rect.height * dpr);
+        const width = Math.round((right - left) * dpr);
+        const height = Math.round((bottom - top) * dpr);
         if (width <= 0 || height <= 0) return null;
         return { width, height };
     }

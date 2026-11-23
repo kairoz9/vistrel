@@ -69,7 +69,7 @@ function pasteEvent(target, text) {
 
 let controller;
 let target;
-let video;
+let content;
 let imeCollector;
 let packets;
 let interactionSpy;
@@ -77,15 +77,15 @@ let lockSpy;
 let textSpy;
 let hintSpy;
 
-/** 构造控制器：DOM 结构贴近 index.html（#game-surface > video + imeCollector） */
+/** 构造控制器：DOM 结构贴近 index.html（#game-surface > #videoViewport > video + imeCollector） */
 function setup() {
     document.body.innerHTML = `
         <div id="game-surface">
-            <video id="fakeVideo"></video>
+            <div id="videoViewport"><video id="fakeVideo"></video></div>
             <input id="imeCollector" type="text" />
         </div>`;
     target = document.getElementById("game-surface");
-    video = document.getElementById("fakeVideo");
+    content = document.getElementById("videoViewport");
     imeCollector = document.getElementById("imeCollector");
     packets = [];
     // send 必须捕获数组本身而非模块级变量：旧控制器的监听器在整个文件生命周期内存活，
@@ -94,7 +94,7 @@ function setup() {
     const send = (buffer) => ownPackets.push(decodePacket(buffer));
     controller = new InputController({
         targetElement: target,
-        videoElement: video,
+        viewportElement: content,
         getDataChannel: () => ({ readyState: "open", send }),
         sendTextInput: textSpy,
         onUserInteraction: interactionSpy,
@@ -118,11 +118,9 @@ function enterGuiMode() {
     controller.setCursorState(true);
 }
 
-/** 桩视频几何：1600×900 内容塞进 800×600 容器（contain 缩放 0.5、留边 75） */
-function setVideoGeometry({ width = 800, height = 600, videoWidth = 1600, videoHeight = 900 } = {}) {
-    Object.defineProperty(video, "videoWidth", { configurable: true, value: videoWidth });
-    Object.defineProperty(video, "videoHeight", { configurable: true, value: videoHeight });
-    video.getBoundingClientRect = () => ({ left: 0, top: 0, width, height });
+/** 桩显示视口矩形：输入层只认可见视口（此处为 1600×900 内容 contain 到 800×600、纵向偏移 75） */
+function setViewportRect({ left = 0, top = 75, width = 800, height = 450 } = {}) {
+    content.getBoundingClientRect = () => ({ left, top, width, height });
 }
 
 const flush = async () => {
@@ -182,7 +180,7 @@ describe("输入帧编码", () => {
         target = document.getElementById("game-surface");
         controller = new InputController({
             targetElement: target,
-            videoElement: video,
+            viewportElement: document.createElement("div"),
             getDataChannel: () => ({ readyState: "connecting", send: vi.fn() }),
             sendTextInput: textSpy,
             onUserInteraction: interactionSpy,
@@ -238,30 +236,22 @@ describe("鼠标管线", () => {
         expect(packets).toHaveLength(0);
     });
 
-    it("GUI 态位移转绝对帧（contain 按内容区归一化）", () => {
+    it("GUI 态位移按显示视口归一化", () => {
         setup();
-        setVideoGeometry();
+        setViewportRect();
         enterGuiMode();
         target.dispatchEvent(mouseEvent("mousemove", { x: 100, y: 165 }));
         expect(packets).toEqual([{ type: 5, x: 8192, y: 13107 }]);
     });
 
-    it("GUI 态 cover 模式先反解帧内裁切区域再归一化", () => {
+    it("GUI 态落在 letterbox 黑边上的坐标钳到画面边缘", () => {
         setup();
-        setVideoGeometry();
-        video.style.objectFit = "cover";
+        setViewportRect();
         enterGuiMode();
-        target.dispatchEvent(mouseEvent("mousemove", { x: 400, y: 300 }));
-        expect(packets).toEqual([{ type: 5, x: 32_768, y: 32_768 }]);
-    });
-
-    it("GUI 态 none 模式按原始像素居中归一化", () => {
-        setup();
-        setVideoGeometry();
-        video.style.objectFit = "none";
-        enterGuiMode();
-        target.dispatchEvent(mouseEvent("mousemove", { x: 400, y: 300 }));
-        expect(packets).toEqual([{ type: 5, x: 32_768, y: 32_768 }]);
+        target.dispatchEvent(mouseEvent("mousemove", { x: 400, y: 10 }));
+        expect(packets).toEqual([{ type: 5, x: 32_768, y: 0 }]);
+        target.dispatchEvent(mouseEvent("mousemove", { x: 900, y: 300 }));
+        expect(packets.at(-1)).toEqual({ type: 5, x: 65_535, y: 32_768 });
     });
 
     it("IDLE 态位移全静默", () => {
@@ -686,7 +676,7 @@ describe("触摸手势状态机", () => {
 
     it("GUI 态触摸光标绝对跟随，无相对位移", () => {
         setup();
-        setVideoGeometry();
+        setViewportRect();
         enterGuiMode();
         target.dispatchEvent(touchEvent("pointerdown", { pointerId: 1, x: 100, y: 165 }));
         expect(packets).toEqual([{ type: 5, x: 8192, y: 13107 }]);

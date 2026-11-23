@@ -199,9 +199,32 @@ describe("信令下行分流", () => {
         );
         expect(session.pc.setRemoteDescription).toHaveBeenCalledWith({ type: "answer", sdp: expect.any(String) });
         expect(authEvents).toEqual([{ ok: true }]);
-        expect(profileEvents).toEqual([
-            { width: 1920, height: 1080, fps: 60, codec: "h265", backend: "nvenc", backends: null },
-        ]);
+        expect(profileEvents).toEqual([{ codec: "h265", backend: "nvenc", backends: null }]);
+    });
+
+    it("answer 的 width/height 作为显示几何初值种入 display_geometry 事件", async () => {
+        const { session } = makeSession();
+        session.pc = new FakeRTCPeerConnection({});
+        const geometries = [];
+        session.on("display_geometry", (geometry) => geometries.push(geometry));
+        await session.handleSignalingMessage(
+            JSON.stringify({
+                type: "answer",
+                sdp: "v=0\r\na=rtpmap:96 H264\r\n",
+                width: 2560,
+                height: 1440,
+            }),
+        );
+        expect(geometries).toEqual([{ width: 2560, height: 1440 }]);
+    });
+
+    it("answer 缺显示几何时不种初值，交给后续推送", async () => {
+        const { session } = makeSession();
+        session.pc = new FakeRTCPeerConnection({});
+        const geometries = [];
+        session.on("display_geometry", (geometry) => geometries.push(geometry));
+        await session.handleSignalingMessage(JSON.stringify({ type: "answer", sdp: "v=0\r\na=rtpmap:96 H264\r\n" }));
+        expect(geometries).toEqual([]);
     });
 
     it("answer 携带的能力清单原样进入协商档案", async () => {
@@ -221,9 +244,6 @@ describe("信令下行分流", () => {
             }),
         );
         expect(profileEvents[0]).toEqual({
-            width: 1920,
-            height: 1080,
-            fps: 60,
             codec: "h264",
             backend: "software",
             backends: [
@@ -233,7 +253,7 @@ describe("信令下行分流", () => {
         });
     });
 
-    it("answer（字符串形态）与缺省档位回填", async () => {
+    it("answer（字符串形态）与缺省后端回填", async () => {
         const { session } = makeSession();
         session.pc = new FakeRTCPeerConnection({});
         const profileEvents = [];
@@ -242,9 +262,6 @@ describe("信令下行分流", () => {
         expect(session.pc.setRemoteDescription).toHaveBeenCalledWith({ type: "answer", sdp: expect.any(String) });
         // 应答缺 backend 字段（旧 Native）按未知处理
         expect(profileEvents[0]).toEqual({
-            width: 1920,
-            height: 1080,
-            fps: 60,
             codec: "h264",
             backend: "unknown",
             backends: null,
@@ -321,6 +338,16 @@ describe("信令下行分流", () => {
         session.on("action", (action) => events.push(action));
         await expect(session.handleSignalingMessage("{bad json")).resolves.toBeUndefined();
         expect(events).toHaveLength(0);
+    });
+
+    it("显示几何回执转 display_geometry 事件，非法宽高丢弃", async () => {
+        const { session } = makeSession();
+        const geometries = [];
+        session.on("display_geometry", (geometry) => geometries.push(geometry));
+        await session.handleSignalingMessage(JSON.stringify({ type: "display_geometry", width: 1920, height: 1080 }));
+        await session.handleSignalingMessage(JSON.stringify({ type: "display_geometry", width: 0, height: 1080 }));
+        await session.handleSignalingMessage(JSON.stringify({ type: "display_geometry", width: "1920", height: 1080 }));
+        expect(geometries).toEqual([{ width: 1920, height: 1080 }]);
     });
 });
 

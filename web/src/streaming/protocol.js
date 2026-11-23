@@ -23,24 +23,27 @@ export const WS_OUT = {
     CANDIDATE: "candidate",
     TEXT_INPUT: "text_input",
     // 客户端串流偏好同步：幂等状态快照，尽量携带完整 bpp + viewport（物理像素，UI 层算好）；
-    // 两者都不产生回执——流本身即事实源，前端以视频元素与 getStats 自观测
+    // 不产生回执——显示几何走 Answer/display_geometry 镜像，实测数据由视频元素与 getStats 自观测
     SETTINGS: "settings",
 };
 
 // 信令下行词汇表——Java 侧对端：SignalingServer 的 TextSignal 帧（candidate /
 // auth_failed / error 由其直接下发）；answer 帧负载是 NativeBridge.negotiateOffer
 // 的应答 JSON，字段形状 width/height/fps/bpp/bitrate/codec/backend/backends/sdp，
-// 其中 backends 是编码能力清单 [{kind, codecs}]（硬编按服务端优先级序，软件编码收尾）
+// 其中 backends 是编码能力清单 [{kind, codecs}]（硬编按服务端优先级序，软件编码收尾）；
+// answer 的 width/height 是显示几何初值，变化经 display_geometry 推送
 export const WS_IN = {
     ANSWER: "answer",
     CANDIDATE: "candidate",
     AUTH_FAILED: "auth_failed",
     ERROR: "error",
+    // 显示几何更新（ClientEvent.DisplayGeometry）：宽高是画面可见区域，不含编码对齐补齐边；
+    // 初值随 Answer 下发，服务端只在几何变化时推送
+    DISPLAY_GEOMETRY: "display_geometry",
 };
 
-// 控制数据通道下行词汇表；档位/会话消息走信令 WS（见 WS_IN）。
-// 与 Java 侧 ClientEvent 的三个下行 record（CursorState / OpenUrl / ClipboardWrite）
-// 的 type 组件手工对齐——ClientEvent.java 是本表的另一端锚点
+// 下行控制事件词汇表（同经信令 WS 文本帧）；与 ClientEvent.java 的下行 record 手工对齐，
+// 其中 display_geometry 在 WS_IN——ClientEvent.java 是本表的另一端锚点
 export const CONTROL_IN = {
     CURSOR_STATE: "cursor_state",
     OPEN_URL: "open_url",

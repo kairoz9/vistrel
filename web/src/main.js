@@ -35,9 +35,7 @@ window.addEventListener("DOMContentLoaded", () => {
     });
     session.on(SESSION_EVENTS.PROFILE, (profile) => {
         ui.modals.kicked.hide();
-        // answer 携带的协商值先上屏（此刻视频元素还没有首帧），
-        // 后续内容驱动的分辨率变化由视频元素 resize 事件接管
-        ui.setStreamExtent(profile.width, profile.height);
+        // 显示几何不在此档案里，由 DISPLAY_GEOMETRY 事件单独携带
         if (profile.codec) {
             ui.setCodec(profile.codec);
         }
@@ -49,6 +47,8 @@ window.addEventListener("DOMContentLoaded", () => {
             ui.setEncoderOptions(profile.backends);
         }
     });
+    // 显示几何：Answer 初值与换档更新共用此事件
+    session.on(SESSION_EVENTS.DISPLAY_GEOMETRY, (geometry) => ui.setDisplayGeometry(geometry.width, geometry.height));
     session.on(SESSION_EVENTS.STATS, (stats) => {
         if (stats.rttMs !== null) ui.setRtt(stats.rttMs);
         if (stats.fps !== null) ui.setFps(stats.fps);
@@ -111,7 +111,7 @@ window.addEventListener("DOMContentLoaded", () => {
     // 建立输入控制器
     inputController = new InputController({
         targetElement: ui.gameSurface,
-        videoElement: ui.video,
+        viewportElement: ui.videoViewportElement,
         getDataChannel: () => session.getInputDataChannel(),
         sendTextInput: (text) => session.sendTextInput(text),
         onUserInteraction: unlockMedia,

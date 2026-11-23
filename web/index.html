@@ -13,7 +13,10 @@
     <div id="video-container">
         <!-- 输入汇聚点：画面、音频与 IME 收集器之外的 DOM 一律视为页面 UI，其事件不进游戏 -->
         <div id="game-surface">
-            <video id="remoteVideo" autoplay playsinline muted></video>
+            <!-- 显示视口：只呈现解码帧的显示区域，右/下编码补齐边在此裁掉 -->
+            <div id="videoViewport">
+                <video id="remoteVideo" autoplay playsinline muted></video>
+            </div>
             <audio id="remoteAudio" autoplay></audio>
 
             <!-- IME 收集器：GUI 态文本输入的焦点载体，输入法确认后的文本由 input.js 取走清空 -->

@@ -32,6 +32,8 @@ export const SESSION_EVENTS = Object.freeze({
     TORN_DOWN: "torn-down",
     /** 服务端下发的信令错误（含编码偏好不可满足的拒绝原因），负载为错误文案 */
     ERROR: "error",
+    /** 当前生效显示几何 {width, height}：Answer 给初值、服务端推送更新，不含编码对齐补齐边 */
+    DISPLAY_GEOMETRY: "display_geometry",
 });
 
 /**
@@ -60,6 +62,11 @@ function closeQuietly(connection) {
     }
 }
 
+/** 合法显示几何：正有限宽高（Answer 初值与 display_geometry 更新共用同一判定） */
+function isValidGeometry(width, height) {
+    return Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0;
+}
+
 /**
  * Vistrel 浏览器侧串流会话：信令协商、PeerConnection 生命周期与统计轮询
  */
@@ -86,9 +93,6 @@ export class StreamingSession {
         this.status = null;
         this.auth = "pending";
         this.profile = {
-            width: null,
-            height: null,
-            fps: null,
             codec: parseCodecToken(this.readPreferences().codec),
             backend: "unknown",
             backends: null,
@@ -147,15 +151,12 @@ export class StreamingSession {
         this.emit(SESSION_EVENTS.STATUS, status);
     }
 
-    setProfile(width, height, fps, codec, backend, backends) {
-        width = width || 1920;
-        height = height || 1080;
-        fps = fps || 60;
-        // backend/backends 是协商回执的事实（实际建成身份与可选值清单），随 answer 一次性落定
+    /**
+     * 协商档案：codec / backend / backends 是 Answer 落定的会话常量；
+     * 显示几何不在档案里，由 DISPLAY_GEOMETRY 事件单独携带
+     */
+    setProfile(codec, backend, backends) {
         this.profile = {
-            width,
-            height,
-            fps,
             codec,
             backend: backend || "unknown",
             backends: Array.isArray(backends) ? backends : null,
@@ -290,8 +291,12 @@ export class StreamingSession {
 
                 // SDP 生效后才算认证成功：避免 setRemoteDescription 失败时提前持久化凭据
                 this.setAuth({ ok: true });
-                this.setProfile(msg.width, msg.height, msg.fps, ackCodec, msg.backend, msg.backends);
+                this.setProfile(ackCodec, msg.backend, msg.backends);
                 console.log(`Vistrel: Negotiation complete: ${msg.width}x${msg.height}@${msg.fps} (${ackCodec})`);
+                // 显示几何初值随 Answer 下发，后续变化由服务端推送
+                if (isValidGeometry(msg.width, msg.height)) {
+                    this.emit(SESSION_EVENTS.DISPLAY_GEOMETRY, { width: msg.width, height: msg.height });
+                }
             } else if (msg.type === WS_IN.CANDIDATE && msg.candidate) {
                 if (this.pc && this.pc.remoteDescription) {
                     await this.pc.addIceCandidate(msg.candidate);
@@ -316,6 +321,11 @@ export class StreamingSession {
                 // 信令错误视为可恢复：关闭信令连接，走 onclose 的 3 秒重连闭环
                 if (this.ws && this.ws.readyState === WebSocket.OPEN) {
                     this.ws.close();
+                }
+            } else if (msg.type === WS_IN.DISPLAY_GEOMETRY) {
+                // 换档后的显示几何更新
+                if (isValidGeometry(msg.width, msg.height)) {
+                    this.emit(SESSION_EVENTS.DISPLAY_GEOMETRY, { width: msg.width, height: msg.height });
                 }
             } else if (msg.type === CONTROL_IN.CURSOR_STATE) {
                 this.emit(SESSION_EVENTS.ACTION, {
