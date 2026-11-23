@@ -15,8 +15,8 @@ use arc_swap::ArcSwapOption;
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use webrtc::peer_connection::RTCIceCandidateInit;
 
+use crate::encode::BackendCapability;
 use crate::encode::EncodeBackendKind;
-use crate::encode::HardwareProbeResult;
 use crate::encode::StreamingProfile;
 use crate::encode::TierRequest;
 use crate::encode::VideoCodec;
@@ -204,8 +204,7 @@ impl StreamingEngine {
         let preferred = match preferences.backend {
             None => None,
             Some(kind) => {
-                let selectable = crate::encode::encoder_caps_options();
-                if !selectable.iter().any(|(k, _)| *k == kind) {
+                if !crate::encode::is_selectable(kind) {
                     return Err(
                         format!("指定的编码后端 {kind:?} 不在本机能力清单内，协商拒绝").into(),
                     );
@@ -319,7 +318,7 @@ fn resolve_initial_request(
     height: usize,
     fps: usize,
     bpp: Option<f32>,
-    caps_entry: Option<&HardwareProbeResult>,
+    caps_entry: Option<&BackendCapability>,
 ) -> TierRequest {
     let mut request = TierRequest {
         width,
@@ -390,7 +389,7 @@ fn parse_sdp_offered_codecs(offer: &RTCSessionDescription) -> Option<Vec<VideoCo
 /// 可行项，兜底 H.264。SDP 载荷序只承载浏览器解码可行性，不参与判定
 fn resolve_codec(
     offer: Option<&RTCSessionDescription>,
-    caps_entry: Option<&HardwareProbeResult>,
+    caps_entry: Option<&BackendCapability>,
     preferred: Option<VideoCodec>,
 ) -> Result<VideoCodec, String> {
     let supported_codecs = caps_entry
@@ -694,10 +693,9 @@ mod tests {
         let offer_av1 = RTCSessionDescription::offer(
             "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 AV1/90000\r\n".to_string()
         ).unwrap();
-        let av1_probe = HardwareProbeResult {
+        let av1_probe = BackendCapability {
             backend_type: EncodeBackendKind::Nvenc,
             supported_codecs: vec![VideoCodec::Av1, VideoCodec::H264],
-            coded_align: (1, 1),
             gpu_name: String::new(),
         };
 
@@ -768,15 +766,14 @@ mod tests {
     /// 浏览器载荷序无关
     #[test]
     fn test_resolve_codec_with_sdp() {
-        use crate::encode::HardwareProbeResult;
+        use crate::encode::BackendCapability;
 
-        let fake_probe = HardwareProbeResult {
+        let fake_probe = BackendCapability {
             backend_type: EncodeBackendKind::Nvenc,
             supported_codecs: vec![VideoCodec::Av1, VideoCodec::H265, VideoCodec::H264],
-            coded_align: (1, 1),
             gpu_name: String::new(),
         };
-        let h264_only_probe = HardwareProbeResult {
+        let h264_only_probe = BackendCapability {
             supported_codecs: vec![VideoCodec::H264],
             ..fake_probe.clone()
         };

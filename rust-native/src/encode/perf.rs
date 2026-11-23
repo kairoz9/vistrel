@@ -459,11 +459,14 @@ fn source_revision() -> String {
 }
 
 fn backend_summary() -> String {
-    match super::hardware::hardware_caps() {
-        Some(probe) => format!(
-            "{:?}（对齐 {:?}，支持 {:?}）",
-            probe.backend_type, probe.coded_align, probe.supported_codecs
-        ),
+    match super::hardware::hardware_backends() {
+        Some(list) => match list.first() {
+            Some(probe) => format!(
+                "{:?}（支持 {:?}，显卡 {}）",
+                probe.backend_type, probe.supported_codecs, probe.gpu_name
+            ),
+            None => "探测快照为空".into(),
+        },
         None => "探测快照为空".into(),
     }
 }

@@ -2,6 +2,7 @@ package com.kairo.vistrel.command;
 
 import com.kairo.vistrel.VistrelService;
 import com.kairo.vistrel.config.VistrelConfig;
+import com.kairo.vistrel.streaming.EncoderCaps;
 import com.kairo.vistrel.streaming.EncoderChannel;
 import com.kairo.vistrel.streaming.SessionServer;
 import com.mojang.brigadier.Command;
@@ -125,7 +126,7 @@ public final class VistrelCommands {
     }
 
     /**
-     * 生成当前服务状态行；除 queryEncoderCaps 读一次常驻快照（不等待、不碰设备）外
+     * 生成当前服务状态行；除一次在位编码器查询（纯内存读、不等待、不碰设备）外
      * 全是 Java 内存读取，渲染主线程直接调用不会卡顿
      *
      * @return 状态行列表，至少一行
@@ -343,34 +344,24 @@ public final class VistrelCommands {
     }*/
     //? }
     /**
-     * 读取常驻编码能力快照并追加编码/显卡两行（线格式 {@code 后端|codecs[|显卡]}）；
-     * 快照还没建立或原生库不可用时显示未知
+     * 读取会话实际建成的编码后端，从本机能力快照里查它的 codec 与显卡名
      */
     private static void appendEncoderLines(List<Component> lines, EncoderChannel channel) {
-        String summary = channel == null ? "" : channel.caps();
-        if (summary.isEmpty() || "unknown".equals(summary)) {
-            lines.add(row("编码信息", Component.literal("§8未知")));
+        SessionServer.SessionState state = VistrelService.getSessionState();
+        String backendToken = state == null ? null : state.backend();
+        if (backendToken == null) {
+            lines.add(row("编码信息", Component.literal("§8无 §7(无活跃会话)")));
             return;
         }
-        try {
-            String[] parts = summary.split("\\|");
-            if (parts.length < 2) {
-                lines.add(row("编码信息", Component.literal("§8未知")));
-                return;
-            }
-            String backend = switch (parts[0]) {
-                case "nvenc" -> "NVENC";
-                case "vulkan_video" -> "Vulkan Video";
-                case "software" -> "软件编码";
-                default -> parts[0];
-            };
-            String codecs = parts[1].replace("H264", "H.264").replace("H265", "H.265");
-            lines.add(row("编码信息", Component.literal("§f" + backend + " §8· §f" + codecs)));
-            if (parts.length >= 3 && !parts[2].isEmpty()) {
-                lines.add(row("使用显卡", Component.literal("§f" + parts[2])));
-            }
-        } catch (Throwable t) {
-            lines.add(row("编码信息", Component.literal("§8未知")));
+        EncoderCaps.Backend backend = channel == null ? null : channel.caps().find(backendToken);
+        if (backend == null) {
+            lines.add(row("编码信息", Component.literal("§8未知 §7(" + backendToken + ")")));
+            return;
+        }
+        String codecs = String.join(" §8· §f", backend.codecLabels());
+        lines.add(row("编码信息", Component.literal("§f" + backend.label() + " §8· §f" + codecs)));
+        if (!backend.gpu().isEmpty()) {
+            lines.add(row("使用显卡", Component.literal("§f" + backend.gpu())));
         }
     }
 

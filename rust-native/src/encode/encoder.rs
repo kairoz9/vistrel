@@ -8,7 +8,6 @@
 use bytes::Bytes;
 
 use super::hardware::nvenc::NvencBackend;
-use super::hardware::publish_actual_backend;
 use super::hardware::vulkan::VulkanVideoBackend;
 use super::software::SoftwareBackend;
 use crate::encode::hardware::slots::{SlotStateBlock, VramSlotDescriptor};
@@ -197,11 +196,6 @@ impl VideoEncoder {
                 heap_blocks(),
             ),
         };
-        // 实际建成的后端才是真相：采集侧尺寸与 backend_type() 都按建成值发布，
-        // 否则会按探测粒度去建纹理，而编码器按设备粒度消费——两条采集路径同时失效
-        // （软编无快照可校正，publish 内部跳过）
-        let backend_kind = backend.kind();
-        publish_actual_backend(backend_kind, backend.coded_align());
 
         Ok((
             Self {

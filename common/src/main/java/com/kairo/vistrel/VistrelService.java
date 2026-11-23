@@ -15,6 +15,7 @@ import com.kairo.vistrel.input.InputInjector;
 import com.kairo.vistrel.streaming.natives.NativeEncoderChannel;
 import com.kairo.vistrel.streaming.natives.NativeSessionServer;
 import com.kairo.vistrel.platform.Services;
+import com.kairo.vistrel.streaming.EncoderCaps;
 import com.kairo.vistrel.streaming.EncoderChannel;
 import com.kairo.vistrel.streaming.ClientEvent;
 import com.kairo.vistrel.streaming.SessionServer;
@@ -85,12 +86,30 @@ public final class VistrelService {
     }
 
     /**
-     * 显存直通只由硬编后端提供：NVENC 与 Vulkan Video 都能直接消费显存槽位，软编只能编码主机帧
+     * 显存直通只由硬编后端提供：NVENC 与 Vulkan Video 能直接消费显存槽位，软编只能编码主机帧
      *
-     * @param caps 编码能力快照，线格式见 {@link EncoderChannel#caps()}
+     * @param caps 本机编码能力快照
+     * @return 至少有一个硬件后端返回 {@code true}
      */
-    private static boolean supportsVramDirect(String caps) {
-        return caps.startsWith("nvenc|") || caps.startsWith("vulkan_video|");
+    private static boolean supportsVramDirect(EncoderCaps caps) {
+        return caps.hasHardware();
+    }
+
+    /**
+     * 能力快照的可读描述，启动日志用
+     *
+     * @param caps 本机编码能力快照
+     */
+    private static String describeCaps(EncoderCaps caps) {
+        return switch (caps.state()) {
+            case NOT_PROBED -> "未探测 (引擎尚未启动)";
+            case NO_HARDWARE -> "无硬件编码器 (仅软件编码)";
+            case CAPABILITIES -> caps
+                .backends()
+                .stream()
+                .map(b -> b.kind() + b.codecs() + (b.gpu().isEmpty() ? "" : "@" + b.gpu()))
+                .collect(java.util.stream.Collectors.joining(", "));
+        };
     }
 
     /**
@@ -131,7 +150,9 @@ public final class VistrelService {
             VistrelConfig cfg = Objects.requireNonNull(config.get(), "配置视图求值结果不能为空");
             // 1. 内容档位协调器：会话状态的唯一生产者（三路输入的阻塞 ask 汇聚点，ask 只在工作线程）
             ProfileCoordinator profileCoordinator = new ProfileCoordinator(server::applyProfile);
-            // 2. 组装采集调度器：显存直通能力延迟到会话建立时求值
+            // 2. 组装采集调度器：显存直通能力在此求值一次（本机是否有硬件编码能力），
+            //    会话是否真的跑在硬编上由 applyState 里的 state.hardware() 二次判定——
+            //    两者同时成立才启用显存直通
             VideoCaptureScheduler videoScheduler = new VideoCaptureScheduler(
                     encoder,
                     () -> cfg.vramDirect() && supportsVramDirect(encoder.caps()),
@@ -182,7 +203,7 @@ public final class VistrelService {
                 Constants.LOG.info("  Vistrel 服务已启动");
                 Constants.LOG.info("  访问地址: {}", accessUrl);
                 Constants.LOG.info("  访问密码: {}", cfg.password().isEmpty() ? "未启用（免认证）" : "[" + cfg.password() + "]");
-                Constants.LOG.info("  硬件加速状态: {}", encoder.caps());
+                Constants.LOG.info("  本机硬件加速能力: {}", describeCaps(encoder.caps()));
                 Constants.LOG.info("================================================================================");
             }
         } catch (Throwable t) {
@@ -595,6 +616,19 @@ public final class VistrelService {
     public static EncoderChannel getChannel() {
         ServiceContext ctx = activeContext;
         return ctx == null ? null : ctx.encoder();
+    }
+
+    /**
+     * 当前会话状态快照：后端身份、内容相位与生效档位
+     *
+     * <p>
+     * 后端身份是会话实际建成的后端，由协商应答落账。
+     *
+     * @return 当前会话状态；服务未启动、已停机或尚无活跃会话时返回 {@code null}
+     */
+    public static SessionServer.SessionState getSessionState() {
+        ProfileCoordinator coordinator = activeProfileCoordinator;
+        return coordinator == null ? null : coordinator.current();
     }
 
     /**

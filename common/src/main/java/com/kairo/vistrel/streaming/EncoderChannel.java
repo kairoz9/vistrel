@@ -26,14 +26,15 @@ public interface EncoderChannel {
     default void pushAudioPcm(ByteBuffer buffer, int samplesPerChannel) {}
 
     /**
-     * 查询常驻编码能力快照（拉式纯读，无等待、无设备调用）
+     * 本机编码能力快照，拉式纯读，无等待、无设备调用
      *
-     * @return 线格式 {@code 后端|codec,codec[|显卡]}：{@code nvenc|H264,H265} /
-     *         {@code vulkan_video|...} / {@code software|H264}（已探测且无硬编）；
-     *         {@code unknown} 表示引擎尚未启动过；空串表示 Native 库不可用
+     * <p>
+     * 会话实际在跑什么由 {@link SessionServer.SessionState#backend()} 承载。
+     *
+     * @return 能力快照，不为 {@code null}
      */
-    default String caps() {
-        return "";
+    default EncoderCaps caps() {
+        return EncoderCaps.EMPTY;
     }
 
     /**

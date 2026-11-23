@@ -13,6 +13,11 @@ public class FakeSessionServer implements SessionServer {
         public int systemFramesPushed = 0;
         public int audioFramesPushed = 0;
         public boolean vramDirectSupported = false;
+        /**
+         * 覆盖 caps() 的应答：null 表示按 {@link #vramDirectSupported} 推导，
+         * 非 null 时由用例直接给定能力快照
+         */
+        public EncoderCaps capsOverride = null;
 
         @Override
         public void pushSystemFrame(ByteBuffer buffer, int width, int height) {
@@ -25,8 +30,17 @@ public class FakeSessionServer implements SessionServer {
         }
 
         @Override
-        public String caps() {
-            return vramDirectSupported ? "nvenc|H264,H265" : "software|H264";
+        public EncoderCaps caps() {
+            if (capsOverride != null) {
+                return capsOverride;
+            }
+            if (vramDirectSupported) {
+                return new EncoderCaps(
+                        EncoderCaps.State.CAPABILITIES,
+                        List.of(new EncoderCaps.Backend("nvenc", List.of("H264", "H265"), "NVIDIA GeForce RTX 5060"))
+                );
+            }
+            return new EncoderCaps(EncoderCaps.State.NO_HARDWARE, List.of());
         }
     }
 
@@ -118,6 +132,15 @@ public class FakeSessionServer implements SessionServer {
      * （基线种入 + listener 广播初始档位），不经会话状态管道
      */
     public void simulateClientConnected(int width, int height, int fps) {
+        simulateClientConnected(width, height, fps, "nvenc");
+    }
+
+    /**
+     * 模拟 offer 协商成功并指定落账的后端身份
+     *
+     * @param backend 协商应答的线上后端词汇（nvenc / vulkan_video / software）
+     */
+    public void simulateClientConnected(int width, int height, int fps, String backend) {
         ProfileCoordinator worker = profileCoordinator;
         if (worker != null) {
             worker.noteOfferAnswer(
@@ -127,7 +150,9 @@ public class FakeSessionServer implements SessionServer {
                     + height
                     + ",\"fps\":"
                     + fps
-                    + ",\"bpp\":0.1,\"bitrate\":4000000,\"codec\":\"H264\",\"backend\":\"nvenc\"}",
+                    + ",\"bpp\":0.1,\"bitrate\":4000000,\"codec\":\"H264\",\"backend\":\""
+                    + backend
+                    + "\"}",
                     0.1
             );
         }

@@ -292,16 +292,7 @@ async fn handle_negotiate_offer(
             "bitrate": profile.bitrate(),
             "codec": codec.as_str(),
             "backend": backend.as_str(),
-            // 可选值清单：硬编按探测优先级序，软件编码恒收尾；远程玩家设置面板据此渲染
-            "backends": encode::encoder_caps_options()
-                .iter()
-                .map(|(kind, codecs)| {
-                    serde_json::json!({
-                        "kind": kind.as_str(),
-                        "codecs": codecs.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-                    })
-                })
-                .collect::<Vec<_>>(),
+            "backends": encode::encoder_caps_options_json(),
             "bppMin": encode::MIN_BPP,
             "bppMax": encode::MAX_BPP,
             "sdp": answer,
@@ -497,11 +488,10 @@ fn query_encoder_caps<'caller>(
     env: &mut Env<'caller>,
     _class: JClass<'caller>,
 ) -> jni::errors::Result<JString<'caller>> {
-    // 纯读常驻能力快照，无副作用。Unknown（引擎未启动）与
-    // Unavailable（探测过、无硬件）都是合法应答而非错误——status 命令在停服状态也
-    // 会查询，由 Java 侧按 `unknown` / `software` 分别展示。
-    let summary = encode::encoder_caps_summary();
-    match env.new_string(summary) {
+    // 纯读内存，不碰设备。返回本机全部可用后端及其 codec 与显卡名，由 Java 侧解析缓存
+    // ——诊断界面按会话后端查表，显存直通门控按有无硬编判定，都从这一份快照派生。
+    let json = encode::encoder_caps().to_string();
+    match env.new_string(json) {
         Ok(s) => Ok(s),
         Err(_) => Ok(JString::default()),
     }
@@ -519,7 +509,7 @@ fn import_vram_slots<'caller>(
     flat: JPrimitiveArray<'caller, jlong>,
 ) -> jni::errors::Result<jint> {
     // 0. 硬编能力预检：读启动期建立的快照，本机无硬编时直接拒绝
-    if encode::hardware_caps().is_none() {
+    if encode::hardware_backends().is_none() {
         return Ok(ControlStatus::NoHardwareEncoder as i32);
     }
 
@@ -899,7 +889,7 @@ mod tests {
         );
         assert_eq!(
             answer["backends"],
-            serde_json::json!([{ "kind": "software", "codecs": ["H264"] }]),
+            serde_json::json!([{ "kind": "software", "codecs": ["H264"], "gpu": "" }]),
             "未探测环境的能力清单只含软件编码（软件编码恒收尾）"
         );
 

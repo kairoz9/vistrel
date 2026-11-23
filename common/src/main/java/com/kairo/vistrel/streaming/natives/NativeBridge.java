@@ -241,11 +241,19 @@ public class NativeBridge {
     public static native int pollInputEvents(java.nio.ByteBuffer buffer, int maxEvents);
 
     /**
-     * 查询编码能力摘要：主动读常驻快照，进程内硬件能力不变
+     * 查询本机编码能力快照
      *
-     * @return {@code 后端|codec,codec} 紧凑串：{@code nvenc|H264,H265,AV1} /
-     *         {@code vulkan_video|...} / {@code software|H264}（已探测且无硬编）；
-     *         {@code unknown} 表示引擎尚未启动过（快照未建立）
+     * <p>
+     * 返回全部可用后端及其 codec 与显卡名，由
+     * {@link com.kairo.vistrel.streaming.EncoderCaps#parse} 解析后缓存。
+     *
+     * <p>
+     * 会话实际在跑什么不在这里，那是协商建成的结果，落账在
+     * {@link com.kairo.vistrel.streaming.SessionServer.SessionState#backend()}。
+     *
+     * @return JSON：{@code {"state":"capabilities"|"noHardware"|"notProbed",
+     *         "backends":[{"kind":"nvenc","codecs":["H264","H265"],"gpu":"显卡名"}]}}。
+     *         {@code state} 区分未探测与探测过无硬件，二者诊断意义相反，不得合并
      */
     public static native String queryEncoderCaps();
 

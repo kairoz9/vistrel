@@ -1,6 +1,7 @@
 package com.kairo.vistrel.streaming.natives;
 
 import com.kairo.vistrel.input.InputEventSource;
+import com.kairo.vistrel.streaming.EncoderCaps;
 import com.kairo.vistrel.streaming.EncoderChannel;
 import java.nio.ByteBuffer;
 
@@ -26,12 +27,29 @@ public final class NativeEncoderChannel implements EncoderChannel, InputEventSou
         return NativeBridge.pollInputEvents(buffer, maxEvents);
     }
 
+    /**
+     * 能力快照缓存：探测结果在进程生命周期内不变，解析一次长期复用
+     *
+     * <p>
+     * 只在已探测时落地。未探测意味着引擎还没启动，缓存它会让后续调用永远读到未探测
+     * ——显存直通门控在启动早期求值时就撞这个现场，必须下次再问。
+     */
+    private volatile EncoderCaps cachedCaps = null;
+
     @Override
-    public String caps() {
-        if (!NativeBridge.isLoaded()) {
-            return "";
+    public EncoderCaps caps() {
+        EncoderCaps cached = cachedCaps;
+        if (cached != null) {
+            return cached;
         }
-        return NativeBridge.queryEncoderCaps();
+        if (!NativeBridge.isLoaded()) {
+            return EncoderCaps.EMPTY;
+        }
+        EncoderCaps parsed = EncoderCaps.parse(NativeBridge.queryEncoderCaps());
+        if (parsed.probed()) {
+            cachedCaps = parsed;
+        }
+        return parsed;
     }
 
     @Override
