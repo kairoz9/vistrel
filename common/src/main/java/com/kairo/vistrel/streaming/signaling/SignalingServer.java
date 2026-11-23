@@ -29,6 +29,7 @@ import java.util.Base64;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -41,10 +42,14 @@ public class SignalingServer {
     private static final int MAX_TEXT_INPUT_LENGTH = 8192;
     // 粗粒度资源闸：只限制单实例同时存在的 TCP 连接数
     private static final int MAX_CONNECTIONS = 64;
+    // 显示几何推送去重键的未下发值
+    private static final long GEOMETRY_UNSENT = -1L;
     // 信令委托
     private final SignalingDelegate delegate;
     // 档位协调器
     private volatile ProfileCoordinator profileCoordinator;
+    // 最近一次已下发（Answer 或推送）的显示几何；等值唤醒不重发
+    private final AtomicLong sentGeometry = new AtomicLong(GEOMETRY_UNSENT);
     private volatile java.util.function.Consumer<String> textInputSink;
     private final AtomicReference<String> password = new AtomicReference<>(null);
     private final AtomicReference<Channel> activeChannel = new AtomicReference<>(null);
@@ -62,12 +67,16 @@ public class SignalingServer {
     }
 
     /**
-     * 注入档位协调器（信令开张前调用）：offer 快照/视口/BPP 与 settings 分发的直达通道
+     * 注入档位协调器（信令开张前调用）：offer 快照/视口/BPP 与 settings 分发的直达通道；
+     * 同时登记唤醒，把显示几何的变化推给浏览器（Answer 已带初值，等值不重发）
      *
      * @param worker 档位协调器；offer 规划 / Answer 落账 / 关闭复位均经它直达
      */
     public void setProfileCoordinator(ProfileCoordinator worker) {
         this.profileCoordinator = worker;
+        if (worker != null) {
+            worker.addListener(this::onSessionStateChanged);
+        }
     }
 
     /**
@@ -206,6 +215,49 @@ public class SignalingServer {
      */
     public void pushEvent(ClientEvent event) {
         sendToActiveClient(GSON.toJson(event));
+    }
+
+    /**
+     * 档位协调器唤醒：把显示几何同步排到通道事件循环上。
+     *
+     * <p>唤醒可能来自渲染线程、后台 ask 线程或信令线程；收敛到事件循环后与信令帧写入串行，
+     * 也不必在唤醒方线程上序列化信令帧。
+     */
+    private void onSessionStateChanged() {
+        Channel channel = activeChannel.get();
+        if (channel == null) {
+            return;
+        }
+        channel.eventLoop().execute(this::pushDisplayGeometry);
+    }
+
+    /**
+     * 下发当前显示几何：状态在推送时现读；等值唤醒（Answer 初值、相位翻转、纯码率重配）不重发，
+     * 迟到的唤醒由现值幂等吸收——浏览器只镜像服务端状态，不参与时序判断。
+     */
+    private void pushDisplayGeometry() {
+        ProfileCoordinator worker = profileCoordinator;
+        SessionServer.SessionState state = worker == null ? null : worker.current();
+        if (state == null) {
+            return;
+        }
+        Channel channel = activeChannel.get();
+        if (channel == null || !channel.isActive()) {
+            return;
+        }
+        SessionServer.Tier tier = state.tier();
+        long geometry = geometryKey(tier.width(), tier.height());
+        if (sentGeometry.getAndSet(geometry) == geometry) {
+            return;
+        }
+        sendToActiveClient(GSON.toJson(ClientEvent.DisplayGeometry.of(tier.width(), tier.height())));
+    }
+
+    /**
+     * 显示几何去重键：宽高各占 32 位
+     */
+    private static long geometryKey(int width, int height) {
+        return ((long) width << 32) | (height & 0xFFFFFFFFL);
     }
 
     public void setTextInputSink(java.util.function.Consumer<String> textInputSink) {
@@ -742,8 +794,11 @@ public class SignalingServer {
                             msg.backend()
             );
             if (answerJson != null && !answerJson.isEmpty()) {
-                // Answer 落账进协调器：种入基线并经 listener 广播初始档位（管线落地/接入提示）
-                profileCoordinator.noteOfferAnswer(answerJson, bpp);
+                // Answer 落账并广播初始档位；其实际档位即显示几何初值，记账后等值唤醒不再推送
+                SessionServer.Tier settled = profileCoordinator.noteOfferAnswer(answerJson, bpp);
+                if (settled != null) {
+                    sentGeometry.set(geometryKey(settled.width(), settled.height()));
+                }
                 ctx.writeAndFlush(WebSocketFrameCodec.textFrame(answerJson));
             } else {
                 ctx.writeAndFlush(WebSocketFrameCodec.textFrame(GSON.toJson(TextSignal.error(

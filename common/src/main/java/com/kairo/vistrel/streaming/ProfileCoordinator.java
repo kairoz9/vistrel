@@ -350,22 +350,26 @@ public final class ProfileCoordinator {
     /**
      * 信令线程入口：offer 协商成功的 Answer 落账。应答携带协商定死的后端身份与初始档位，
      * 此后内容 / BPP 请求以该基线为去重锚
+     *
+     * @param answerJson   协商应答 JSON（与下发浏览器的 Answer 同源）
+     * @param requestedBpp 请求的画质档位，用于种入去重锚
+     * @return 落账的实际档位（Answer 的显示几何）；不可解析或字段缺失时为 {@code null}，状态保持不变
      */
-    public void noteOfferAnswer(String answerJson, double requestedBpp) {
+    public SessionServer.Tier noteOfferAnswer(String answerJson, double requestedBpp) {
         if (stopped) {
-            return;
+            return null;
         }
         JsonObject obj;
         try {
             obj = JsonParser.parseString(answerJson).getAsJsonObject();
         } catch (Exception e) {
             Constants.LOG.warn("Answer 解析失败，档位基线保持未种: {}", e.getMessage());
-            return;
+            return null;
         }
         SessionServer.Tier applied = tierFrom(obj);
         if (applied == null) {
             Constants.LOG.warn("Answer 档位字段缺失，基线保持未种");
-            return;
+            return null;
         }
         String backend =
                 obj.has("backend") && !obj.get("backend").isJsonNull() ? obj.get("backend").getAsString() : null;
@@ -374,6 +378,7 @@ public final class ProfileCoordinator {
         published.set(new SessionServer.SessionState(backend, phaseNow(), applied));
         lastAttempted = new SessionServer.Tier(applied.width(), applied.height(), applied.fps(), clampBpp(requestedBpp));
         wakeListeners();
+        return applied;
     }
 
     /**

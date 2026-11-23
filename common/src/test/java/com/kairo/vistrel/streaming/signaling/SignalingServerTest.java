@@ -279,7 +279,7 @@ class SignalingServerTest {
     }
 
     /**
-     * 开好 WebSocket 并完成认证，返回已就绪的通道
+     * 开好 WebSocket 并完成认证，返回已就绪的通道（Answer 已消费）
      */
     private static EmbeddedChannel authenticatedWebSocket(SignalingServer server) {
         EmbeddedChannel ch = openWebSocket(server);
@@ -316,6 +316,69 @@ class SignalingServerTest {
         ch.writeInbound(Unpooled.wrappedBuffer(maskedTextFrame(payload)));
         Assertions.assertTrue(received.isEmpty(), "未认证会话的输入文本必须丢弃");
         ch.finishAndReleaseAll();
+    }
+
+    /**
+     * 换档推送：Answer 携带显示几何初值，只有几何实际变化的唤醒才下发
+     */
+    @Test
+    void testTierChangePushesDisplayGeometry() throws Exception {
+        SignalingServer server = new SignalingServer(new RecordingDelegate());
+        server.setPassword("pass123");
+        java.util.concurrent.CountDownLatch askLatch = new java.util.concurrent.CountDownLatch(1);
+        ProfileCoordinator worker = newWorker(new ProfileCoordinator.ContentSnapshot(3840, 2160, 60, false, 0), new RecordingWorkerListener(), (
+                                                                                                                                                       width,
+                                                                                                                                                       height,
+                                                                                                                                                       fps,
+                                                                                                                                                       bpp
+                                                                                                                                               ) -> {
+            askLatch.countDown();
+            return "{\"width\":1280,\"height\":720,\"fps\":60,\"bpp\":0.1,\"bitrate\":2000000}";
+        });
+        worker.start();
+        server.setProfileCoordinator(worker);
+
+        EmbeddedChannel ch = openWebSocket(server);
+        sendOffer(ch, "pass123");
+        ByteBuf answer = ch.readOutbound();
+        Assertions.assertNotNull(answer, "合法 offer 应收到 answer");
+        answer.release();
+        // 初值随 Answer 下发：会话建立的唤醒与初值等值，不得重复推送
+        ch.runPendingTasks();
+        Assertions.assertNull(ch.readOutbound(), "Answer 已携带初值，会话建立不得重复推送");
+
+        String settings = "{\"type\":\"settings\",\"viewport\":{\"width\":1280,\"height\":720}}";
+        ch.writeInbound(Unpooled.wrappedBuffer(maskedTextFrame(settings)));
+        Assertions.assertTrue(askLatch.await(2, TimeUnit.SECONDS), "视口变更必须触达后台 ask");
+
+        String json = awaitDisplayGeometryPush(ch);
+        Assertions.assertNotNull(json, "换档落账后必须主动推送显示几何");
+        Assertions.assertTrue(
+                json.contains("\"width\":1280") && json.contains("\"height\":720"),
+                "推送必须携带新显示几何，实际 " + json
+        );
+        ch.finishAndReleaseAll();
+        worker.shutdown();
+    }
+
+    /**
+     * 轮询泵送嵌入式事件循环直到收到 display_geometry 推送帧（上限 2 秒）
+     */
+    private static String awaitDisplayGeometryPush(EmbeddedChannel ch) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (System.nanoTime() < deadline) {
+            ch.runPendingTasks();
+            ByteBuf frame;
+            while ((frame = ch.readOutbound()) != null) {
+                String json = frame.toString(StandardCharsets.UTF_8);
+                frame.release();
+                if (json.contains("\"type\":\"display_geometry\"")) {
+                    return json;
+                }
+            }
+            Thread.sleep(10);
+        }
+        return null;
     }
 
     @Test

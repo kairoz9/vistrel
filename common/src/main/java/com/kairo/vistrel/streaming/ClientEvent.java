@@ -38,4 +38,17 @@ public sealed interface ClientEvent {
             return new ClipboardWrite("clipboard_write", text);
         }
     }
+
+    /**
+     * 当前生效的显示几何：远程画面可见区域的宽高（不含编码对齐补齐边）
+     *
+     * <p>
+     * 解码帧可能因编码器输入对齐更大（如 AV1 的 64×64），网页端据此裁掉右/下补齐边并换算
+     * 输入坐标。初值随 Answer 下发，换档落账后由信令层推送变化值（等值不重发）。
+     */
+    record DisplayGeometry(String type, int width, int height) implements ClientEvent {
+        public static DisplayGeometry of(int width, int height) {
+            return new DisplayGeometry("display_geometry", width, height);
+        }
+    }
 }

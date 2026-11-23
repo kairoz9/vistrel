@@ -33,4 +33,12 @@ public class ClientEventTest {
                 gson.toJson(ClientEvent.ClipboardWrite.of("hello"))
         );
     }
+
+    @Test
+    void testDisplayGeometryWireShape() {
+        Assertions.assertEquals(
+                "{\"type\":\"display_geometry\",\"width\":1920,\"height\":1080}",
+                gson.toJson(ClientEvent.DisplayGeometry.of(1920, 1080))
+        );
+    }
 }
