@@ -108,7 +108,8 @@ tasks.named<Copy>("buildAndCollect") {
 val mixinRefmaps = renamer.enableMixinRefmaps {
     config("$modId.mixins.json")
     config("$modId.forge.mixins.json")
-    source(sourceSets.main.get(), "$modId-refmap.json")
+    // source 参数是 refmap 基名，插件会固定追加 .refmap.json
+    source(sourceSets.main.get(), modId)
     jar(fatJar)
 }
 minecraft.runs.configureEach { mixinRefmaps.run(this) }
@@ -124,7 +125,7 @@ tasks.named<JavaCompile>("compileJava") {
 // refmap 键只进 forge 产物
 tasks.named("processResources") {
     // 值局部化到任务配置作用域：doLast 闭包只捕获局部值，捕获脚本引用会与配置缓存不兼容
-    val refmapFileName = "$modId-refmap.json.refmap.json"
+    val refmapFileName = "$modId.refmap.json"
     val mixinConfigNames = listOf("$modId.mixins.json", "$modId.forge.mixins.json")
     val prettyJson = Json { prettyPrint = true }
     doLast {

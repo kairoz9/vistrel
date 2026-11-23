@@ -2,8 +2,6 @@ import org.apache.tools.ant.taskdefs.condition.Os
 import org.gradle.api.tasks.Copy
 import org.gradle.api.tasks.JavaExec
 import org.gradle.api.tasks.SourceSetContainer
-import org.gradle.api.tasks.compile.JavaCompile
-import org.gradle.api.tasks.javadoc.Javadoc
 import org.gradle.jvm.tasks.Jar
 import org.gradle.language.jvm.tasks.ProcessResources
 
@@ -15,6 +13,14 @@ val commonPath = ":common:${project.name}".takeIf { findProject(it) != null } ?:
 val commonProject = evaluationDependsOn(commonPath)
 val commonMain = commonProject.the<SourceSetContainer>().getByName("main")
 
+// IDE 的 Gradle 模型只认 source set；原先把 common 只挂在 compileJava.source 上，
+// 编辑器（VS Code 的 Java 扩展、IntelliJ）看不到这份源码，loader 里的 common 引用
+// 会显示为未解析。把 common 的 source set 直接并入 main，编译、sourcesJar 与 javadoc
+// 都沿用同一份源码。
+sourceSets.named("main") {
+    java.srcDir(commonMain.java)
+}
+
 // 产物归拢目标目录，各 loader 脚本补齐 from 规格
 // （可分发 jar 因 loader 而异：fabric 走 loom 变体任务，forge 以 -srg 为准）
 tasks.register<Copy>("buildAndCollect") {
@@ -23,16 +29,7 @@ tasks.register<Copy>("buildAndCollect") {
     into(rootProject.layout.buildDirectory.dir("libs/${project.name}"))
 }
 
-tasks.named<JavaCompile>("compileJava") {
-    source(commonMain.java)
-}
-
-tasks.named<Javadoc>("javadoc").configure {
-    source(commonMain.java)
-}
-
 tasks.named<Jar>("sourcesJar") {
-    from(commonMain.java)
     from(commonMain.resources)
 }
 
