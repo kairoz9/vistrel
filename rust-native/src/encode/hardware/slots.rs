@@ -291,8 +291,9 @@ pub(crate) const SLOT_STATE_BLOCK_BYTES: usize = 64;
 /// 游戏侧认领槽位写 1，Actor 归还写 0（均为 CAS），心跳供游戏侧做停滞判定。
 /// 64 字节单缓存行（按 64 字节对齐），经直接内存缓冲区暴露给游戏侧，访问全部走 acquire/release。
 ///
-/// 布局是跨语言约定（游戏侧按 `ValueLayout` 原生端序按偏移访问）：
-/// `[0..32) = busy[8]`、`[32..40) = heartbeat`、`[40..48) = stage`、`[48..64) = 保留`。
+/// 布局是跨语言约定（游戏侧按原生端序按偏移访问）：
+/// `[0..32) = busy[8]`、`[32..40) = heartbeat`、`[40..48) = stage`、
+/// `[48..56) = binding_epoch`、`[56..64) = 保留`。
 ///
 /// 块随引擎实例创建并故意泄漏：卡死弃用的旧 Actor 只能写到自己那一代的块上，
 /// 碰不到新一代——跨代复用同一块的话，旧线程复活的心跳会让新一代的超时判定失效。
@@ -304,8 +305,11 @@ pub(crate) struct SlotStateBlock {
     heartbeat: AtomicU64,
     /// Actor 当前阻塞的阶段码：心跳冻结时游戏侧读回写进停滞日志
     stage: AtomicU64,
+    /// 显存绑定世代：重建编码器或槽位失效的重配时 +1。游戏侧导入/推送/注销
+    /// 都带上它，Native 据此拒绝旧绑定世代的槽位操作
+    binding_epoch: AtomicU64,
     /// 布局保留段：凑满单缓存行，游戏侧不得访问
-    _reserved: [u8; 16],
+    _reserved: [u8; 8],
 }
 
 const _: () = assert!(std::mem::size_of::<SlotStateBlock>() == SLOT_STATE_BLOCK_BYTES);
@@ -319,7 +323,8 @@ impl SlotStateBlock {
             busy: std::array::from_fn(|_| AtomicU32::new(0)),
             heartbeat: AtomicU64::new(0),
             stage: AtomicU64::new(ActorStage::Idle as u64),
-            _reserved: [0; 16],
+            binding_epoch: AtomicU64::new(0),
+            _reserved: [0; 8],
         });
         Box::leak(block)
     }
@@ -350,6 +355,16 @@ impl SlotStateBlock {
     /// Actor 每轮循环开始时 +1：心跳冻结即编码线程停止迭代
     pub(crate) fn heartbeat_bump(&self) {
         self.heartbeat.fetch_add(1, Ordering::Release);
+    }
+
+    /// 当前显存绑定世代：导入、推送与注销的准入令牌
+    pub(crate) fn binding_epoch(&self) -> u64 {
+        self.binding_epoch.load(Ordering::Acquire)
+    }
+
+    /// 显存绑定换代：旧世代的槽位导入/推送/注销从此失效
+    pub(crate) fn bump_binding_epoch(&self) -> u64 {
+        self.binding_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// 暴露给游戏侧的原始指针（由互操作层包装为直接内存缓冲区）

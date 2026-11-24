@@ -348,7 +348,7 @@ public final class VistrelCommands {
      */
     private static void appendEncoderLines(List<Component> lines, EncoderChannel channel) {
         SessionServer.SessionState state = VistrelService.getSessionState();
-        String backendToken = state == null ? null : state.backend();
+        String backendToken = state == null ? null : state.generation().backend();
         if (backendToken == null) {
             lines.add(row("编码信息", Component.literal("§8无 §7(无活跃会话)")));
             return;

@@ -58,7 +58,7 @@ pub(crate) struct VramSlotProducer {
 }
 
 impl VramSlotProducer {
-    /// 槽位数量：对齐生产侧 `RenderpearlVramPipeline.SLOT_COUNT`（3 槽轮转）
+    /// 槽位数量：对齐生产侧 `VramExportSet.SLOT_COUNT`（3 槽轮转）
     pub(crate) const SLOT_COUNT: usize = 3;
 
     /// 建全部槽位并各填一份内容

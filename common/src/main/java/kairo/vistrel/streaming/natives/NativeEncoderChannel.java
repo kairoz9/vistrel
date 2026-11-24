@@ -1,12 +1,15 @@
 package kairo.vistrel.streaming.natives;
 
 import kairo.vistrel.input.InputEventSource;
+import kairo.vistrel.streaming.ControlStatus;
 import kairo.vistrel.streaming.EncoderCaps;
 import kairo.vistrel.streaming.EncoderChannel;
+import kairo.vistrel.streaming.VramBinding;
 import java.nio.ByteBuffer;
+import java.util.List;
 
 /**
- * 基于底层 JNI NativeBridge 的推流数据通道默认实现
+ * 基于底层 JNI NativeBridge 的推流数据通道默认实现。
  */
 public final class NativeEncoderChannel implements EncoderChannel, InputEventSource {
     @Override
@@ -52,65 +55,64 @@ public final class NativeEncoderChannel implements EncoderChannel, InputEventSou
         return parsed;
     }
 
+    /**
+     * 把类型化槽位描述编码成 JNI 的 7 元组扁平数组。
+     *
+     * <p>包私有供测试直接钉住字段序，不依赖 JNI。
+     *
+     * @param slots 槽位描述
+     * @return 每槽位 {@link NativeWireContract#VRAM_SLOT_STRIDE} 个 long 的扁平数组
+     */
+    static long[] encodeSlots(List<VramSlotDescriptor> slots) {
+        long[] flat = new long[slots.size() * NativeWireContract.VRAM_SLOT_STRIDE];
+        int base = 0;
+        for (VramSlotDescriptor slot : slots) {
+            flat[base] = slot.slotIdx();
+            flat[base + 1] = slot.memHandle();
+            flat[base + 2] = slot.semHandle();
+            flat[base + 3] = slot.width();
+            flat[base + 4] = slot.height();
+            flat[base + 5] = slot.sizeBytes();
+            flat[base + 6] = slot.offset();
+            base += NativeWireContract.VRAM_SLOT_STRIDE;
+        }
+        return flat;
+    }
+
     @Override
-    public SlotLease importVramSlots(long[] slots) {
+    public VramBinding bindVram(List<VramSlotDescriptor> slots) {
         if (!NativeBridge.isLoaded()) {
             throw new IllegalStateException("Native 库未加载，无法注册显存槽位");
         }
-        int code = NativeBridge.importVramSlots(slots);
-        if (code != EncoderChannel.CONTROL_OK) {
-            throw new EncoderChannel.ControlException(
-                    "NativeBridge.importVramSlots 失败 (整批已回滚): " + EncoderChannel.describeControlResult(code) + " (" + code + ")",
-                    code
+        if (slots == null || slots.isEmpty()) {
+            throw new IllegalArgumentException("显存槽位描述不能为空");
+        }
+        if (slots.size() > NativeWireContract.SLOT_STATE_SLOTS) {
+            throw new IllegalArgumentException(
+                    "显存槽位数量超过共享块容量: " + slots.size() + " > " + NativeWireContract.SLOT_STATE_SLOTS
             );
         }
-        return new NativeSlotLease();
-    }
-
-    @Override
-    public ByteBuffer slotStateBlock() {
-        if (!NativeBridge.isLoaded()) {
-            return null;
-        }
-        return NativeBridge.slotStateBlock();
-    }
-
-    /**
-     * 持有投递与注销义务的原生槽位租约
-     */
-    private static final class NativeSlotLease implements SlotLease {
-        private volatile boolean closed = false;
-        /**
-         * close() 之后有意义：注销是否得到原生确认（可否销毁导出资源的处置契约
-         * 在 {@code SlotLease.isReleased} 定义一次）
-         */
-        private volatile boolean releaseAcked = false;
-
-        @Override
-        public void push(int slotIdx, long signalVal) {
-            if (closed) {
-                throw new IllegalStateException("显存槽位租约已关闭，拒绝投递");
+        // 先取块再导入：块无效时在导入前失败，不会留下需要回滚的 Native 槽位表。
+        // 绑定世代也取自同一块；导入期间编码器换代时 Native 回 StaleBinding，重读一次再试
+        long[] flat = encodeSlots(slots);
+        for (int attempt = 0; ; attempt++) {
+            ByteBuffer stateBlock = NativeBridge.slotStateBlock();
+            if (stateBlock == null
+                    || !stateBlock.isDirect()
+                    || stateBlock.capacity() < NativeWireContract.SLOT_STATE_BLOCK_BYTES) {
+                throw new IllegalStateException("Native 未提供有效的槽位所有权块，显存直通不可用");
             }
-            NativeBridge.pushVramSlot(slotIdx, signalVal);
-        }
-
-        @Override
-        public void close() {
-            if (closed) {
-                return;
+            SlotStateBlock blockView = new SlotStateBlock(stateBlock, slots.size());
+            long bindingEpoch = blockView.bindingEpoch();
+            int code = NativeBridge.importVramSlots(bindingEpoch, flat);
+            if (code == ControlStatus.OK.code()) {
+                return new NativeVramBinding(blockView, bindingEpoch);
             }
-            closed = true;
-            if (!NativeBridge.isLoaded()) {
-                // Native 库未加载就没有导入方，游戏侧资源可放心释放
-                releaseAcked = true;
-                return;
+            if (code == ControlStatus.STALE_BINDING.code() && attempt == 0) {
+                // 读取绑定世代与导入之间编码器换代：重读当前绑定世代再导入一次
+                continue;
             }
-            releaseAcked = NativeBridge.clearVramSlots() == EncoderChannel.CONTROL_OK;
-        }
-
-        @Override
-        public boolean isReleased() {
-            return releaseAcked;
+            throw new EncoderChannel.ControlException("NativeBridge.importVramSlots 失败", code);
         }
     }
 }

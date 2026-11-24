@@ -249,7 +249,7 @@ public class NativeBridge {
      *
      * <p>
      * 会话实际在跑什么不在这里，那是协商建成的结果，落账在
-     * {@link kairo.vistrel.streaming.SessionServer.SessionState#backend()}。
+     * {@link kairo.vistrel.streaming.SessionServer.EncoderGeneration#backend()}。
      *
      * @return JSON：{@code {"state":"capabilities"|"noHardware"|"notProbed",
      *         "backends":[{"kind":"nvenc","codecs":["H264","H265"],"gpu":"显卡名"}]}}。
@@ -260,40 +260,46 @@ public class NativeBridge {
     /**
      * 批量注册全部显存槽位与同步原语 (JNI 原语层)。
      *
-     * <p>协议与结果码（7 元组字段序、{@code CONTROL_*}）只在
-     * {@link kairo.vistrel.streaming.EncoderChannel} 定义一次，与 Native 侧 {@code cuda::FLAT_STRIDE} 是同一条约定的两端。
+     * <p>协议与结果码（7 元组字段序、{@link kairo.vistrel.streaming.ControlStatus}）
+     * 只在 {@link NativeWireContract} 定义一次，与 Native 侧
+     * {@code encode::hardware::slots::FLAT_STRIDE} 是同一条约定的两端。
      *
+     * @param bindingEpoch 显存绑定世代（共享块中的当前值）
      * @param slots 扁平 long[]：逐槽位依序排列的 7 元组，字段序见
-     *              {@link kairo.vistrel.streaming.EncoderChannel} 协议定义
-     * @return 控制结果码：{@link kairo.vistrel.streaming.EncoderChannel#CONTROL_OK} 为成功，非零为失败原因
-     *         (协议错位 / 无硬编 / 导入失败 / 管线已死 / ACK 超时)
+     *              {@link NativeWireContract}
+     * @return 控制结果码：{@link kairo.vistrel.streaming.ControlStatus#OK} 为成功，非零为失败原因
+     *         (协议错位 / 无硬编 / 导入失败 / 管线已死 / ACK 超时 / 绑定世代过期)
      */
-    public static native int importVramSlots(long[] slots);
+    public static native int importVramSlots(long bindingEpoch, long[] slots);
 
     /**
      * 安全注销并释放 Native 引擎内部缓存的所有外部显存槽位与同步原语
      *
-     * @return 控制结果码：仅 {@link kairo.vistrel.streaming.EncoderChannel#CONTROL_OK} 表示
+     * @param bindingEpoch 显存绑定世代；旧世代的注销按空操作成功（导入已随实例销毁）
+     * @return 控制结果码：仅 {@link kairo.vistrel.streaming.ControlStatus#OK} 表示
      *         原生侧已确认注销完毕；未确认时调用方不得销毁导出资源——后果与处置在
-     *         {@link kairo.vistrel.streaming.EncoderChannel.SlotLease#isReleased()} 定义一次
+     *         {@link kairo.vistrel.streaming.VramBinding#close()} 与
+     *         {@link kairo.vistrel.streaming.VramBinding.ReleaseStatus} 定义一次
      */
-    public static native int clearVramSlots();
+    public static native int clearVramSlots(long bindingEpoch);
 
     /**
      * 向 Native 引擎直通投递显存槽位（单向投递，不等待编码结果）
      *
      * <p>
-     * {@code slotIdx} 为显存槽位索引 (0 合法)。
+     * {@code slotIdx} 为显存槽位索引 (0 合法)。绑定世代不匹配的帧在入口直接丢弃，
+     * 检查是共享块上的原子读，不做 JNI 往返。
      *
-     * @param slotIdx   已注册的显存槽位索引
-     * @param syncValue 时间线信号量信号值 (Vulkan) 或 0L (OpenGL / 其它无时间线信号量后端)
+     * @param bindingEpoch 显存绑定世代
+     * @param slotIdx      已注册的显存槽位索引
+     * @param syncValue    时间线信号量信号值 (Vulkan) 或 0L (OpenGL / 其它无时间线信号量后端)
      */
-    public static native void pushVramSlot(int slotIdx, long syncValue);
+    public static native void pushVramSlot(long bindingEpoch, int slotIdx, long syncValue);
 
     /**
      * 取当前活跃引擎的槽位所有权共享块；布局与换代语义在
-     * {@link kairo.vistrel.streaming.EncoderChannel#slotStateBlock} 定义一次
-     * （跨语言契约的 Java 端唯一定义处）
+     * {@link NativeWireContract} 定义一次（跨语言契约的 Java 端唯一定义处），
+     * 由 {@link kairo.vistrel.streaming.VramBinding} 包装消费
      *
      * @return 64 字节 DirectBuffer；引擎未运行时为 null
      */

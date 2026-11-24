@@ -22,7 +22,7 @@ public class AudioCaptureSchedulerTest {
 
         TestState live() {
             this.state = new SessionServer.SessionState(
-                    "nvenc",
+                    new SessionServer.EncoderGeneration("nvenc", "h264"),
                     SessionServer.Phase.STREAMING,
                     new SessionServer.Tier(1920, 1080, 60, 0.1)
             );
@@ -31,7 +31,7 @@ public class AudioCaptureSchedulerTest {
 
         TestState paused() {
             this.state = new SessionServer.SessionState(
-                    "nvenc",
+                    new SessionServer.EncoderGeneration("nvenc", "h264"),
                     SessionServer.Phase.PAUSED,
                     new SessionServer.Tier(1920, 1080, 60, 0.1)
             );

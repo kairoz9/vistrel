@@ -12,7 +12,7 @@ import java.util.Objects;
  * 本机编码能力快照，由 {@code NativeBridge.queryEncoderCaps()} 的 JSON 解析而来
  *
  * <p>
- * 会话实际在跑什么由 {@link SessionServer.SessionState#backend()} 承载。
+ * 会话实际在跑什么由 {@link SessionServer.EncoderGeneration#backend()} 承载。
  *
  * <p>
  * {@link State} 的三态不能合并：未探测是调用顺序问题，探测过无硬件是本机能力缺失。

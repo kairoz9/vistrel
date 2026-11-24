@@ -1,7 +1,7 @@
 package kairo.vistrel.mixin;
 
 //? if vulkan_backend {
-import kairo.vistrel.capture.RenderpearlVramPipeline;
+import kairo.vistrel.capture.VramExportSet;
 import com.llamalad7.mixinextras.sugar.Local;
 import com.mojang.renderpearl.api.GpuFormat;
 import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
@@ -41,16 +41,14 @@ public abstract class MixinVulkanGpuTexture {
             @Local VkImageCreateInfo imageCreateInfo,
             @Local VmaAllocationCreateInfo allocInfo
     ) {
-        RenderpearlVramPipeline.ScopedExportAllocation exportScope = RenderpearlVramPipeline.getActiveExportScope();
+        VramExportSet.ScopedExportAllocation exportScope = VramExportSet.getActiveExportScope();
         // 名字匹配：即使导出作用域因异常泄漏到
         // 无关创建路径，也只有本管线的槽位纹理会被收进导出池
-        if (exportScope != null
-                && label != null
-                && label.startsWith(RenderpearlVramPipeline.SLOT_TEXTURE_LABEL_PREFIX)) {
+        if (exportScope != null && label != null && label.startsWith(VramExportSet.SLOT_TEXTURE_LABEL_PREFIX)) {
             VkExternalMemoryImageCreateInfo extInfo = VkExternalMemoryImageCreateInfo
                 .calloc(MemoryStack.stackGet())
                 .sType$Default()
-                .handleTypes(RenderpearlVramPipeline.getExternalMemoryHandleType());
+                .handleTypes(VramExportSet.getExternalMemoryHandleType());
 
             extInfo.pNext(imageCreateInfo.pNext());
             imageCreateInfo.pNext(extInfo.address());

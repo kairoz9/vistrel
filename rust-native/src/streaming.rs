@@ -488,7 +488,7 @@ pub(crate) mod test_support {
                         let _ = reply.send(ControlStatus::Ok);
                         Rec::Other
                     }
-                    ControlCommand::ClearVramSlots { reply } => {
+                    ControlCommand::ClearVramSlots { reply, .. } => {
                         let _ = reply.send(ControlStatus::Ok);
                         Rec::Other
                     }
