@@ -9,14 +9,11 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 /**
- * 视频渲染捕获总调度器
- * 负责主渲染线程的帧率节拍控制 (Pacing)、双管道 (VRAM Direct / RAM Readback) 的可用性裁定与断路器降级。
+ * 主渲染线程的视频采集调度器：帧率节拍、双管线 (VRAM Direct / RAM Readback) 裁定与断路器降级。
  *
- * 降级条件分两种：构造期失败立即降级；运行期只有**连续** {@code FAILURE_THRESHOLD} 帧
- * {@code Failed}（管线抛出异常同样折算为 {@code Failed}）才熔断，{@code Delivered} 与
- * {@code Dropped}（槽位全在途等主动丢帧）一律清零、不计入。
- *
- * 实例自身不持有任何静态状态，生命周期由 VistrelService 统一管理。
+ * <p>构造期失败立即降级；运行期只有**连续** {@code FAILURE_THRESHOLD} 帧 {@code Failed}
+ * （异常同样折算）才熔断，{@code Delivered} / {@code Dropped} 一律清零。
+ * 生命周期由 VistrelService 统一管理。
  */
 public class VideoCaptureScheduler {
     private final EncoderChannel channel;
@@ -30,18 +27,17 @@ public class VideoCaptureScheduler {
      * 驱动，TORN_DOWN 为终态（迟到的会话广播在此丢弃）。单字段单写者，无需同步原语
      */
     private CaptureState state = CaptureState.IDLE;
-    private VideoPipeline ramPipeline = null;
-    private VideoPipeline vramPipeline = null;
+    private FrameSource ramPipeline = null;
+    private FrameSource vramPipeline = null;
     /**
      * 当前会话状态的读取口：唤醒只入队，渲染线程任务执行时才求值
      */
     private final Supplier<SessionServer.SessionState> sessionState;
     /**
-     * 当前管线采集尺寸；宽高 0 表示尚无可用管线，几何变化必须重建
-     * codec 会话期内固定（SDP 只协商一次），不参与重建判定。
+     * 最近一次已对账的快照：既是去重锚点，也是管线寿命的基线。
+     * 快照不可变且每次变更整体替换，引用相同即无需重复应用
      */
-    private int pipelineWidth = 0;
-    private int pipelineHeight = 0;
+    private SessionServer.SessionState appliedState = null;
     /**
      * 编码停滞自愈回调：显存管线心跳超时或导入报「编码器不可用」时在渲染线程调用，
      * 实现方必须立即移交后台线程。测试与未装配场景用空实现占位
@@ -113,7 +109,7 @@ public class VideoCaptureScheduler {
         this.sessionState = Objects.requireNonNull(sessionState, "会话状态读取口不能为空");
     }
 
-    protected VideoPipeline createRamPipeline(int width, int height) {
+    protected FrameSource createRamPipeline(int width, int height) {
         //? if gpu_device {
         return new RenderpearlRamPipeline(this.channel, width, height);
         //? } else {
@@ -121,9 +117,9 @@ public class VideoCaptureScheduler {
         //? }
     }
 
-    protected VideoPipeline createVramPipeline(int width, int height) {
+    protected FrameSource createVramPipeline(int width, int height, SessionServer.EncoderGeneration generation) {
         //? if vulkan_backend {
-        return new RenderpearlVramPipeline(this.channel, width, height, this.encoderStallListener);
+        return new RenderpearlVramPipeline(this.channel, width, height, generation, this.encoderStallListener);
         //? } else {
         /*// 纯 OpenGL 后端（1.20/1.21 线与 26.1）明确不支持显存直通，统一走双 PBO 内存回读管线
         return null;*/
@@ -131,20 +127,66 @@ public class VideoCaptureScheduler {
     }
 
     /**
-     * 会话状态变更入口（协调器唤醒）：只入队，渲染线程任务执行时现读
+     * 把显存管线的槽位导入重新绑定到新编码器代次。
+     *
+     * <p>{@code rebind} 只属于显存直通管线，不抬进 {@link FrameSource} 通用接口；测试替身
+     * 可覆写本钩子，生产路径直接调用具体管线的公开方法。
+     *
+     * @param pipeline 当前显存管线
+     * @param generation 新编码器代次
      */
-    public void applySessionState() {
-        runOnRenderThread(() -> applyState(sessionState.get()));
+    protected void rebindVramPipeline(FrameSource pipeline, SessionServer.EncoderGeneration generation) {
+        //? if vulkan_backend {
+        ((RenderpearlVramPipeline) pipeline).rebind(generation);
+        //? } else {
+        /*throw new UnsupportedOperationException("当前版本不支持显存直通");*/
+        //? }
     }
 
     /**
-     * 按当下会话状态落地采集：无会话 / 内容丢失停采释放，活跃则重建或复用管线
+     * 会话状态变更入口（协调器唤醒）：只入队，渲染线程任务执行时现读。
+     * 唤醒只是低延迟提示，正确性在 {@link #capture()} 的动作点对账上
+     */
+    public void applySessionState() {
+        runOnRenderThread(this::reconcile);
+    }
+
+    /**
+     * 动作点对账：读当下快照并落地管线。监听器唤醒可能迟到或丢失，
+     * 采集路径每帧也走这里，旧管线不会因投递顺序而滞留
+     */
+    private void reconcile() {
+        SessionServer.SessionState now;
+        try {
+            now = sessionState.get();
+        } catch (Throwable t) {
+            Constants.LOG.error("读取会话状态失败，保持当前采集状态: {}", t.getMessage());
+            return;
+        }
+        try {
+            applyState(now);
+        } catch (Throwable t) {
+            // 渲染线程最后一道防线：对账异常不得掀翻主循环
+            Constants.LOG.error("应用会话状态异常: {}", t.getMessage(), t);
+        }
+    }
+
+    /**
+     * 按当下会话状态落地采集：无会话 / 内容丢失停采释放，活跃则按各自寿命复用或重建管线。
+     *
+     * <p>寿命判定以 {@link #appliedState} 的上一份快照为基线：每个 (代次, 几何) 只尝试一次，
+     * 失败后等下一次快照变化，不在每个渲染 tick 反复重试。
      */
     private void applyState(SessionServer.SessionState state) {
         if (this.state == CaptureState.TORN_DOWN) {
             // teardown 之后才落地的任务：管线必须保持已释放，泄漏防线
             return;
         }
+        if (state == appliedState) {
+            return;
+        }
+        SessionServer.SessionState previous = appliedState;
+        appliedState = state;
         if (state == null || state.phase() != SessionServer.Phase.STREAMING) {
             // 无会话或内容丢失：停采并释放管线（音频不受影响）
             this.state = CaptureState.IDLE;
@@ -164,54 +206,79 @@ public class VideoCaptureScheduler {
             this.throttler.setFps(tier.fps());
         }
         this.state = CaptureState.CAPTURING;
+        // 非 STREAMING 时管线已在当时释放，恢复必须整体重建
+        boolean wasStreaming = previous != null && previous.phase() == SessionServer.Phase.STREAMING;
+        boolean geometryChanged =
+                !wasStreaming || previous.tier().width() != width || previous.tier().height() != height;
+        boolean generationChanged = !wasStreaming || previous.generation() != state.generation();
+        // 1. RAM 回读：只随几何变化重建；编码器代次变化不影响系统内存帧
+        if (geometryChanged) {
+            closeRamPipeline();
+            this.ramFailureGate.reset();
+            try {
+                this.ramPipeline = createRamPipeline(width, height);
+            } catch (Throwable t) {
+                Constants.LOG.error("构建 RAM 回读管线异常: {}", t.getMessage(), t);
+            }
+        }
+        // 2. 显存直通：几何变化重建，代次变化只重绑
+        //    能力开关在调度器生命周期内恒定（配置快照 + caps 缓存）；晚就绪只随新编码器代次出现
         boolean vramDirectEnabled = resolveVramDirect(state.hardware());
-        // 只变了帧率：尺寸没变且管线还在，直接复用（停采后管线已释放，自然不会命中）；
-        // 能力从 false 变 true 时必须重建
-        boolean vramSettled = vramDirectEnabled ? vramPipeline != null || vramBreaker.isTripped() : vramPipeline == null;
-        if (width == pipelineWidth && height == pipelineHeight && ramPipeline != null && vramSettled) {
+        if (!vramDirectEnabled) {
+            closeVramPipeline();
             return;
         }
-
-        cleanupPipelines();
-        // 换了尺寸 = 换了管线：断路器状态与连续失败数不能带过来，
-        // 否则重建后可能被上次的失败记录立刻误判成故障
-        this.vramBreaker.reset();
-        this.ramFailureGate.reset();
-        // 1. 优先构建兜底保障的 RAM 回读管道
-        try {
-            this.ramPipeline = createRamPipeline(width, height);
-        } catch (Throwable t) {
-            Constants.LOG.error("构建 RAM 回读管道异常: {}", t.getMessage(), t);
-        }
-        // 2. 构造期就定死显存直通 (VRAM Direct) 能不能用：结构性失败即永久降级，
-        //    本次会话不再重试
-        if (vramDirectEnabled && !this.vramBreaker.isTripped()) {
+        if (geometryChanged || (this.vramPipeline == null && generationChanged)) {
+            // 新几何 / 新代次：断路器与连续失败数不能带过来，
+            // 否则重建后可能被上次的失败记录立刻误判成故障
+            this.vramBreaker.reset();
+            closeVramPipeline();
             try {
-                this.vramPipeline = createVramPipeline(width, height);
+                this.vramPipeline = createVramPipeline(width, height, state.generation());
                 if (this.vramPipeline == null) {
                     demoteVram("当前版本不支持显存直通");
                 }
             } catch (EncoderChannel.ControlException t) {
                 this.vramPipeline = null;
-                if (t.code == EncoderChannel.CONTROL_NO_HARDWARE_ENCODER
-                        || t.code == EncoderChannel.CONTROL_ENCODER_BUILD_FAILED) {
-                    // 编码器不在了：降级采集救不了没有编码器的流，唯一恢复路径
-                    // 是整引擎自愈重启（重新探测硬件并重新协商）。
-                    // 建成失败（探测说有、实际建不出来）与探测不到硬编同属「无编码器可用」
-                    Constants.LOG.error("显存直通构建失败：{}，触发编码停滞自愈", t.getMessage());
-                    this.encoderStallListener.run();
-                } else {
-                    // 槽位注册失败等故障：编码器仍在，降级 RAM 照常续流
-                    demoteVram("构造期未就绪: " + t.getMessage());
-                }
+                handleVramControlFailure(t);
             } catch (Throwable t) {
                 this.vramPipeline = null;
-                demoteVram("构造期未就绪: " + t.getMessage());
+                demoteVram("显存直通未就绪: " + t.getMessage());
+            }
+            return;
+        }
+        if (this.vramPipeline != null && generationChanged) {
+            // 同几何新代次：导出资源可原样复用，只把槽位导入重新绑定到新编码器代次
+            this.vramBreaker.reset();
+            try {
+                rebindVramPipeline(this.vramPipeline, state.generation());
+            } catch (EncoderChannel.ControlException t) {
+                closeVramPipeline();
+                handleVramControlFailure(t);
+            } catch (Throwable t) {
+                closeVramPipeline();
+                demoteVram("重新绑定失败: " + t.getMessage());
             }
         }
+    }
 
-        this.pipelineWidth = width;
-        this.pipelineHeight = height;
+    /**
+     * 显存管线控制面失败：编码器不在了就触发整引擎自愈，否则降级 RAM 续流。
+     */
+    private void handleVramControlFailure(EncoderChannel.ControlException t) {
+        if (t.encoderUnavailable()) {
+            // 编码器不在了：降级救不了没有编码器的流，只能整引擎自愈重启；
+            // 建成失败与探测不到同属「无编码器可用」
+            Constants.LOG.error("显存直通就绪失败：{}，触发编码停滞自愈", t.getMessage());
+            try {
+                this.encoderStallListener.run();
+            } catch (Throwable callbackError) {
+                Constants.LOG.error("编码停滞自愈回调异常: {}", callbackError.getMessage());
+            }
+        } else {
+            // 槽位注册失败等故障：编码器仍在，降级 RAM 照常续流
+            demoteVram("显存直通未就绪: " + t.getMessage());
+        }
     }
 
     /**
@@ -263,12 +330,13 @@ public class VideoCaptureScheduler {
     /**
      * 采集一帧并直接推流
      *
-     * 三种结果各有明确处理：{@code Delivered} 已投递、{@code Dropped} 主动丢帧（刻意不回落 RAM）、
-     * {@code Failed} 回落下一级并累计连续失败。异常一律算作 {@code Failed}，绝不允许逃逸到渲染线程。
+     * 异常一律折算为 {@code Failed}，绝不逃逸到渲染线程；{@code Dropped} 是主动丢帧，不回落 RAM。
      *
      * @return 本帧是否已投递；false 表示无推流会话、被节流拦截、主动丢帧
      */
     public boolean capture() {
+        // 动作点对账：监听器唤醒可能迟到或丢失，管线身份以这里读到的快照为准
+        reconcile();
         if (this.state != CaptureState.CAPTURING) {
             CaptureProfiler.count(CaptureProfiler.Counter.SCHEDULER_IDLE);
             return false;
@@ -289,12 +357,12 @@ public class VideoCaptureScheduler {
     private boolean dispatchCapture() {
         // Level 1: 显存直通 (VRAM Direct)
         if (vramPipeline != null) {
-            VideoPipeline.CaptureOutcome outcome;
+            FrameSource.CaptureOutcome outcome;
             try {
                 outcome = vramPipeline.capture();
             } catch (Throwable t) {
                 Constants.LOG.error("{} 采集抛出异常: {}", VRAM_LABEL, t.getMessage());
-                outcome = VideoPipeline.CaptureOutcome.Failed;
+                outcome = FrameSource.CaptureOutcome.Failed;
             }
             if (vramBreaker.record(outcome)) {
                 demoteVram(vramBreaker.streak() + " 帧连续采集失败");
@@ -314,15 +382,13 @@ public class VideoCaptureScheduler {
         }
         // Level 2: 内存回读 (RAM Readback)
         if (ramPipeline != null) {
-            VideoPipeline.CaptureOutcome outcome = captureRamSafely();
-            if (outcome == VideoPipeline.CaptureOutcome.Delivered) {
+            FrameSource.CaptureOutcome outcome = captureRamSafely();
+            if (outcome == FrameSource.CaptureOutcome.Delivered) {
                 CaptureProfiler.count(CaptureProfiler.Counter.RAM_DELIVERED);
                 return true;
             }
             CaptureProfiler.count(
-                    outcome == VideoPipeline.CaptureOutcome.Dropped
-                    ? CaptureProfiler.Counter.RAM_DROPPED
-                    : CaptureProfiler.Counter.RAM_FAILED
+                    outcome == FrameSource.CaptureOutcome.Dropped ? CaptureProfiler.Counter.RAM_DROPPED : CaptureProfiler.Counter.RAM_FAILED
             );
             return false;
         }
@@ -334,14 +400,14 @@ public class VideoCaptureScheduler {
     /**
      * 采一帧内存回读：异常折算为 {@code Failed} 且不逃逸，首条异常报一次
      */
-    private VideoPipeline.CaptureOutcome captureRamSafely() {
+    private FrameSource.CaptureOutcome captureRamSafely() {
         try {
             return ramPipeline.capture();
         } catch (Throwable t) {
             if (ramFailureGate.tryFire()) {
                 Constants.LOG.error("{} 采集抛出异常: {}", RAM_LABEL, t.getMessage());
             }
-            return VideoPipeline.CaptureOutcome.Failed;
+            return FrameSource.CaptureOutcome.Failed;
         }
     }
 
@@ -352,6 +418,10 @@ public class VideoCaptureScheduler {
         this.vramBreaker.trip();
         CaptureProfiler.count(CaptureProfiler.Counter.VRAM_DEMOTED);
         Constants.LOG.warn("显存直通 (VRAM Direct) 永久降级到 RAM 回读: {}", reason);
+        closeVramPipeline();
+    }
+
+    private void closeVramPipeline() {
         if (this.vramPipeline != null) {
             try {
                 this.vramPipeline.close();
@@ -361,14 +431,7 @@ public class VideoCaptureScheduler {
         }
     }
 
-    private void cleanupPipelines() {
-        if (this.vramPipeline != null) {
-            try {
-                this.vramPipeline.close();
-            } catch (Throwable ignored) {
-            }
-            this.vramPipeline = null;
-        }
+    private void closeRamPipeline() {
         if (this.ramPipeline != null) {
             try {
                 this.ramPipeline.close();
@@ -376,9 +439,11 @@ public class VideoCaptureScheduler {
             }
             this.ramPipeline = null;
         }
-        // 管线已销毁，几何随之失效：下一次推送必须重建，不能走复用分支
-        this.pipelineWidth = 0;
-        this.pipelineHeight = 0;
+    }
+
+    private void cleanupPipelines() {
+        closeVramPipeline();
+        closeRamPipeline();
     }
 
     /**
@@ -461,11 +526,11 @@ public class VideoCaptureScheduler {
          *
          * @return 本次是否恰好熔断；已熔断的实例此后一直返回 false（熔断只需告警一次）
          */
-        boolean record(VideoPipeline.CaptureOutcome outcome) {
+        boolean record(FrameSource.CaptureOutcome outcome) {
             if (this.tripped) {
                 return false;
             }
-            if (outcome != VideoPipeline.CaptureOutcome.Failed) {
+            if (outcome != FrameSource.CaptureOutcome.Failed) {
                 this.streak = 0;
                 return false;
             }

@@ -84,11 +84,7 @@ class RenderpearlCaptureContractTest {
         // 计入断路器、把 Dropped 视为管线健康，语义不可互换
         RenderpearlRamPipeline pipeline = new RenderpearlRamPipeline((EncoderChannel) null, 1280, 720);
         try {
-            Assertions.assertEquals(
-                    VideoPipeline.CaptureOutcome.Dropped,
-                    pipeline.capture(),
-                    "无设备构造的管线必须按主动丢帧处理，不得上报故障"
-            );
+            Assertions.assertEquals(FrameSource.CaptureOutcome.Dropped, pipeline.capture(), "无设备构造的管线必须按主动丢帧处理，不得上报故障");
         } finally {
             pipeline.close();
         }

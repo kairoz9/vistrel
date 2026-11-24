@@ -51,6 +51,8 @@ pub(crate) enum ControlStatus {
     /// 硬编建成失败：探测认证过的候选后端全部建不起来。与 `NoHardwareEncoder`
     /// 的区别是后者表示「本机探测不到硬编」，本码表示「探测说有，实际建不出来」
     EncoderBuildFailed = 9,
+    /// 显存绑定轮次已前移：调用方持有的槽位导入令牌属于旧绑定，整批拒绝
+    StaleBinding = 10,
 }
 
 /// 控制命令
@@ -84,11 +86,15 @@ pub(crate) enum ControlCommand {
     },
     /// 导入显存直通槽位
     ImportVramSlots {
+        binding_epoch: u64,
         slots: Vec<VramSlotDescriptor>,
         reply: SyncSender<ControlStatus>,
     },
     /// 释放槽位表但保持编码器存活
-    ClearVramSlots { reply: SyncSender<ControlStatus> },
+    ClearVramSlots {
+        binding_epoch: u64,
+        reply: SyncSender<ControlStatus>,
+    },
 }
 
 /// 控制面发送端
@@ -195,17 +201,25 @@ impl ControlSender {
     /// 一起拖死，直接回 [`ControlStatus::QueueFull`] 让调用方走各自的降级分支。
     pub(crate) fn import_vram_slots(
         &self,
+        binding_epoch: u64,
         slots: Vec<VramSlotDescriptor>,
     ) -> Result<(), ControlStatus> {
-        self.ask_blocking(|reply| ControlCommand::ImportVramSlots { slots, reply })
+        self.ask_blocking(|reply| ControlCommand::ImportVramSlots {
+            binding_epoch,
+            slots,
+            reply,
+        })
     }
 
     /// 释放槽位表但保持硬件编码器存活（ask）
     ///
     /// 次序是「先尝试排空设备队列、再丢弃导入」：最后一帧的跨 API 回执还在队列上，先丢弃导入
     /// 会让它写到已弃掉的信号量上。排空失败只记日志、不进结果码——`Ok` 只表示槽位已释放。
-    pub(crate) fn clear_vram_slots(&self) -> Result<(), ControlStatus> {
-        self.ask_blocking(|reply| ControlCommand::ClearVramSlots { reply })
+    pub(crate) fn clear_vram_slots(&self, binding_epoch: u64) -> Result<(), ControlStatus> {
+        self.ask_blocking(|reply| ControlCommand::ClearVramSlots {
+            binding_epoch,
+            reply,
+        })
     }
 
     /// 非阻塞入队并唤醒 Actor
@@ -294,7 +308,7 @@ mod tests {
                 ControlCommand::ImportVramSlots { reply, .. } => {
                     let _ = reply.send(ControlStatus::Ok);
                 }
-                ControlCommand::ClearVramSlots { reply } => {
+                ControlCommand::ClearVramSlots { reply, .. } => {
                     let _ = reply.send(ControlStatus::Ok);
                 }
                 ControlCommand::Retier { reply, .. } => {
@@ -325,7 +339,7 @@ mod tests {
     #[test]
     fn test_ask_code_is_answered() {
         let (sender, recorded) = recording_actor();
-        assert_eq!(sender.clear_vram_slots(), Ok(()));
+        assert_eq!(sender.clear_vram_slots(1), Ok(()));
         assert_eq!(
             recorded.recv_timeout(Duration::from_secs(1)).unwrap(),
             "clear_vram_slots"
@@ -339,7 +353,7 @@ mod tests {
         drop(rx);
         let sender = ControlSender::new(tx, bell);
         assert_eq!(
-            sender.clear_vram_slots(),
+            sender.clear_vram_slots(1),
             Err(ControlStatus::ActorDead),
             "没有接收端时必须报管线已死，绝不能报成功"
         );
@@ -355,7 +369,7 @@ mod tests {
         let bell = Arc::new(Notify::new());
         let sender = ControlSender::new(tx, bell);
         let start = Instant::now();
-        assert_eq!(sender.clear_vram_slots(), Err(ControlStatus::QueueFull));
+        assert_eq!(sender.clear_vram_slots(1), Err(ControlStatus::QueueFull));
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "队列满必须立即返回，不得阻塞调用方"
@@ -383,13 +397,13 @@ mod tests {
         let held = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&held);
         let sender = fake_actor(move |cmd| {
-            if let ControlCommand::ClearVramSlots { reply } = cmd {
+            if let ControlCommand::ClearVramSlots { reply, .. } = cmd {
                 sink.lock().unwrap().push(reply);
             }
         })
         .with_ack_timeout(Duration::from_millis(50));
         let start = Instant::now();
-        assert_eq!(sender.clear_vram_slots(), Err(ControlStatus::AckTimeout));
+        assert_eq!(sender.clear_vram_slots(1), Err(ControlStatus::AckTimeout));
         assert!(start.elapsed() < Duration::from_secs(1), "超时必须按时返回");
         drop(held);
     }

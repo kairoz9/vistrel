@@ -31,7 +31,7 @@ import java.nio.ByteBuffer;
 import java.util.Optional;
 
 /**
- * 基于 Mojang 设备抽象 API (GpuDevice) 的双缓冲 (Ping-Pong) 异步 DMA 内存回读管道（26.1+，跨 blaze3d/renderpearl 两代）
+ * 基于 Mojang 设备抽象 API (GpuDevice) 的双缓冲 (Ping-Pong) 异步 DMA 内存回读管线（26.1+，跨 blaze3d/renderpearl 两代）
  * 源码恒以 26.3 renderpearl 形态落笔，26.1/26.2 视图由 replacements 表换装为 blaze3d 限定名
  * RAII：构造即初始化双 PBO 与 Blit 纹理，捕获、投递与缓冲区映射的生命周期都在本类内管理。
  * 线程归属：capture 与 close 均在渲染线程执行（stop 会把拆除投递到渲染线程）
@@ -40,7 +40,7 @@ import java.util.Optional;
  * 自建 NV12 管线的 GLSL 以字符串内联（见 {@link BlitPipelines}），经设备源码注入接口编译，
  * 与资源重载状态完全解耦，无启动窗口限制。
  */
-public class RenderpearlRamPipeline implements VideoPipeline {
+public class RenderpearlRamPipeline implements FrameSource {
     private final EncoderChannel channel;
     private final GpuDevice device;
     private final CommandEncoder encoder;

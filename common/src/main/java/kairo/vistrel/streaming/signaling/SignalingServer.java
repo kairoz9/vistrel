@@ -794,6 +794,10 @@ public class SignalingServer {
                             msg.backend()
             );
             if (answerJson != null && !answerJson.isEmpty()) {
+                // 已被新连接抢占：旧会话迟到的 Answer 不得落账
+                if (activeChannel.get() != ctx.channel() || !ctx.channel().isActive()) {
+                    return;
+                }
                 // Answer 落账并广播初始档位；其实际档位即显示几何初值，记账后等值唤醒不再推送
                 SessionServer.Tier settled = profileCoordinator.noteOfferAnswer(answerJson, bpp);
                 if (settled != null) {

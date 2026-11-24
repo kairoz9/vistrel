@@ -18,10 +18,10 @@ import org.lwjgl.opengl.GL33;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 
-// 历史版本 OpenGL 双 PBO 内存回读管道（26.1 起由 GpuDevice 管线接管）
+// 历史版本 OpenGL 双 PBO 内存回读管线（26.1 起由 GpuDevice 管线接管）
 // RAII：构造即初始化双 PBO 与 NV12 两平面目标，捕获、投递与解映射都在本类内完成
 // 不加锁：capture 与 close 均在渲染线程执行（stop 会把拆除投递到渲染线程）
-public class OpenGlRamPipeline implements VideoPipeline {
+public class OpenGlRamPipeline implements FrameSource {
     private final EncoderChannel channel;
     private final int width;
     private final int height;

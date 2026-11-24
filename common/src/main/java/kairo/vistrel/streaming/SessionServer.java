@@ -79,34 +79,41 @@ public interface SessionServer {
     record Tier(int width, int height, int fps, double bpp) {}
 
     /**
-     * 会话控制面状态：后端身份、内容相位与生效档位；{@code null} = 无会话
+     * 一个已协商建成的编码器代次：backend + codec，对象身份即控制面会话代次。
      *
-     * <p>后端身份只在协商落账时写入，此后只经 {@link #withPhase} / {@link #withTier} 原样携带。
-     * 消费者在动作点经 {@code ProfileCoordinator#current()} 读当下状态。
-     *
-     * @param backend 协商应答的线上后端词汇（nvenc / vulkan_video / software）
-     * @param phase   内容相位
-     * @param tier    生效档位
+     * <p>每次 offer 落账新建；{@link SessionState#withPhase} / {@link SessionState#withTier}
+     * 原样携带。故意不覆写 {@code equals} / {@code hashCode}：backend/codec 相同也是不同代次，
+     * 在途 ask 与采集侧按引用区分。Native 绑定是否失效由共享块 {@code bindingEpoch} 回答。
      */
-    record SessionState(String backend, Phase phase, Tier tier) {
+    final class EncoderGeneration {
+        private final String backend;
+        private final String codec;
+
         /**
-         * 同会话的相位替换，其余字段原样保留
-         *
-         * @param next 目标相位
-         * @return 新实例
+         * @param backend 协商应答的线上后端词汇（nvenc / vulkan_video / software）
+         * @param codec   协商应答的 codec 线上令牌（h264 / h265 / av1）；缺失时为空串
          */
-        public SessionState withPhase(Phase next) {
-            return new SessionState(backend, next, tier);
+        public EncoderGeneration(String backend, String codec) {
+            this.backend = backend;
+            this.codec = codec;
         }
 
         /**
-         * 同会话的档位替换，其余字段原样保留
+         * 协商后端词汇
          *
-         * @param next 目标档位
-         * @return 新实例
+         * @return 线上后端令牌；应答缺失时为 {@code null}
          */
-        public SessionState withTier(Tier next) {
-            return new SessionState(backend, phase, next);
+        public String backend() {
+            return backend;
+        }
+
+        /**
+         * 协商 codec 令牌
+         *
+         * @return 线上 codec 令牌；缺失时为空串
+         */
+        public String codec() {
+            return codec;
         }
 
         /**
@@ -116,6 +123,55 @@ public interface SessionServer {
          */
         public boolean hardware() {
             return "nvenc".equals(backend) || "vulkan_video".equals(backend);
+        }
+
+        @Override
+        public String toString() {
+            return backend + "/" + codec;
+        }
+    }
+
+    /**
+     * 会话控制面状态：编码器代次、内容相位与生效档位；{@code null} = 无会话
+     *
+     * <p>编码器代次只在协商落账时写入，此后只经 {@link #withPhase} / {@link #withTier}
+     * 原样携带。消费者在动作点经 {@code ProfileCoordinator#current()} 读当下状态。
+     *
+     * <p>显存绑定的失效由 Native 共享块 {@code bindingEpoch} 决定，不看本对象；
+     * 几何由 {@link Tier} 承载，fps/bpp 变化不重建显存绑定。
+     *
+     * @param generation 编码器代次（backend + codec）
+     * @param phase      内容相位
+     * @param tier       生效档位
+     */
+    record SessionState(EncoderGeneration generation, Phase phase, Tier tier) {
+        /**
+         * 同会话的相位替换，编码器代次与档位原样保留
+         *
+         * @param next 目标相位
+         * @return 新实例
+         */
+        public SessionState withPhase(Phase next) {
+            return new SessionState(generation, next, tier);
+        }
+
+        /**
+         * 同会话的档位替换，编码器代次与相位原样保留
+         *
+         * @param next 目标档位
+         * @return 新实例
+         */
+        public SessionState withTier(Tier next) {
+            return new SessionState(generation, phase, next);
+        }
+
+        /**
+         * 是否为硬件编码
+         *
+         * @return 编码器代次落到硬编时为 true
+         */
+        public boolean hardware() {
+            return generation.hardware();
         }
     }
 }

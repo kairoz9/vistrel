@@ -1,10 +1,14 @@
 package kairo.vistrel.capture;
 
 /**
- * 视频画面采集管道统一接口
- * 遵循 RAII 规范：构造即就绪，负责从 Minecraft 渲染管线抓取画面并直接推流至 EncoderChannel。
+ * 单帧画面来源：从 Minecraft 渲染管线取得画面并直接投递至 EncoderChannel。
+ *
+ * <p>遵循 RAII：构造即就绪，{@link #close()} 释放全部显存与缓冲资源。实现分两类：
+ * RAM 回读管线（{@code RenderpearlRamPipeline} / {@code OpenGlRamPipeline}）经系统内存
+ * 投递，只随几何变化；VRAM 直通管线（{@code RenderpearlVramPipeline}）经外部显存槽位
+ * 投递，除几何外还绑定编码器代次。
  */
-public interface VideoPipeline extends AutoCloseable {
+public interface FrameSource extends AutoCloseable {
     /**
      * 单帧采集结果。
      */
@@ -18,7 +22,7 @@ public interface VideoPipeline extends AutoCloseable {
          */
         Dropped,
         /**
-         * 管线不可用：未就绪、拿不到必要句柄或内部异常
+         * 来源不可用：未就绪、拿不到必要句柄或内部异常
          */
         Failed
     }

@@ -1,11 +1,12 @@
 package kairo.vistrel.streaming;
 
 import java.nio.ByteBuffer;
+import java.util.List;
 
 /**
- * 推流数据面编码通道：面向 Native 编码管线的下行媒体投递（系统内存帧、音频 PCM、
- * 显存槽位）与编码能力查询。上行输入事件由 {@link kairo.vistrel.input.InputEventSource}
- * 端口承载，数据面实现同时提供两个面。
+ * 推流数据面端口：系统内存帧、音频 PCM 与显存直通会话的投递入口，以及编码能力查询。
+ * 上行输入事件由 {@link kairo.vistrel.input.InputEventSource} 端口承载，数据面实现
+ * 同时提供两个面。
  */
 public interface EncoderChannel {
     /**
@@ -29,7 +30,7 @@ public interface EncoderChannel {
      * 本机编码能力快照，拉式纯读，无等待、无设备调用
      *
      * <p>
-     * 会话实际在跑什么由 {@link SessionServer.SessionState#backend()} 承载。
+     * 会话实际在跑什么由 {@link SessionServer.EncoderGeneration#backend()} 承载。
      *
      * @return 能力快照，不为 {@code null}
      */
@@ -38,133 +39,91 @@ public interface EncoderChannel {
     }
 
     /**
-     * 显存槽位扁平协议的每槽位 long 数。与 Native 侧 {@code cuda::FLAT_STRIDE}
-     * 是同一条约定的两端，改动必须同步。
+     * 把当前导出资源整批绑定到 Native 编码器。
      *
-     * <p>
-     * 每槽位 7 元组:
-     * <ol>
-     * <li>{@code [0] slotIdx} —— 槽位索引，多槽位循环复用</li>
-     * <li>{@code [1] memHandle} —— 外部显存句柄；OpenGL 后端为 GL 纹理 ID</li>
-     * <li>{@code [2] semHandle} —— 时间线信号量句柄；OpenGL 后端无信号量，固定为 0</li>
-     * <li>{@code [3] width} —— 纹理宽度（像素）</li>
-     * <li>{@code [4] height} —— 纹理高度（像素）</li>
-     * <li>{@code [5] sizeBytes} —— 外部显存总大小（字节）；OpenGL 后端固定为 0</li>
-     * <li>{@code [6] offset} —— 纹理在外部显存中的字节偏移；OpenGL 后端固定为 0</li>
-     * </ol>
-     * 数组长度不是本值的整数倍时，整批拒绝并返回 {@link #CONTROL_MALFORMED_BATCH}。
-     */
-    int VRAM_SLOT_STRIDE = 7;
-    /**
-     * 控制结果码：数值与 Rust 侧 {@code encode::control::ControlError} 的判别值一一对应
-     * （{@code rust-native/src/encode/control.rs}），改一处必须同步另一处。
+     * <p>整批处理：要么全成要么全败。绑定只对导入时的绑定轮次有效；编码器重建后
+     * 旧绑定的推送在 Native 入口丢弃，调用方应在新绑定轮次上重新导入。
      *
-     * {@link #CONTROL_RECONFIGURE_FAILED} 目前只在 Native 内部产生（档位重配失败的会话内上报），
-     * 还没有 JNI 出口能把它带回 Java；补齐它是为了码表与 Rust 枚举保持一对一。
+     * @param slots 槽位描述，索引与几何由调用方与 Native 双重校验
+     * @return 已导入的显存绑定
+     * @throws UnsupportedOperationException 实现不支持显存直通
+     * @throws ControlException              Native 拒绝整批导入
      */
-    int CONTROL_OK = 0;
-    int CONTROL_MALFORMED_BATCH = 1;
-    int CONTROL_NO_HARDWARE_ENCODER = 2;
-    int CONTROL_IMPORT_FAILED = 3;
-    int CONTROL_PIPELINE_DEAD = 4;
-    int CONTROL_ACK_TIMEOUT = 5;
-    int CONTROL_RECONFIGURE_FAILED = 6;
-    int CONTROL_QUEUE_FULL = 7;
-    int CONTROL_RELEASE_FAILED = 8;
-    int CONTROL_ENCODER_BUILD_FAILED = 9;
-
-    /**
-     * 控制结果码转可读原因
-     */
-    static String describeControlResult(int code) {
-        return switch (code) {
-            case CONTROL_OK -> "成功";
-            case CONTROL_MALFORMED_BATCH -> "槽位批量协议错位 (数组长度不是每槽位 long 数的整数倍)";
-            case CONTROL_NO_HARDWARE_ENCODER -> "本机无可用硬件编码器";
-            case CONTROL_IMPORT_FAILED -> "外部显存或时间线信号量导入失败 (整批已回滚)";
-            case CONTROL_PIPELINE_DEAD -> "编码管线已死 (fail-closed)";
-            case CONTROL_ACK_TIMEOUT -> "Actor ACK 超时";
-            case CONTROL_RECONFIGURE_FAILED -> "档位重配被编码线程拒绝 (编码器重配失败，档位保持不变)";
-            case CONTROL_QUEUE_FULL -> "控制队列已满 (编码线程已卡住不消费)";
-            case CONTROL_RELEASE_FAILED -> "注销前排空失败 (导入引用与槽位表已保留)";
-            case CONTROL_ENCODER_BUILD_FAILED -> "编码器建成失败 (候选后端全部创建失败，详见日志)";
-            default -> "未知错误码 " + code;
-        };
-    }
-
-    /**
-     * 控制命令失败的异常载体，消费方按 {@link #code} 对表分支
-     */
-    class ControlException extends IllegalStateException {
-        public final int code;
-
-        public ControlException(String message, int code) {
-            super(message);
-            this.code = code;
-        }
-    }
-
-    /**
-     * 显存槽位租约 (RAII)：由 {@link #importVramSlots(long[])} 成功后返回，
-     * 投递与注销都挂在租约上——没注册就拿不到租约，不 close 就完不成注销。
-     *
-     * <p>
-     * 线程约定：push 在渲染线程调用；close 幂等，且必须在销毁槽位纹理/信号量之前
-     * 调用（先停写者、再释放资源的固定次序），所以不做 Cleaner 兜底。
-     * close 后再 push 属编程错误，抛 {@link IllegalStateException}。
-     */
-    interface SlotLease extends AutoCloseable {
-        /**
-         * 向 Native 引擎直通投递一帧已注册槽位（单向投递，不等待编码结果）。
-         *
-         * @param slotIdx   显存环形缓冲区的槽位索引 (0 &lt;= slotIdx &lt; SLOT_COUNT)
-         * @param signalVal 本帧与 GPU 提交流原子绑定的时间线信号量信号值
-         */
-        void push(int slotIdx, long signalVal);
-
-        /**
-         * {@link #close()} 之后查询原生侧是否确认完成槽位注销。
-         *
-         * <p>
-         * 返回 {@code false} 表示注销没得到编码线程确认（ACK 超时 / 控制队列满 / 排空失败）：
-         * 编码器可能还在读这些导出资源，此时销毁游戏侧的纹理/信号量/导出池是驱动层
-         * 未定义行为。必须把这些资源留着不销毁（GpuTexture 没有 Cleaner，丢掉引用不会
-         * 触发释放），等引擎关停时随 VkDevice 一起回收。返回 {@code true} 才能继续销毁。
-         */
-        default boolean isReleased() {
-            return true;
-        }
-
-        @Override
-        void close();
-    }
-
-    /**
-     * 批量导入外部显存槽位与同步原语，成功返回租约。
-     *
-     * <p>
-     * <b>整批处理</b>：要么全成要么全败。任一槽位导入失败即整批回滚，
-     * 整体回退 RAM 回读采集。失败抛 {@link ControlException}，
-     * 可读原因见 {@link #describeControlResult(int)}。
-     *
-     * @param slots 扁平协议数组，长度必须是 {@link #VRAM_SLOT_STRIDE} 的整数倍
-     */
-    default SlotLease importVramSlots(long[] slots) {
+    default VramBinding bindVram(List<VramSlotDescriptor> slots) {
         throw new UnsupportedOperationException("此通道不支持显存直通");
     }
 
     /**
-     * 取当前活跃引擎的槽位所有权共享块（64 字节，原生端序 DirectBuffer）
+     * 一个可被 Native 硬件编码器导入的显存槽位描述。
      *
-     * <p>
-     * 布局：{@code [0..32) = busy[8] int 位}（1 = Java 已认领且未归还）、
-     * {@code [32..40) = heartbeat long}、{@code [40..48) = stage long}
-     * （编码线程最后进入的阶段码，停滞日志据此定位卡点）。访问走 acquire/release
-     * 语义，块随引擎实例换代——每次构建显存管线时取一次，不得缓存跨引擎复用。
+     * <p>这是 Java 侧的类型化视图；JNI 的 {@code long[]} 7 元组编码只发生在
+     * {@code NativeEncoderChannel} 内，采集来源不接触线协议。
      *
-     * @return DirectBuffer；引擎未运行或不支持显存直通时为 null
+     * @param slotIdx   槽位索引，0 起始，必须小于槽位环容量
+     * @param memHandle 外部显存句柄（Linux fd / Win32 handle / OpenGL 纹理 ID）
+     * @param semHandle 时间线信号量句柄；OpenGL 后端无信号量，固定为 0
+     * @param width     纹理宽度（像素）
+     * @param height    纹理高度（像素）
+     * @param sizeBytes 外部显存总大小（字节）；OpenGL 后端固定为 0
+     * @param offset    纹理在外部显存中的字节偏移；OpenGL 后端固定为 0
      */
-    default ByteBuffer slotStateBlock() {
-        return null;
+    record VramSlotDescriptor(
+            int slotIdx,
+            long memHandle,
+            long semHandle,
+            int width,
+            int height,
+            long sizeBytes,
+            long offset
+    ) {
+        public VramSlotDescriptor {
+            if (slotIdx < 0) {
+                throw new IllegalArgumentException("槽位索引不能为负: " + slotIdx);
+            }
+            if (memHandle == 0L) {
+                throw new IllegalArgumentException("槽位 " + slotIdx + " 缺少外部显存句柄");
+            }
+            if (width <= 0 || height <= 0) {
+                throw new IllegalArgumentException("槽位 " + slotIdx + " 几何非法: " + width + "x" + height);
+            }
+            if (sizeBytes < 0L || offset < 0L) {
+                throw new IllegalArgumentException("槽位 " + slotIdx + " 大小/偏移不能为负");
+            }
+        }
+    }
+
+    /**
+     * 控制命令失败的异常载体，消费方按 {@link #status} 分支。
+     */
+    class ControlException extends IllegalStateException {
+        private static final long serialVersionUID = 1L;
+        /**
+         * Native 原始判别值；表外码也保留。
+         */
+        public final int code;
+        /**
+         * 对应枚举；表外码为 {@code null}。
+         */
+        public final ControlStatus status;
+
+        public ControlException(String message, int code) {
+            super(message + " (" + code + ": " + ControlStatus.describe(code) + ")");
+            this.code = code;
+            this.status = ControlStatus.fromCode(code);
+        }
+
+        public ControlException(String message, ControlStatus status) {
+            this(message, status.code());
+        }
+
+        /**
+         * 是否属于「编码器不可用」类故障（无硬编 / 建成失败）：降级采集救不了，
+         * 唯一恢复路径是整引擎自愈重启。
+         *
+         * @return true 表示应触发引擎自愈而不是降级到 RAM
+         */
+        public boolean encoderUnavailable() {
+            return status == ControlStatus.NO_HARDWARE_ENCODER || status == ControlStatus.ENCODER_BUILD_FAILED;
+        }
     }
 }

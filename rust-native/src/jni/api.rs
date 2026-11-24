@@ -500,12 +500,13 @@ fn query_encoder_caps<'caller>(
 const _: jni::NativeMethod = native_method! {
     java_type = "kairo.vistrel.streaming.natives.NativeBridge",
     export = "Java_kairo_vistrel_streaming_natives_NativeBridge_importVramSlots",
-    static fn import_vram_slots(flat: jlong[]) -> jint,
+    static fn import_vram_slots(binding_epoch: jlong, flat: jlong[]) -> jint,
 };
 
 fn import_vram_slots<'caller>(
     env: &mut Env<'caller>,
     _class: JClass<'caller>,
+    binding_epoch: jlong,
     flat: JPrimitiveArray<'caller, jlong>,
 ) -> jni::errors::Result<jint> {
     // 0. 硬编能力预检：读启动期建立的快照，本机无硬编时直接拒绝
@@ -533,7 +534,10 @@ fn import_vram_slots<'caller>(
 
     // 派发控制命令给 Actor 进行槽位导入与激活硬编
     let code = if let Some(engine) = get_global().streaming_engine.load().as_ref() {
-        match engine.video().import_vram_slots(slots) {
+        match engine
+            .video()
+            .import_vram_slots(binding_epoch as u64, slots)
+        {
             Ok(()) => ControlStatus::Ok.code(),
             Err(e) => e.code(),
         }
@@ -547,22 +551,27 @@ const _: jni::NativeMethod = native_method! {
     java_type = "kairo.vistrel.streaming.natives.NativeBridge",
     export = "Java_kairo_vistrel_streaming_natives_NativeBridge_pushVramSlot",
     error_policy = LogErrorAndDefault,
-    static fn push_vram_slot(slot_idx: jint, sync_value: jlong) -> void,
+    static fn push_vram_slot(binding_epoch: jlong, slot_idx: jint, sync_value: jlong) -> void,
 };
 
 fn push_vram_slot<'caller>(
     _env: &mut Env<'caller>,
     _class: JClass<'caller>,
+    binding_epoch: jlong,
     slot_idx: jint,
     sync_value: jlong,
 ) -> jni::errors::Result<()> {
     let birth_nanos = elapsed_birth_nanos();
 
-    // 零锁极速投递：直接构建 VramSlot payload 投递到帧收件箱，由编码 Actor 处理槽位映射
+    // 零锁极速投递：直接构建 VramSlot payload 投递到帧收件箱，由编码 Actor 处理槽位映射。
+    // 轮次检查在共享块上完成：旧实例的帧在入口丢弃，不进入收件箱
     if let Some(engine) = get_global().streaming_engine.load().as_ref() {
-        engine
-            .video()
-            .push_vram_slot(birth_nanos, slot_idx as u32, sync_value as u64);
+        engine.video().push_vram_slot(
+            binding_epoch as u64,
+            birth_nanos,
+            slot_idx as u32,
+            sync_value as u64,
+        );
     }
     Ok(())
 }
@@ -599,12 +608,13 @@ fn slot_state_block<'caller>(
 const _: jni::NativeMethod = native_method! {
     java_type = "kairo.vistrel.streaming.natives.NativeBridge",
     export = "Java_kairo_vistrel_streaming_natives_NativeBridge_clearVramSlots",
-    static fn clear_vram_slots() -> jint,
+    static fn clear_vram_slots(binding_epoch: jlong) -> jint,
 };
 
 fn clear_vram_slots<'caller>(
     _env: &mut Env<'caller>,
     _class: JClass<'caller>,
+    binding_epoch: jlong,
 ) -> jni::errors::Result<jint> {
     // 引擎未运行即无导入方：注销实际是空操作，Vacuous ACK 同样成立。
     // 这里返回非 OK 会让 Java 按「未获确认」保留导出资源，而编码器早已随引擎析构，
@@ -618,7 +628,7 @@ fn clear_vram_slots<'caller>(
     // 清空待编帧、排空 GPU 在途任务并注销显存槽位：ClearVramSlots 单命令完成
     // 「停写者 → 排空异步尾巴 → 释放导入」的固定次序，一次控制往返
     // 注意：不回退软编！硬件编码器仍保持就绪，可无缝接收随后的主机帧池块 (RAM DMA 双缓冲) 并用 StagingBuffer 进行硬编
-    let code = match pipeline.clear_vram_slots() {
+    let code = match pipeline.clear_vram_slots(binding_epoch as u64) {
         Ok(()) => ControlStatus::Ok.code(),
         Err(e) => e.code(),
     };

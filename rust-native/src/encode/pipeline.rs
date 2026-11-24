@@ -76,11 +76,14 @@ impl VideoPipeline {
     }
 
     /// 导入本次采集的显存槽位表（ask，阻塞式）
+    ///
+    /// `binding_epoch` 是调用方持有的显存绑定令牌；与当前绑定轮次不符即整批拒绝
     pub(crate) fn import_vram_slots(
         &self,
+        binding_epoch: u64,
         slots: Vec<crate::encode::hardware::VramSlotDescriptor>,
     ) -> Result<(), ControlStatus> {
-        self.control.import_vram_slots(slots)
+        self.control.import_vram_slots(binding_epoch, slots)
     }
 
     /// 会话建立前把编码器按定档请求与协商定死的 codec 就绪（ask），`Ok` 携带
@@ -97,8 +100,8 @@ impl VideoPipeline {
     }
 
     /// 释放显存槽位表（ask，阻塞式）
-    pub(crate) fn clear_vram_slots(&self) -> Result<(), ControlStatus> {
-        self.control.clear_vram_slots()
+    pub(crate) fn clear_vram_slots(&self, binding_epoch: u64) -> Result<(), ControlStatus> {
+        self.control.clear_vram_slots(binding_epoch)
     }
 
     /// 构造全部 seam 并拉起编码线程
@@ -198,7 +201,22 @@ impl VideoPipeline {
     }
 
     /// 投递一帧显存直通画面（槽位需先经 [`ControlSender::import_vram_slots`] 导入）
-    pub fn push_vram_slot(&self, birth_nanos: u64, slot_idx: u32, sync_value: u64) {
+    ///
+    /// 旧绑定轮次的帧直接丢弃：槽位表已随编码器重建失效，继续投递只会让
+    /// 编码线程去查一张不存在的表。检查是共享块上的原子读，不做 JNI 往返
+    pub fn push_vram_slot(
+        &self,
+        binding_epoch: u64,
+        birth_nanos: u64,
+        slot_idx: u32,
+        sync_value: u64,
+    ) {
+        if binding_epoch != self.slot_state.binding_epoch() {
+            // 帧没进编码器：渲染线程已占用的所有权位必须归还，否则槽位会永久泄漏，
+            // 三轮之后 claim 全忙，显存直通被误判为持续丢帧
+            self.slot_state.mark_free(slot_idx);
+            return;
+        }
         self.inbox.push(VideoFrame {
             birth_nanos,
             payload: FramePayload::VramSlot {
@@ -286,6 +304,26 @@ mod tests {
             nv12_len(coded.0, coded.1),
             "补齐后字节数按编码尺寸"
         );
+    }
+
+    /// 旧轮次推送被丢弃时必须归还渲染线程已占用的所有权位，否则槽位永久泄漏
+    #[test]
+    fn test_stale_vram_push_releases_claimed_slot() {
+        let doorbell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&doorbell)));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let pipeline =
+            VideoPipeline::assemble(ControlSender::new(tx, doorbell), Arc::clone(&inbox));
+
+        pipeline.slot_state().set_busy(1);
+        let stale = pipeline.slot_state().binding_epoch() + 1;
+        pipeline.push_vram_slot(stale, 0, 1, 7);
+
+        assert!(
+            !pipeline.slot_state().is_busy(1),
+            "丢弃的帧没有编码器消费，所有权位必须立即归还"
+        );
+        assert!(inbox.take().is_none(), "旧轮次帧不得进入收件箱");
     }
 
     /// 取出收件箱里的主机帧（唯一一帧，取完即空）
