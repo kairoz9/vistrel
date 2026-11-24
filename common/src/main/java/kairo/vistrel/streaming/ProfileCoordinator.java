@@ -10,36 +10,22 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * 档位变更后台协调器：本地内容轮询 + 外部偏好事件，汇成阻塞 ask，渲染线程零等待
+ * 档位变更后台协调器：内容轮询 + 信令偏好汇成阻塞 ask，渲染线程零等待。
  *
- * <p>职责分界：渲染线程只管游戏内容（snapshot 无变更回调，只能帧节拍轮询）；视口与 BPP
- * 是信令推的外部事件，变化立即生效——防抖归客户端（resize 已 250ms 防抖），服务端不做二次稳定。
+ * <p>渲染线程只喂内容快照（无变更回调，只能按帧节拍轮询）；视口与 BPP 是信令事件，
+ * 变化立即生效，防抖归客户端。内容须经 1 秒稳定窗：同一快照持续 1 秒才合成目标，
+ * 与上次已尝试目标一致则跳过，拒绝后的重试风暴由 lastAttempted 记账；0×0 立即翻
+ * PAUSED，恢复立即翻回 STREAMING（采集按在位档位重建），ask 只微调几何。
  *
- * <p>内容变化须经稳定窗：plan 是纯函数，快照不变则目标必不变——客户端 tick（20Hz）只做一次
- * 快照值比较，同一快照持续 1 秒才合成目标放行；窗口内反复变化只有最终稳定者被放行；
- * 与上次已尝试目标一致则跳过——拒绝后的重试风暴由 lastAttempted 统一记账；0×0 → 立即翻
- * PAUSED，恢复时立即翻回 STREAMING（采集先按在位档位重建），ask 只微调几何。
+ * <p>会话状态是唯一一份不可变记录（{@link SessionServer.SessionState}）：新代次 / 新相位 /
+ * 新档位都整体替换；在途 ask 以发布快照的编码器代次引用结账。监听器只收唤醒，消费者在
+ * 动作点经 {@link #current()} 现读，投递顺序不参与正确性。
  *
- * <p>会话状态是唯一一份不可变记录（{@link SessionServer.SessionState}）：换代 / 换相位 / 换档位
- * 都整体替换实例；在途 ask 以发布快照的编码器世代引用结账。监听器只收唤醒，消费者在动作点经
- * {@link #current()} 现读，因此投递顺序与线程交错不参与正确性。
+ * <p>线程模型：客户端线程每 tick 喂内容快照（{@link #onContentSnapshot}）并就地翻相位；
+ * 信令线程经 {@link #noteOfferAnswer} / {@link #onClientSettings} / {@link #onSessionClosed}
+ * 落账；工作线程串行执行阻塞 ask（{@link Applier}），应答 JSON 是档位的唯一事实源。
  *
- * <p>线程模型：
- * <ul>
- *   <li>客户端线程每次 tick 喂内容快照：会话活跃时经 {@link #onContentSnapshot}（规划 + 稳定判定，
- *       纯内存算术，无锁无阻塞），目标落 latest-wins 槽位并唤醒工作线程；相位翻转在客户端
- *       线程就地发布。无会话时经 {@link #seedContentSnapshot} 仅更新快照，供 offer 规划使用。
- *       稳定窗状态（lastSeenAtNanos / seenDirty / paused）只由客户端线程读写</li>
- *   <li>信令线程经三个入口落位会话状态：{@link #noteOfferAnswer}（offer 落账）、
- *       {@link #onClientSettings}（外部偏好变更：视口 / BPP 任一变化立即落槽位）、
- *       {@link #onSessionClosed}（关闭复位）。lastAttempted 的跨线程写只发生在
- *       offer 落账与 ask 记账——Java 引用写原子，最坏滞后一帧重放行一次</li>
- *   <li>工作线程串行执行阻塞 ask（{@link Applier}，即 JNI {@code applyProfile}），
- *       应答 JSON 是档位的唯一事实源，生效即替换会话状态并唤醒监听器</li>
- * </ul>
- *
- * <p>拒绝不自动重试：目标统一记为已尝试，避免编码器持续拒绝时的风暴；
- * 旧档继续生效（流没有变化），失败痕迹只落日志，浏览器不感知。
+ * <p>拒绝不自动重试：旧档继续生效，失败只落日志。
  */
 public final class ProfileCoordinator {
     private static final long STABILITY_WINDOW_NS = 1_000_000_000L;
@@ -106,7 +92,7 @@ public final class ProfileCoordinator {
     private final AtomicReference<SessionServer.SessionState> published = new AtomicReference<>(null);
     /**
      * 结算锁：快照发布与相位翻转必须串行化。信令层可能有多个 event loop 并发落账；
-     * 若不串行化，旧快照可能后发布覆盖新快照。会话世代由 {@link SessionServer.EncoderGeneration}
+     * 若不串行化，旧快照可能后发布覆盖新快照。会话代次由 {@link SessionServer.EncoderGeneration}
      * 的对象身份承载，不需要额外的计数器。
      */
     private final Object settlementLock = new Object();
@@ -376,7 +362,7 @@ public final class ProfileCoordinator {
         String backend =
                 obj.has("backend") && !obj.get("backend").isJsonNull() ? obj.get("backend").getAsString() : null;
         String codec = obj.has("codec") && !obj.get("codec").isJsonNull() ? obj.get("codec").getAsString() : "";
-        // 落账即换代：新 EncoderGeneration 对象身份即控制面会话世代，与快照发布在同一临界区。
+        // 落账即新代次：新 EncoderGeneration 对象身份即控制面会话代次，与快照发布在同一临界区。
         // 落账相位取当下内容（最小化中直接 PAUSED）
         synchronized (settlementLock) {
             published.set(
@@ -407,7 +393,7 @@ public final class ProfileCoordinator {
         if (stopped) {
             return;
         }
-        // 复位即换代：状态清空（在途 ask 读 null 即作废）。与落账共用结算锁，
+        // 复位即作废：状态清空（在途 ask 读 null 即作废）。与落账共用结算锁，
         // 避免关闭与并发落账交错出「已关闭但快照复活」
         synchronized (settlementLock) {
             published.set(null);
@@ -503,7 +489,7 @@ public final class ProfileCoordinator {
         String json = applier.apply(target.width(), target.height(), target.fps(), target.bpp());
         SessionServer.SessionState now = published.get();
         if (now == null || now.generation() != beforeGeneration) {
-            // ask 期间换代 / 关闭：应答属于旧会话，不得写回
+            // ask 期间跨代次 / 关闭：应答属于旧会话，不得写回
             return;
         }
         SessionServer.Tier parsed = json == null || json.isEmpty() ? null : parseTierReply(json);
@@ -513,7 +499,7 @@ public final class ProfileCoordinator {
             Constants.LOG.warn("档位 ask 无应答（{}），保持旧档 {}", target, now.tier());
             return;
         }
-        // 只写档位：相位可能已翻过，以当下实例为 CAS 目标重试；换代则放弃
+        // 只写档位：相位可能已翻过，以当下实例为 CAS 目标重试；跨代次则放弃
         while (true) {
             now = published.get();
             if (now == null || now.generation() != beforeGeneration) {

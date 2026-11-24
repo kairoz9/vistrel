@@ -564,7 +564,7 @@ fn push_vram_slot<'caller>(
     let birth_nanos = elapsed_birth_nanos();
 
     // 零锁极速投递：直接构建 VramSlot payload 投递到帧收件箱，由编码 Actor 处理槽位映射。
-    // 世代检查在共享块上完成：旧实例的帧在入口丢弃，不进入收件箱
+    // 轮次检查在共享块上完成：旧实例的帧在入口丢弃，不进入收件箱
     if let Some(engine) = get_global().streaming_engine.load().as_ref() {
         engine.video().push_vram_slot(
             binding_epoch as u64,

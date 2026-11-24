@@ -51,7 +51,7 @@ pub(crate) enum ControlStatus {
     /// 硬编建成失败：探测认证过的候选后端全部建不起来。与 `NoHardwareEncoder`
     /// 的区别是后者表示「本机探测不到硬编」，本码表示「探测说有，实际建不出来」
     EncoderBuildFailed = 9,
-    /// 显存绑定已换代：调用方持有的槽位导入令牌属于旧绑定，整批拒绝
+    /// 显存绑定轮次已前移：调用方持有的槽位导入令牌属于旧绑定，整批拒绝
     StaleBinding = 10,
 }
 

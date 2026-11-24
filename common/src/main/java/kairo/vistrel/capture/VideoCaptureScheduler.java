@@ -9,14 +9,11 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 /**
- * 视频渲染捕获总调度器
- * 负责主渲染线程的帧率节拍控制 (Pacing)、双管线 (VRAM Direct / RAM Readback) 的可用性裁定与断路器降级。
+ * 主渲染线程的视频采集调度器：帧率节拍、双管线 (VRAM Direct / RAM Readback) 裁定与断路器降级。
  *
- * 降级条件分两种：构造期失败立即降级；运行期只有**连续** {@code FAILURE_THRESHOLD} 帧
- * {@code Failed}（管线抛出异常同样折算为 {@code Failed}）才熔断，{@code Delivered} 与
- * {@code Dropped}（槽位全在途等主动丢帧）一律清零、不计入。
- *
- * 实例自身不持有任何静态状态，生命周期由 VistrelService 统一管理。
+ * <p>构造期失败立即降级；运行期只有**连续** {@code FAILURE_THRESHOLD} 帧 {@code Failed}
+ * （异常同样折算）才熔断，{@code Delivered} / {@code Dropped} 一律清零。
+ * 生命周期由 VistrelService 统一管理。
  */
 public class VideoCaptureScheduler {
     private final EncoderChannel channel;
@@ -130,13 +127,13 @@ public class VideoCaptureScheduler {
     }
 
     /**
-     * 把显存管线的槽位导入重新绑定到新编码器世代。
+     * 把显存管线的槽位导入重新绑定到新编码器代次。
      *
      * <p>{@code rebind} 只属于显存直通管线，不抬进 {@link FrameSource} 通用接口；测试替身
      * 可覆写本钩子，生产路径直接调用具体管线的公开方法。
      *
      * @param pipeline 当前显存管线
-     * @param generation 新编码器世代
+     * @param generation 新编码器代次
      */
     protected void rebindVramPipeline(FrameSource pipeline, SessionServer.EncoderGeneration generation) {
         //? if vulkan_backend {
@@ -177,11 +174,8 @@ public class VideoCaptureScheduler {
     /**
      * 按当下会话状态落地采集：无会话 / 内容丢失停采释放，活跃则按各自寿命复用或重建管线。
      *
-     * <p>RAM 回读只依赖几何；显存直通依赖编码器世代与几何。世代变化（新 offer / codec /
-     * backend）只重新绑定显存槽位并复用几何绑定的导出集，RAM 兜底保持原管线，避免无谓的
-     * 采集空窗。生命周期判定以 {@link #appliedState} 的上一份快照为基线：每个
-     * (世代, 几何) 只尝试一次，失败后等下一次快照变化，防止构建失败后在每个渲染 tick
-     * 上反复重试。
+     * <p>寿命判定以 {@link #appliedState} 的上一份快照为基线：每个 (代次, 几何) 只尝试一次，
+     * 失败后等下一次快照变化，不在每个渲染 tick 反复重试。
      */
     private void applyState(SessionServer.SessionState state) {
         if (this.state == CaptureState.TORN_DOWN) {
@@ -217,7 +211,7 @@ public class VideoCaptureScheduler {
         boolean geometryChanged =
                 !wasStreaming || previous.tier().width() != width || previous.tier().height() != height;
         boolean generationChanged = !wasStreaming || previous.generation() != state.generation();
-        // 1. RAM 回读：只随几何变化重建；编码器世代变化不影响系统内存帧
+        // 1. RAM 回读：只随几何变化重建；编码器代次变化不影响系统内存帧
         if (geometryChanged) {
             closeRamPipeline();
             this.ramFailureGate.reset();
@@ -227,15 +221,15 @@ public class VideoCaptureScheduler {
                 Constants.LOG.error("构建 RAM 回读管线异常: {}", t.getMessage(), t);
             }
         }
-        // 2. 显存直通：几何变化重建，世代变化只重绑
-        //    能力开关在调度器生命周期内恒定（配置快照 + caps 缓存）；晚就绪只随新编码器世代出现
+        // 2. 显存直通：几何变化重建，代次变化只重绑
+        //    能力开关在调度器生命周期内恒定（配置快照 + caps 缓存）；晚就绪只随新编码器代次出现
         boolean vramDirectEnabled = resolveVramDirect(state.hardware());
         if (!vramDirectEnabled) {
             closeVramPipeline();
             return;
         }
         if (geometryChanged || (this.vramPipeline == null && generationChanged)) {
-            // 新几何 / 新世代：断路器与连续失败数不能带过来，
+            // 新几何 / 新代次：断路器与连续失败数不能带过来，
             // 否则重建后可能被上次的失败记录立刻误判成故障
             this.vramBreaker.reset();
             closeVramPipeline();
@@ -254,7 +248,7 @@ public class VideoCaptureScheduler {
             return;
         }
         if (this.vramPipeline != null && generationChanged) {
-            // 同几何换代：导出资源可原样复用，只把槽位导入重新绑定到新编码器世代
+            // 同几何新代次：导出资源可原样复用，只把槽位导入重新绑定到新编码器代次
             this.vramBreaker.reset();
             try {
                 rebindVramPipeline(this.vramPipeline, state.generation());
@@ -273,9 +267,8 @@ public class VideoCaptureScheduler {
      */
     private void handleVramControlFailure(EncoderChannel.ControlException t) {
         if (t.encoderUnavailable()) {
-            // 编码器不在了：降级采集救不了没有编码器的流，唯一恢复路径
-            // 是整引擎自愈重启（重新探测硬件并重新协商）。
-            // 建成失败（探测说有、实际建不出来）与探测不到硬编同属「无编码器可用」
+            // 编码器不在了：降级救不了没有编码器的流，只能整引擎自愈重启；
+            // 建成失败与探测不到同属「无编码器可用」
             Constants.LOG.error("显存直通就绪失败：{}，触发编码停滞自愈", t.getMessage());
             try {
                 this.encoderStallListener.run();
@@ -337,8 +330,7 @@ public class VideoCaptureScheduler {
     /**
      * 采集一帧并直接推流
      *
-     * 三种结果各有明确处理：{@code Delivered} 已投递、{@code Dropped} 主动丢帧（刻意不回落 RAM）、
-     * {@code Failed} 回落下一级并累计连续失败。异常一律算作 {@code Failed}，绝不允许逃逸到渲染线程。
+     * 异常一律折算为 {@code Failed}，绝不逃逸到渲染线程；{@code Dropped} 是主动丢帧，不回落 RAM。
      *
      * @return 本帧是否已投递；false 表示无推流会话、被节流拦截、主动丢帧
      */

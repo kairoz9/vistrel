@@ -6,7 +6,7 @@ package kairo.vistrel.capture;
  * <p>遵循 RAII：构造即就绪，{@link #close()} 释放全部显存与缓冲资源。实现分两类：
  * RAM 回读管线（{@code RenderpearlRamPipeline} / {@code OpenGlRamPipeline}）经系统内存
  * 投递，只随几何变化；VRAM 直通管线（{@code RenderpearlVramPipeline}）经外部显存槽位
- * 投递，除几何外还绑定编码器世代。
+ * 投递，除几何外还绑定编码器代次。
  */
 public interface FrameSource extends AutoCloseable {
     /**

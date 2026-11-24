@@ -3,9 +3,8 @@ package kairo.vistrel.streaming;
 /**
  * Native 控制面结果码的 Java 侧类型表。
  *
- * <p>数值与 Rust {@code encode::control::ControlStatus} 的判别值一一对应；JNI 边界只传
- * {@code int}，进入 Java 后立即收敛到本枚举。契约变更必须两端同步（本类
- * {@code kairo.vistrel.streaming.natives.NativeWireContract} 记录版本）。
+ * <p>数值与 Rust {@code encode::control::ControlStatus} 一一对应；JNI 边界只传 {@code int}。
+ * 契约变更必须两端同步，版本见 {@code kairo.vistrel.streaming.natives.NativeWireContract}。
  */
 public enum ControlStatus {
     OK(0, "成功"),
@@ -18,7 +17,7 @@ public enum ControlStatus {
     QUEUE_FULL(7, "控制队列已满 (编码线程已卡住不消费)"),
     RELEASE_FAILED(8, "注销前排空失败 (导入引用与槽位表已保留)"),
     ENCODER_BUILD_FAILED(9, "编码器建成失败 (候选后端全部创建失败，详见日志)"),
-    STALE_BINDING(10, "显存绑定已换代 (旧世代的槽位导入被拒绝)");
+    STALE_BINDING(10, "显存绑定已过期 (旧轮次的槽位导入被拒绝)");
     private final int code;
     private final String description;
 

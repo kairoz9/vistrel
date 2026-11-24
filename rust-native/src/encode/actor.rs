@@ -215,7 +215,7 @@ impl EncoderActor {
                 reply,
             } => {
                 if binding_epoch != self.slot_state.binding_epoch() {
-                    // 旧世代的导入不改变当前编码器状态：不丢弃在途帧，也不解除拒收。
+                    // 旧轮次的导入不改变当前编码器状态：不丢弃在途帧，也不解除拒收。
                     // 句柄所有权仍归调用方——Java 会用同一批原始句柄重试，这里绝不能关闭
                     for slot in &mut slots {
                         slot.handles_taken = true;
@@ -224,7 +224,7 @@ impl EncoderActor {
                 } else {
                     self.discard_frames_before_rebuild();
                     let code = self.import_vram_slots(binding_epoch, slots);
-                    // 恢复接收只认当前世代的导入，无论成败：成功即新表生效；失败时旧表恢复或
+                    // 恢复接收只认当前轮次的导入，无论成败：成功即新表生效；失败时旧表恢复或
                     // 表空，交给既有索引查找与几何兜底
                     self.rejecting_frames = false;
                     let _ = reply.send(code);
@@ -235,7 +235,7 @@ impl EncoderActor {
                 reply,
             } => {
                 if binding_epoch != self.slot_state.binding_epoch() {
-                    // 旧世代：旧编码器连同它的导入已销毁，注销是空操作，不动当前世代的拒收状态
+                    // 旧轮次：旧编码器连同它的导入已销毁，注销是空操作，不动当前轮次的拒收状态
                     let _ = reply.send(ControlStatus::Ok);
                 } else {
                     self.discard_frames_before_rebuild();
@@ -319,7 +319,7 @@ impl EncoderActor {
     /// 释放一张驱动仍在读的纹理。没有编码器则没有导入引用，无需排空。
     fn clear_vram_slots(&mut self, binding_epoch: u64) -> ControlStatus {
         if binding_epoch != self.slot_state.binding_epoch() {
-            // 旧世代：旧编码器连同它的导入已销毁，注销是空操作。
+            // 旧轮次：旧编码器连同它的导入已销毁，注销是空操作。
             // 返回 Ok 让游戏侧可以立即复用/销毁导出资源
             return ControlStatus::Ok;
         }
@@ -348,7 +348,7 @@ impl EncoderActor {
         mut slots: Vec<VramSlotDescriptor>,
     ) -> ControlStatus {
         if binding_epoch != self.slot_state.binding_epoch() {
-            // 导入令牌属于旧绑定：整批拒绝，调用方按新世代重试
+            // 导入令牌属于旧绑定：整批拒绝，调用方按新轮次重试
             return ControlStatus::StaleBinding;
         }
         if !self.encoder.as_ref().is_some_and(|e| e.is_hardware()) {
@@ -510,7 +510,7 @@ impl EncoderActor {
         if had_hardware {
             log::warn!("重建硬件编码器：已导入的显存槽位随旧编码器失效，需重新注册");
         }
-        // 旧实例即将销毁：先推进绑定世代，旧世代的导入/推送/注销从此刻起全部失效
+        // 旧实例即将销毁：先推进绑定轮次，旧轮次的导入/推送/注销从此刻起全部失效
         self.slot_state.bump_binding_epoch();
 
         let mut request = request;
@@ -1776,7 +1776,7 @@ mod tests {
         assert!(output.take().is_some(), "新导入后槽位帧恢复编码");
     }
 
-    /// 用例 4b：旧世代的导入/注销不得改动当前世代的拒收状态
+    /// 用例 4b：旧轮次的导入/注销不得改动当前轮次的拒收状态
     #[test]
     fn test_stale_slot_commands_are_noops() {
         let bell = Arc::new(Notify::new());
@@ -1799,16 +1799,16 @@ mod tests {
         let stale_epoch = actor.slot_state.binding_epoch();
         actor.slot_state.bump_binding_epoch();
 
-        // 旧世代注销：回报 Ok（旧导入已随旧实例销毁），但不得把当前世代打成拒收
+        // 旧轮次注销：回报 Ok（旧导入已随旧实例销毁），但不得把当前轮次打成拒收
         let (reply, rx) = std::sync::mpsc::sync_channel(1);
         assert!(actor.apply(ControlCommand::ClearVramSlots {
             binding_epoch: stale_epoch,
             reply
         }));
         assert_eq!(wait_control_reply(rx), ControlStatus::Ok);
-        assert!(!actor.rejecting_frames, "旧世代注销不得阻断当前世代");
+        assert!(!actor.rejecting_frames, "旧轮次注销不得阻断当前轮次");
 
-        // 当前世代注销：正常进入拒收，等待下一次当前世代导入
+        // 当前轮次注销：正常进入拒收，等待下一次当前轮次导入
         let (reply, rx) = std::sync::mpsc::sync_channel(1);
         assert!(actor.apply(ControlCommand::ClearVramSlots {
             binding_epoch: actor.slot_state.binding_epoch(),
@@ -1817,7 +1817,7 @@ mod tests {
         assert_eq!(wait_control_reply(rx), ControlStatus::Ok);
         assert!(actor.rejecting_frames);
 
-        // 旧世代导入：整批拒绝，不得解除当前世代的拒收
+        // 旧轮次导入：整批拒绝，不得解除当前轮次的拒收
         let (reply, rx) = std::sync::mpsc::sync_channel(1);
         assert!(actor.apply(ControlCommand::ImportVramSlots {
             binding_epoch: stale_epoch,
@@ -1834,10 +1834,10 @@ mod tests {
             reply
         }));
         assert_eq!(wait_control_reply(rx), ControlStatus::StaleBinding);
-        assert!(actor.rejecting_frames, "旧世代导入不得解除当前世代拒收");
+        assert!(actor.rejecting_frames, "旧轮次导入不得解除当前轮次拒收");
     }
 
-    /// 用例 4c：旧世代导入被拒时，原始句柄必须留给调用方重试
+    /// 用例 4c：旧轮次导入被拒时，原始句柄必须留给调用方重试
     #[cfg(unix)]
     #[test]
     fn test_stale_import_leaves_handles_open_for_retry() {
@@ -1869,7 +1869,7 @@ mod tests {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         assert!(
             flags >= 0,
-            "旧世代拒绝后句柄必须保持打开，供 Java 用同一批句柄重试"
+            "旧轮次拒绝后句柄必须保持打开，供 Java 用同一批句柄重试"
         );
         // SAFETY: 查询完成后测试独占该 fd，关闭一次
         unsafe { libc::close(fd) };

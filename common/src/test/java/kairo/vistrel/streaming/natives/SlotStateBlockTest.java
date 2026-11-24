@@ -20,7 +20,7 @@ class SlotStateBlockTest {
 
     /**
      * 64 字节直接块替身：busy 位在 [0..32)，心跳在 [32..40)，停滞阶段码在 [40..48)，
-     * 显存绑定世代在 [48..56)。
+     * 显存绑定轮次在 [48..56)。
      */
     private static ByteBuffer newBlock() {
         return ByteBuffer.allocateDirect(NativeWireContract.SLOT_STATE_BLOCK_BYTES).order(ByteOrder.nativeOrder());
@@ -131,10 +131,10 @@ class SlotStateBlockTest {
     void testBindingEpochReadsCrossLanguageOffset() {
         ByteBuffer block = newBlock();
         SlotStateBlock ownership = new SlotStateBlock(block, 3);
-        Assertions.assertEquals(0L, ownership.bindingEpoch(), "初始绑定世代为 0：首个编码器尚未重建");
+        Assertions.assertEquals(0L, ownership.bindingEpoch(), "初始绑定轮次为 0：首个编码器尚未重建");
         block.putLong(NativeWireContract.BINDING_EPOCH_OFFSET, 7L);
-        Assertions.assertEquals(7L, ownership.bindingEpoch(), "包装视图必须按共享块偏移读取绑定世代");
-        Assertions.assertEquals(56, NativeWireContract.RESERVED_OFFSET, "世代段之后才是保留段");
+        Assertions.assertEquals(7L, ownership.bindingEpoch(), "包装视图必须按共享块偏移读取绑定轮次");
+        Assertions.assertEquals(56, NativeWireContract.RESERVED_OFFSET, "轮次段之后才是保留段");
     }
 
     private static void writeHeartbeat(ByteBuffer block, long value) {

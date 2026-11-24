@@ -305,8 +305,8 @@ pub(crate) struct SlotStateBlock {
     heartbeat: AtomicU64,
     /// Actor 当前阻塞的阶段码：心跳冻结时游戏侧读回写进停滞日志
     stage: AtomicU64,
-    /// 显存绑定世代：重建编码器或槽位失效的重配时 +1。游戏侧导入/推送/注销
-    /// 都带上它，Native 据此拒绝旧绑定世代的槽位操作
+    /// 显存绑定轮次：重建编码器或槽位失效的重配时 +1。游戏侧导入/推送/注销
+    /// 都带上它，Native 据此拒绝旧绑定轮次的槽位操作
     binding_epoch: AtomicU64,
     /// 布局保留段：凑满单缓存行，游戏侧不得访问
     _reserved: [u8; 8],
@@ -357,12 +357,12 @@ impl SlotStateBlock {
         self.heartbeat.fetch_add(1, Ordering::Release);
     }
 
-    /// 当前显存绑定世代：导入、推送与注销的准入令牌
+    /// 当前显存绑定轮次：导入、推送与注销的准入令牌
     pub(crate) fn binding_epoch(&self) -> u64 {
         self.binding_epoch.load(Ordering::Acquire)
     }
 
-    /// 显存绑定换代：旧世代的槽位导入/推送/注销从此失效
+    /// 显存绑定轮次前移：旧轮次的槽位导入/推送/注销从此失效
     pub(crate) fn bump_binding_epoch(&self) -> u64 {
         self.binding_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }

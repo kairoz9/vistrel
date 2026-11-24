@@ -93,7 +93,7 @@ public final class NativeEncoderChannel implements EncoderChannel, InputEventSou
             );
         }
         // 先取块再导入：块无效时在导入前失败，不会留下需要回滚的 Native 槽位表。
-        // 绑定世代也取自同一块；导入期间编码器换代时 Native 回 StaleBinding，重读一次再试
+        // 绑定轮次也取自同一块；导入期间编码器重建时 Native 回 StaleBinding，重读一次再试
         long[] flat = encodeSlots(slots);
         for (int attempt = 0; ; attempt++) {
             ByteBuffer stateBlock = NativeBridge.slotStateBlock();
@@ -109,7 +109,7 @@ public final class NativeEncoderChannel implements EncoderChannel, InputEventSou
                 return new NativeVramBinding(blockView, bindingEpoch);
             }
             if (code == ControlStatus.STALE_BINDING.code() && attempt == 0) {
-                // 读取绑定世代与导入之间编码器换代：重读当前绑定世代再导入一次
+                // 读取绑定轮次与导入之间编码器重建：重读当前轮次再导入一次
                 continue;
             }
             throw new EncoderChannel.ControlException("NativeBridge.importVramSlots 失败", code);

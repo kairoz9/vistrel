@@ -12,7 +12,7 @@ package kairo.vistrel.streaming.natives;
  *   <li>{@code [0..32)} —— busy[8]，每槽位一个 u32，1 = 渲染线程已认领</li>
  *   <li>{@code [32..40)} —— heartbeat，编码线程每轮递增</li>
  *   <li>{@code [40..48)} —— stage，编码线程当前阶段码</li>
- *   <li>{@code [48..56)} —— bindingEpoch，显存绑定世代</li>
+ *   <li>{@code [48..56)} —— bindingEpoch，显存绑定轮次</li>
  *   <li>{@code [56..64)} —— 保留</li>
  * </ul>
  */
@@ -46,7 +46,7 @@ final class NativeWireContract {
      */
     public static final int STAGE_OFFSET = 40;
     /**
-     * 显存绑定世代偏移：Native Actor 在重建/失效重配时递增，导入/推送/注销都按它准入。
+     * 显存绑定轮次偏移：Native Actor 在重建/失效重配时递增，导入/推送/注销都按它准入。
      */
     public static final int BINDING_EPOCH_OFFSET = 48;
     /**

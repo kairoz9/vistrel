@@ -1,11 +1,10 @@
 package kairo.vistrel.streaming;
 
 /**
- * 一段导出显存绑定到某个编码器世代的 Java 侧句柄：槽位认领、帧投递、心跳判定与注销结算。
+ * 一段导出显存绑定到某个编码器代次的 Java 侧句柄：槽位认领、帧投递、心跳判定与注销结算。
  *
- * <p>生命周期由采集侧持有，构造即完成整批导入（全成全败）；{@link #close()} 是唯一
- * 注销入口，返回 Native 是否确认。绑定只对导入时的绑定世代有效：Native 在编码器
- * 重建/失效重配后递增共享块中的绑定世代，旧绑定的推送在入口被丢弃。
+ * <p>生命周期由采集侧持有；构造即整批导入（全成全败），{@link #close()} 是唯一注销入口。
+ * 绑定只对导入时的绑定轮次有效：编码器重建/失效重配后 Native 递增轮次，旧推送在入口丢弃。
  *
  * <p>线程约定：{@link #claim} / {@link #release} / {@link #push} / {@link #markPushed} /
  * {@link #heartbeatTimedOut} 在渲染线程调用；{@link #stageName} 只读共享块；
@@ -15,8 +14,8 @@ public interface VramBinding {
     /**
      * 心跳冻结判定阈值：持续推流下心跳停在基准值超过此时长，判定编码线程卡死。
      *
-     * <p>编码端每轮循环推进心跳，不推进只有卡死一种解释；判定由采集侧在每个 tick
-     * 执行（含全忙丢帧的 tick），卡死后 push 会停，判定不能跟着停。
+     * <p>编码端每轮推进心跳，不推进只有卡死一种解释；判定必须在每个 tick 执行
+     * （含全忙丢帧的 tick）——卡死后 push 会停，判定不能跟着停。
      */
     long STALL_HEARTBEAT_TIMEOUT_NS = 1_000_000_000L;
 
@@ -67,9 +66,9 @@ public interface VramBinding {
     String stageName();
 
     /**
-     * 本绑定导入时共享块中的绑定世代。
+     * 本绑定导入时共享块中的绑定轮次。
      *
-     * @return 导入令牌；与共享块的当前绑定世代不同即说明编码器已换代
+     * @return 导入令牌；与共享块的当前绑定轮次不同即说明编码器已重建
      */
     long bindingEpoch();
 
@@ -87,8 +86,8 @@ public interface VramBinding {
      * 显存槽位注销的结算结果。
      *
      * <p>{@link #RELEASED} 是游戏侧销毁导出纹理 / 信号量 / VMA 池的唯一依据；
-     * {@link #RETAINED} 表示编码线程没有确认注销（排空失败、ACK 超时或控制队列满），
-     * 它可能仍在读这些导入资源，此时销毁是驱动层未定义行为。
+     * {@link #RETAINED} 表示编码线程未确认注销（排空失败、ACK 超时或队列满），
+     * 可能仍在读导入资源，销毁即驱动层未定义行为。
      */
     enum ReleaseStatus {
         /**

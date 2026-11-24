@@ -30,7 +30,7 @@ public class CaptureCascadeTest {
         private String codec = "H264";
 
         /**
-         * 新会话接入：新的 EncoderGeneration 对象即新会话世代。
+         * 新会话接入：新的 EncoderGeneration 对象即新会话代次。
          */
         TestState live(String backend, int width, int height, int fps) {
             this.state = newState(backend, codec, width, height, fps, 0.1);
@@ -47,7 +47,7 @@ public class CaptureCascadeTest {
         }
 
         /**
-         * 同会话档位变更：不动 offer 世代与编码器身份，只替换 Tier。
+         * 同会话档位变更：不动 offer 代次与编码器身份，只替换 Tier。
          */
         TestState retier(int width, int height, int fps) {
             return retier(width, height, fps, 0.1);
@@ -295,8 +295,7 @@ public class CaptureCascadeTest {
     /**
      * 主动丢帧（槽位全在途）绝不能触发断路器
      *
-     * 这是 1440p 切帧率时「永久降级到 RAM 回读」的回归用例：槽位压力是设计内的背压，
-     * 若被当成故障，一次丢帧就会把整个会话推上最贵的回读路径。
+     * 槽位压力是设计内的背压；当成故障会让一次丢帧永久降级到 RAM 回读。
      */
     @Test
     void testVramDroppedNeverTriggersCircuitBreaker() {
@@ -443,7 +442,7 @@ public class CaptureCascadeTest {
         Assertions.assertEquals(1, createdRams.size(), "应保留 RAM 兜底管线");
 
         capsReady[0] = true;
-        // 能力是外生开关：生产路径首次探测后恒定，晚就绪随新的编码器世代一起生效
+        // 能力是外生开关：生产路径首次探测后恒定，晚就绪随新的编码器代次一起生效
         state.newOffer("vulkan_video", "H264", 1920, 1080, 60);
         capture.applySessionState();
         Assertions.assertEquals(2, evaluations[0], "后续会话变更必须重新求值");
@@ -535,9 +534,7 @@ public class CaptureCascadeTest {
     }
 
     /**
-     * 帧率变化不得重建管线
-     *
-     * 帧率不改变纹理尺寸，重建会走 `waitIdle` + 两次阻塞 JNI（注销/注册显存槽位）+ 纹理重分配，
+     * 帧率变化不得重建管线：重建要走 waitIdle、两次阻塞 JNI 与纹理重分配，
      * 那正是切帧率时偶发卡死的窗口。
      */
     @Test
@@ -587,7 +584,7 @@ public class CaptureCascadeTest {
     }
 
     /**
-     * 同几何换 offer：编码器换代只重新绑定槽位导入，导出资源原样复用。
+     * 同几何换 offer：编码器重建只重新绑定槽位导入，导出资源原样复用。
      * 这是「几何绑定资源与编码器绑定导入分离」的回归用例。
      */
     @Test
@@ -629,17 +626,17 @@ public class CaptureCascadeTest {
         // 同几何、同 codec/backend，但这是新 offer：只换绑定，不重建导出资源
         state.newOffer("vulkan_video", "H264", 1920, 1080, 60);
         capture.applySessionState();
-        Assertions.assertEquals(1, createdVrams.size(), "同几何换代不得重建显存管线");
+        Assertions.assertEquals(1, createdVrams.size(), "同几何新代次不得重建显存管线");
         Assertions.assertEquals(1, source.rebinds, "新实例必须触发一次重新绑定");
-        Assertions.assertNotSame(first, source.boundGeneration(), "绑定记录必须换成新世代");
-        Assertions.assertSame(state.get().generation(), source.boundGeneration(), "绑定记录必须是控制面当前世代");
+        Assertions.assertNotSame(first, source.boundGeneration(), "绑定记录必须换成新代次");
+        Assertions.assertSame(state.get().generation(), source.boundGeneration(), "绑定记录必须是控制面当前代次");
         Assertions.assertEquals(0, source.closeCalls, "复用导出资源时不得关闭管线");
-        Assertions.assertEquals(1, createdRams.size(), "编码器世代变化不应重建 RAM 兜底管线");
+        Assertions.assertEquals(1, createdRams.size(), "编码器代次变化不应重建 RAM 兜底管线");
         Assertions.assertEquals(0, createdRams.get(0).closeCalls, "RAM 管线只随几何变化重建");
     }
 
     /**
-     * 同几何换 codec：新编码器世代同样只触发重新绑定。
+     * 同几何换 codec：新编码器代次同样只触发重新绑定。
      */
     @Test
     void testCodecChangeAtSameGeometryRebindsVramInPlace() {
@@ -680,7 +677,7 @@ public class CaptureCascadeTest {
     }
 
     /**
-     * 后端身份是会话状态：软件编码会话不得建显存管线，也不得升级成整引擎自愈重启
+     * 后端身份是会话状态：软件编码会话不得建显存管线，也不得触发引擎自愈
      * （Capability 只说明驱动能导入槽位，消费端还得是硬件编码器）
      */
     @Test
@@ -799,10 +796,7 @@ public class CaptureCascadeTest {
     }
 
     /**
-     * RAM 回读是最后一级，异常绝不能逃逸到渲染线程
-     *
-     * 回归陷阱：两级捕获缺一不可——任何一级漏包 try/catch，RAM 管线内部的
-     * Throwable 都会掀翻主渲染循环（本用例专门钉住 Level 2）。
+     * RAM 回读是最后一级，异常绝不能逃逸到渲染线程（本用例钉住 Level 2）。
      */
     @Test
     void testRamExceptionNeverEscapesToRenderThread() {
@@ -826,10 +820,8 @@ public class CaptureCascadeTest {
     }
 
     /**
-     * RAM 连续返回 Failed 也不得关闭管线
-     *
-     * VRAM 熔断后尚有 RAM 兜底，RAM 熔断后无路可走：关闭它等于把会话打成黑屏，
-     * 而黑屏比「继续尝试」更糟 —— 故障必须可见，但会话不能自杀。
+     * RAM 连续返回 Failed 也不得关闭管线：它是最后一级，关掉等于黑屏；
+     * 故障必须可见，但会话不能自杀。
      */
     @Test
     void testRamFailureNeverClosesTheOnlyRemainingPipeline() {
@@ -882,10 +874,7 @@ public class CaptureCascadeTest {
     }
 
     /**
-     * 一次成功必须清零连续失败数
-     *
-     * 否则「29 失败 + 1 成功 + 29 失败」会被算成连续 58 次而误熔断，
-     * 把本来健康的显存直通永久推上最贵的回读路径。
+     * 一次成功必须清零连续失败数，否则「29 败 + 1 成 + 29 败」会误熔断。
      */
     @Test
     void testDeliveredResetsFailureStreak() {
@@ -935,7 +924,7 @@ public class CaptureCascadeTest {
         Assertions.assertThrows(
                 IllegalArgumentException.class,
                 () -> new kairo.vistrel.capture.RenderpearlVramPipeline(new FakeEncoderChannel(), 1920, 1080, null, () -> {}),
-                "空编码器世代创建管线应抛出异常"
+                "空编码器代次创建管线应抛出异常"
         );
     }
     //? }

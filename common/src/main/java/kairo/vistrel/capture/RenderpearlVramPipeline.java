@@ -39,7 +39,7 @@ import java.util.Optional;
  * Minecraft 26.2+ 显存直通管线（vulkan_backend 门，驱动扩展支持运行期另判）。
  *
  * <p>资源分两层：{@link VramExportSet} 只随几何变化；{@link VramBinding} 只对导入时的
- * 绑定世代有效。控制面换代时 {@link #rebind} 先把旧绑定从 Native 注销：获得确认
+ * 绑定轮次有效。控制面新代次时 {@link #rebind} 先把旧绑定从 Native 注销：获得确认
  * 就复用导出集重新导入，未获确认则弃置整个导出集并新建，避免编码器仍持有跨 API 导入时
  * 销毁游戏侧资源。
  *
@@ -80,7 +80,7 @@ public class RenderpearlVramPipeline implements FrameSource {
      */
     private VramBinding vramBinding = null;
     /**
-     * 当前绑定对应的控制面编码器世代
+     * 当前绑定对应的控制面编码器代次
      */
     private SessionServer.EncoderGeneration boundGeneration;
     private long globalFrameIndex = 0;
@@ -109,7 +109,7 @@ public class RenderpearlVramPipeline implements FrameSource {
      * @param channel        数据面通道；须能打开显存绑定
      * @param width          采集宽度
      * @param height         采集高度
-     * @param generation     首次绑定的编码器世代，不得为 {@code null}
+     * @param generation     首次绑定的编码器代次，不得为 {@code null}
      * @param onEncoderStall 编码停滞自愈回调，不得为 {@code null}；心跳超时判定在渲染线程
      *                       触发一次，实现方必须立即移交后台线程，回调内不得做任何显存操作
      * @throws IllegalArgumentException channel、generation 或回调为 {@code null}
@@ -129,7 +129,7 @@ public class RenderpearlVramPipeline implements FrameSource {
             throw new IllegalArgumentException("EncoderChannel 不能为空");
         }
         if (generation == null) {
-            throw new IllegalArgumentException("编码器世代不能为空");
+            throw new IllegalArgumentException("编码器代次不能为空");
         }
         if (onEncoderStall == null) {
             throw new IllegalArgumentException("编码停滞回调不能为空");
@@ -151,7 +151,6 @@ public class RenderpearlVramPipeline implements FrameSource {
         if (dev == null) {
             throw new IllegalStateException("Renderpearl GpuDevice 不可用，无法构造显存直通管线");
         }
-        // 仅在 Vulkan 后端下构造显存直通管线，非 Vulkan (OpenGL 等) 直接抛出异常触发安全降级至 RAM 回读管线
         //? if renderpearl_era {
         if (!(dev instanceof FrontendGpuDevice frontend)) {
             throw new IllegalStateException("Renderpearl 运行于非 Vulkan 后端 (OpenGL/其他)，显存直通不支持，安全降级至 RAM 回读管线");
@@ -194,19 +193,18 @@ public class RenderpearlVramPipeline implements FrameSource {
     }
 
     /**
-     * 把当前导出集重新绑定到新的编码器世代。
+     * 把当前导出集重新绑定到新的编码器代次。
      *
-     * <p>旧绑定注销获得 Native 确认时复用导出资源；未获确认时整个导出集弃置并新建，
-     * 新世代导入成功后才更新本管线记录的绑定世代。
+     * <p>旧绑定获 Native 确认则复用导出集，否则整个弃置新建；成功后记录新代次。
      *
-     * @param generation 新编码器世代；与控制面快照中的对象身份一致
+     * @param generation 新编码器代次；与控制面快照中的对象身份一致
      * @throws IllegalArgumentException                     generation 为 {@code null}
      * @throws kairo.vistrel.streaming.EncoderChannel.ControlException Native 拒绝重新导入
      *         或新编码器不可用；失败后本管线已无可用的显存绑定
      */
     public void rebind(SessionServer.EncoderGeneration generation) {
         if (generation == null) {
-            throw new IllegalArgumentException("编码器世代不能为空");
+            throw new IllegalArgumentException("编码器代次不能为空");
         }
         if (generation == boundGeneration) {
             return;
@@ -231,7 +229,7 @@ public class RenderpearlVramPipeline implements FrameSource {
         }
         this.vramBinding = channel.bindVram(exportSet.descriptors());
         this.boundGeneration = generation;
-        // 新编码器世代：停滞判定针对旧编码器的编码线程，不继承
+        // 新编码器代次：停滞判定针对旧编码器的编码线程，不继承
         this.stallTriggered = false;
     }
 
@@ -312,7 +310,7 @@ public class RenderpearlVramPipeline implements FrameSource {
         }
         VramBinding binding = this.vramBinding;
         if (binding == null) {
-            // 重新绑定尚未成功：没有可投递的编码器世代
+            // 重新绑定尚未成功：没有可投递的编码器代次
             return CaptureOutcome.Failed;
         }
         long prepStart = CaptureProfiler.begin();
@@ -333,8 +331,7 @@ public class RenderpearlVramPipeline implements FrameSource {
 
         int claimed = -1;
         try {
-            // 停滞判定每次采集 tick 都执行（含全忙丢帧的 tick）：卡死后 push 会停，判定不能跟着停。
-            // 心跳代表编码线程还活着——Actor 每轮循环都会推进，不推进只有卡死一种解释
+            // 停滞判定每个 tick 都执行（含全忙丢帧）：卡死后 push 会停，判定不能跟着停
             long nowNanos = System.nanoTime();
             if (binding.heartbeatTimedOut(nowNanos)) {
                 CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
@@ -470,12 +467,8 @@ public class RenderpearlVramPipeline implements FrameSource {
             } catch (Throwable ignored) {
             }
         }
-        // 注销必须等到原生侧真正确认：没有绑定 = 从未导入，游戏资源可放心释放；
-        // 有绑定但未确认（编码线程卡死 ACK 超时 / 控制队列满）时，编码器还持有
-        // 导出纹理/信号量的跨 API 导入并在上面等待，此刻销毁是驱动层
-        // 未定义行为。GpuTexture 没有 Cleaner，丢掉引用不会触发释放，
-        // 这些资源随 VkDevice 在引擎关停时统一回收，
-        // 代价只是本次会话泄漏 3 张纹理与导出池——好过整卡挂死。
+        // 未获确认说明编码器仍持有跨 API 导入，此刻销毁是驱动层未定义行为；
+        // GpuTexture 无 Cleaner，弃置的资源随 VkDevice 关停统一回收
         boolean released = true;
         if (this.vramBinding != null) {
             try {

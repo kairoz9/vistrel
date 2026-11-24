@@ -137,7 +137,7 @@ class ProfileCoordinatorTest {
     }
 
     /**
-     * 编码器世代与 codec 进入不可变快照：对象身份即控制面会话世代。
+     * 编码器代次与 codec 进入不可变快照：对象身份即控制面会话代次。
      * withPhase / withTier 必须原样携带，否则一次暂停或档位变更就会把身份抹掉。
      */
     @Test
@@ -147,19 +147,19 @@ class ProfileCoordinatorTest {
             worker.noteOfferAnswer(establishJson(1920, 1080, 60), 0.1);
             SessionServer.SessionState first = worker.current();
             assertEquals("H264", first.generation().codec(), "Answer 的 codec 必须进入快照");
-            assertSame(first.generation(), first.withPhase(SessionServer.Phase.PAUSED).generation(), "相位替换保留同一个编码器世代");
-            assertSame(first.generation(), first.withTier(tier(1280, 720, 30)).generation(), "档位替换保留同一个编码器世代");
+            assertSame(first.generation(), first.withPhase(SessionServer.Phase.PAUSED).generation(), "相位替换保留同一个编码器代次");
+            assertSame(first.generation(), first.withTier(tier(1280, 720, 30)).generation(), "档位替换保留同一个编码器代次");
             assertEquals("H264", first.withTier(tier(1280, 720, 30)).generation().codec(), "档位替换保留 codec");
 
             worker.noteOfferAnswer(establishJson(1920, 1080, 60), 0.1);
-            assertNotSame(first.generation(), worker.current().generation(), "每次 offer 落账都必须产生新世代");
+            assertNotSame(first.generation(), worker.current().generation(), "每次 offer 落账都必须产生新代次");
         } finally {
             worker.shutdown();
         }
     }
 
     /**
-     * 每次落账都必须新建世代：对象身份是控制面会话世代，复用即会让在途 ask 认错会话。
+     * 每次落账都必须新建代次：对象身份是控制面会话代次，复用即会让在途 ask 认错会话。
      */
     @Test
     void testSequentialOfferSettlementsMintDistinctGenerations() {
@@ -169,7 +169,7 @@ class ProfileCoordinatorTest {
             for (int i = 0; i < 100; i++) {
                 worker.noteOfferAnswer(establishJson(1920, 1080, 60), 0.1);
                 SessionServer.EncoderGeneration generation = worker.current().generation();
-                assertTrue(distinct.add(generation), "第 " + i + " 次落账复用了已有世代");
+                assertTrue(distinct.add(generation), "第 " + i + " 次落账复用了已有代次");
             }
         } finally {
             worker.shutdown();
@@ -196,7 +196,7 @@ class ProfileCoordinatorTest {
                         worker.noteOfferAnswer(establishJson(1920, 1080, 60), 0.1);
                         SessionServer.SessionState now = worker.current();
                         assertNotNull(now, "落账后快照不得为空");
-                        assertNotNull(now.generation(), "落账后编码器世代不得为空");
+                        assertNotNull(now.generation(), "落账后编码器代次不得为空");
                         assertEquals(tier(1920, 1080, 60), now.tier(), "落账后档位必须与 Answer 一致");
                     }
                     return null;
@@ -650,7 +650,7 @@ class ProfileCoordinatorTest {
             worker.onContentSnapshot(new ContentSnapshot(1920, 1080, 60, false, 0), 0L);
             worker.onClientSettings(800, 600, null);
             assertTrue(askEntered.await(2, TimeUnit.SECONDS), "ask 必须已进入阻塞 JNI");
-            // ask 在途时不间断重协商：新 offer 落账换基线世代，旧应答按引用同一性作废
+            // ask 在途时不间断重协商：新 offer 落账换基线代次，旧应答按引用同一性作废
             worker.noteOfferAnswer(establishJson(2560, 1440, 90), 0.1);
             assertEquals(tier(2560, 1440, 90), listener.applied.get(1), "新 offer 落账照常广播");
             releaseAsk.countDown();

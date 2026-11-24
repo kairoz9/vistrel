@@ -4,7 +4,7 @@ import kairo.vistrel.streaming.ControlStatus;
 import kairo.vistrel.streaming.VramBinding;
 
 /**
- * 基于 JNI 的显存绑定：槽位表已整批导入，持有一份共享所有权块视图与导入时的绑定世代。
+ * 基于 JNI 的显存绑定：槽位表已整批导入，持有一份共享所有权块视图与导入时的绑定轮次。
  *
  * <p>构造由 {@link NativeEncoderChannel#bindVram} 完成；本类只做投递、认领与注销，
  * 不持有 Vulkan 纹理或导出池（那些归采集侧的导出集）。
@@ -12,7 +12,7 @@ import kairo.vistrel.streaming.VramBinding;
 final class NativeVramBinding implements VramBinding {
     private final SlotStateBlock stateBlock;
     /**
-     * 导入时的显存绑定世代：推送与注销都带上它，Native 据此拒绝旧绑定的操作。
+     * 导入时的显存绑定轮次：推送与注销都带上它，Native 据此拒绝旧绑定的操作。
      */
     private final long bindingEpoch;
     /**

@@ -79,13 +79,11 @@ public interface SessionServer {
     record Tier(int width, int height, int fps, double bpp) {}
 
     /**
-     * 一个已协商建成的编码器世代：backend + codec，对象身份即控制面会话世代。
+     * 一个已协商建成的编码器代次：backend + codec，对象身份即控制面会话代次。
      *
-     * <p>每次 offer 落账创建一个新对象；{@link SessionState#withPhase} /
-     * {@link SessionState#withTier} 原样携带。故意不覆写 {@code equals} / {@code hashCode}：
-     * 两次 offer 即使 backend/codec 完全相同，也是不同的对象，在途 ask 与采集侧都必须
-     * 按引用区分。Native 显存绑定是否真的换代由共享块里的 {@code bindingEpoch} 精确回答，
-     * 本对象只承担控制面身份。
+     * <p>每次 offer 落账新建；{@link SessionState#withPhase} / {@link SessionState#withTier}
+     * 原样携带。故意不覆写 {@code equals} / {@code hashCode}：backend/codec 相同也是不同代次，
+     * 在途 ask 与采集侧按引用区分。Native 绑定是否失效由共享块 {@code bindingEpoch} 回答。
      */
     final class EncoderGeneration {
         private final String backend;
@@ -134,22 +132,21 @@ public interface SessionServer {
     }
 
     /**
-     * 会话控制面状态：编码器世代、内容相位与生效档位；{@code null} = 无会话
+     * 会话控制面状态：编码器代次、内容相位与生效档位；{@code null} = 无会话
      *
-     * <p>编码器世代只在协商落账时写入，此后只经 {@link #withPhase} / {@link #withTier}
+     * <p>编码器代次只在协商落账时写入，此后只经 {@link #withPhase} / {@link #withTier}
      * 原样携带。消费者在动作点经 {@code ProfileCoordinator#current()} 读当下状态。
      *
-     * <p>编码器世代的对象身份是控制面会话世代：新 offer = 新世代。显存绑定的精确
-     * 失效由 Native 共享块的 {@code bindingEpoch} 决定，不看本对象；几何变化由
-     * {@link Tier} 承载。fps/bpp 变化不重建显存绑定。
+     * <p>显存绑定的失效由 Native 共享块 {@code bindingEpoch} 决定，不看本对象；
+     * 几何由 {@link Tier} 承载，fps/bpp 变化不重建显存绑定。
      *
-     * @param generation 编码器世代（backend + codec）
+     * @param generation 编码器代次（backend + codec）
      * @param phase      内容相位
      * @param tier       生效档位
      */
     record SessionState(EncoderGeneration generation, Phase phase, Tier tier) {
         /**
-         * 同会话的相位替换，编码器世代与档位原样保留
+         * 同会话的相位替换，编码器代次与档位原样保留
          *
          * @param next 目标相位
          * @return 新实例
@@ -159,7 +156,7 @@ public interface SessionServer {
         }
 
         /**
-         * 同会话的档位替换，编码器世代与相位原样保留
+         * 同会话的档位替换，编码器代次与相位原样保留
          *
          * @param next 目标档位
          * @return 新实例
@@ -171,7 +168,7 @@ public interface SessionServer {
         /**
          * 是否为硬件编码
          *
-         * @return 编码器世代落到硬编时为 true
+         * @return 编码器代次落到硬编时为 true
          */
         public boolean hardware() {
             return generation.hardware();

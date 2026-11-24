@@ -77,7 +77,7 @@ impl VideoPipeline {
 
     /// 导入本次采集的显存槽位表（ask，阻塞式）
     ///
-    /// `binding_epoch` 是调用方持有的显存绑定令牌；与当前绑定世代不符即整批拒绝
+    /// `binding_epoch` 是调用方持有的显存绑定令牌；与当前绑定轮次不符即整批拒绝
     pub(crate) fn import_vram_slots(
         &self,
         binding_epoch: u64,
@@ -202,7 +202,7 @@ impl VideoPipeline {
 
     /// 投递一帧显存直通画面（槽位需先经 [`ControlSender::import_vram_slots`] 导入）
     ///
-    /// 旧绑定世代的帧直接丢弃：槽位表已随编码器换代失效，继续投递只会让
+    /// 旧绑定轮次的帧直接丢弃：槽位表已随编码器重建失效，继续投递只会让
     /// 编码线程去查一张不存在的表。检查是共享块上的原子读，不做 JNI 往返
     pub fn push_vram_slot(
         &self,
@@ -306,7 +306,7 @@ mod tests {
         );
     }
 
-    /// 旧世代推送被丢弃时必须归还渲染线程已占用的所有权位，否则槽位永久泄漏
+    /// 旧轮次推送被丢弃时必须归还渲染线程已占用的所有权位，否则槽位永久泄漏
     #[test]
     fn test_stale_vram_push_releases_claimed_slot() {
         let doorbell = Arc::new(Notify::new());
@@ -323,7 +323,7 @@ mod tests {
             !pipeline.slot_state().is_busy(1),
             "丢弃的帧没有编码器消费，所有权位必须立即归还"
         );
-        assert!(inbox.take().is_none(), "旧世代帧不得进入收件箱");
+        assert!(inbox.take().is_none(), "旧轮次帧不得进入收件箱");
     }
 
     /// 取出收件箱里的主机帧（唯一一帧，取完即空）

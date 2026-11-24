@@ -28,8 +28,7 @@ final class SlotStateBlock {
     private final ByteBuffer block;
     private final int slotCount;
     /**
-     * 心跳基准：push 成功时记录的心跳值与时刻。判定放在每次采集 tick 里——
-     * 卡死后 push 会停，判定不能跟着停。
+     * 心跳基准：push 成功时记录的心跳值与时刻（仅渲染线程写）
      */
     private long snapshotHeartbeat;
     private long snapshotNanos;
@@ -57,8 +56,7 @@ final class SlotStateBlock {
         }
         this.block = block;
         this.slotCount = slotCount;
-        // 构造时先记一次当前心跳与时刻：之后心跳只要还在推进就比对不上，
-        // 真卡死则一直相等，满 1s 必触发
+        // 构造时记下当前心跳与时刻：心跳推进即比对不上，真卡死满 1s 触发
         this.snapshotHeartbeat = heartbeat();
         this.snapshotNanos = System.nanoTime();
     }
@@ -122,9 +120,9 @@ final class SlotStateBlock {
     }
 
     /**
-     * 当前显存绑定世代：导入、推送与注销的准入令牌。
+     * 当前显存绑定轮次：导入、推送与注销的准入令牌。
      *
-     * @return 共享块中的绑定世代；0 表示尚未建立编码器
+     * @return 共享块中的绑定轮次；0 表示尚未建立编码器
      */
     public long bindingEpoch() {
         return (long) BINDING_EPOCH_HANDLE.getAcquire(block, NativeWireContract.BINDING_EPOCH_OFFSET);
