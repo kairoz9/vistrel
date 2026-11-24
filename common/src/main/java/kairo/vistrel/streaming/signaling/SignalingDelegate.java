@@ -1,5 +1,7 @@
 package kairo.vistrel.streaming.signaling;
 
+import kairo.vistrel.streaming.NativeResult;
+
 /**
  * WebRTC 信令协议委托接口 (Decoupled Signaling Delegate)
  *
@@ -12,7 +14,7 @@ public interface SignalingDelegate {
      * 收到客户端 WebRTC Offer SDP：交给 Native 协商并生成本地 Answer
      *
      * <p>目标几何与帧率已由信令层规划好，编码偏好原样透传，能否满足由 Native 按本机
-     * 能力决定；Answer JSON 携带实际生效的档位与能力清单。
+     * 能力决定。
      *
      * @param offerSdpJson WebRTC Offer SDP JSON
      * @param width        目标宽度（内容驱动，非客户端选择）
@@ -23,9 +25,10 @@ public interface SignalingDelegate {
      *                     {@code null} 表示无偏好；无法满足时协商被拒绝）
      * @param backend      客户端编码后端偏好（线上词汇 {@code nvenc}/{@code vulkan_video}/{@code software}；
      *                     {@code null} 表示无偏好；无法满足时协商被拒绝）
-     * @return Answer JSON 字符串 (包含实际生效的分辨率、帧率、bpp、能力清单与 Answer SDP)，失败时返回 null
+     * @return 统一信封；成功时 {@code data} 是 Answer（含实际生效的档位、能力清单与
+     *         Answer SDP），拒绝时按 {@code retry} / {@code fatal} 携带原因
      */
-    String onOffer(String offerSdpJson, int width, int height, int fps, double bpp, String codec, String backend);
+    NativeResult onOffer(String offerSdpJson, int width, int height, int fps, double bpp, String codec, String backend);
 
     /**
      * 收到客户端追加的 ICE Candidate

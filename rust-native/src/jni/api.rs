@@ -6,7 +6,7 @@ use crate::encode::control::ControlStatus;
 use crate::encode::hardware::{FLAT_STRIDE, VramSlotDescriptor};
 use crate::encode::{self, VideoPipeline};
 use crate::jni::callback;
-use crate::jni::{elapsed_birth_nanos, get_global};
+use crate::jni::{Reply, elapsed_birth_nanos, get_global};
 use crate::streaming::StreamingEngine;
 use crate::streaming::audio_loopback::AudioLoopback;
 use jni::Env;
@@ -24,9 +24,8 @@ use webrtc::peer_connection::RTCIceCandidateInit;
 // `LogErrorAndDefault` 收口：记日志后按零值返回。导出符号串仍逐字保留（不用宏的自动
 // mangle），确保 JVM 按短名解析到与本文件外历史版本一致的符号。
 //
-// 例外：`importVramSlots` / `clearVramSlots` 的零值恰是 `ControlStatus::Ok`，按零值
-// 返回会把 panic 伪装成「已导入 / 已注销」，Java 侧据此销毁游戏侧导出资源即显存 UAF；
-// 这两个出口沿用默认的 `ThrowRuntimeExAndDefault` 抛异常，由 Java 按失败走熔断。
+// 所有可能失败的请求/应答导出面都返回统一信封（见 `Reply`）：panic 或 JNI
+// 失败记日志后返回空串，Java 解析为空即按 retry 处理，不会把零值伪装成成功。
 
 const _: jni::NativeMethod = native_method! {
     java_type = "kairo.vistrel.streaming.natives.NativeBridge",
@@ -174,20 +173,20 @@ fn negotiate_offer<'caller>(
     let state = get_global();
     let is_running = state.is_running.load(Ordering::SeqCst);
     let engine = state.streaming_engine.load_full();
-    let answer = state.runtime.block_on(handle_negotiate_offer(
-        engine,
-        is_running,
-        &offer_str,
-        width,
-        height,
-        fps,
-        bpp,
-        codec_token.as_deref(),
-        backend_token.as_deref(),
-    ));
-    let Some(resp_str) = answer else {
-        return Ok(JString::default());
-    };
+    let resp_str = state
+        .runtime
+        .block_on(handle_negotiate_offer(
+            engine,
+            is_running,
+            &offer_str,
+            width,
+            height,
+            fps,
+            bpp,
+            codec_token.as_deref(),
+            backend_token.as_deref(),
+        ))
+        .encode();
     match env.new_string(resp_str) {
         Ok(output) => Ok(output),
         Err(_) => {
@@ -199,8 +198,8 @@ fn negotiate_offer<'caller>(
 
 /// negotiateOffer 线上请求的处理函数：存活守卫、offer 反序列化、几何与编码偏好
 /// 透传、应答整形；出口只做 JString/Env 搬运，测试直接驱动本函数钉线契约。
-/// `codec_token` / `backend_token` 缺省按自动；词表外令牌与不可行的偏好一律拒绝
-/// （无应答 = Java 回错误帧），偏好从不静默降级
+/// `codec_token` / `backend_token` 缺省按自动；词表外令牌与不可行的偏好一律拒绝，
+/// 偏好从不静默降级
 // 参数表与 JNI 包装层一一对应（后者由 Java native 签名定死），不归本侧的参数预算管
 #[allow(clippy::too_many_arguments)]
 async fn handle_negotiate_offer(
@@ -213,19 +212,19 @@ async fn handle_negotiate_offer(
     bpp: f32,
     codec_token: Option<&str>,
     backend_token: Option<&str>,
-) -> Option<String> {
+) -> Reply {
     if !is_running {
-        return None;
+        return Reply::retry("串流引擎正在关停");
     }
     let Some(engine) = engine else {
         log::error!("StreamingEngine 未启动，无法协商 Offer");
-        return None;
+        return Reply::retry("串流引擎未启动");
     };
     let offer: RTCSessionDescription = match serde_json::from_str(offer_json) {
         Ok(sdp) => sdp,
         Err(e) => {
             log::error!("无法反序列化 Offer SDP: {e}");
-            return None;
+            return Reply::fatal(format!("无法解析 Offer SDP: {e}"));
         }
     };
 
@@ -246,7 +245,7 @@ async fn handle_negotiate_offer(
             Some(codec) => Some(codec),
             None => {
                 log::warn!("negotiateOffer 的 codec 偏好 {token:?} 无法识别，协商拒绝");
-                return None;
+                return Reply::fatal(format!("无法识别的 codec 偏好 {token:?}"));
             }
         },
     };
@@ -256,7 +255,7 @@ async fn handle_negotiate_offer(
             Some(kind) => Some(kind),
             None => {
                 log::warn!("negotiateOffer 的后端偏好 {token:?} 无法识别，协商拒绝");
-                return None;
+                return Reply::fatal(format!("无法识别的编码后端偏好 {token:?}"));
             }
         },
     };
@@ -276,29 +275,30 @@ async fn handle_negotiate_offer(
         .await
     {
         Ok(parts) => parts,
-        Err(e) => {
-            log::error!("WebRTC Offer 协商失败: {e}");
-            return None;
+        Err(reply) => {
+            log::error!(
+                "WebRTC Offer 协商失败（可重试={}）: {}",
+                reply.retryable(),
+                reply.message()
+            );
+            return reply;
         }
     };
-    Some(
-        serde_json::json!({
-            "type": "answer",
-            "width": profile.width(),
-            "height": profile.height(),
-            "fps": profile.fps(),
-            // 生效画质输入：与派生码率消费的钳制值一致（偏好本身不在档位事实里）
-            "bpp": encode::clamp_bpp(initial_bpp.unwrap_or(encode::MIN_BPP)),
-            "bitrate": profile.bitrate(),
-            "codec": codec.as_str(),
-            "backend": backend.as_str(),
-            "backends": encode::encoder_caps_options_json(),
-            "bppMin": encode::MIN_BPP,
-            "bppMax": encode::MAX_BPP,
-            "sdp": answer,
-        })
-        .to_string(),
-    )
+    Reply::ok(serde_json::json!({
+        "type": "answer",
+        "width": profile.width(),
+        "height": profile.height(),
+        "fps": profile.fps(),
+        // 生效画质输入：与派生码率消费的钳制值一致（偏好本身不在档位事实里）
+        "bpp": encode::clamp_bpp(initial_bpp.unwrap_or(encode::MIN_BPP)),
+        "bitrate": profile.bitrate(),
+        "codec": codec.as_str(),
+        "backend": backend.as_str(),
+        "backends": encode::encoder_caps_options_json(),
+        "bppMin": encode::MIN_BPP,
+        "bppMax": encode::MAX_BPP,
+        "sdp": answer,
+    }))
 }
 
 const _: jni::NativeMethod = native_method! {
@@ -315,8 +315,8 @@ const _: jni::NativeMethod = native_method! {
 
 /// 阻塞应用新的画质档位（Java 后台 worker / 信令 executor 调用，渲染线程绝不调用）
 ///
-/// 应答只在**生效**时携带实际档位（`width/height/fps/bpp/bitrate`），被拒绝或
-/// 无会话返回空串，Java 按「无应答」保持自己的生效基线。codec 不在线合同里：
+/// 成功时 `data` 是实际生效档位（`width/height/fps/bpp/bitrate`）；被拒绝按
+/// `fatal`、无会话按 `retry` 返回，Java 保持自己的生效基线。codec 不在线合同里：
 /// 它是协商定死的会话常量。
 fn apply_profile<'caller>(
     env: &mut Env<'caller>,
@@ -328,12 +328,10 @@ fn apply_profile<'caller>(
 ) -> jni::errors::Result<JString<'caller>> {
     let state = get_global();
     let engine = state.streaming_engine.load_full();
-    let answer = state
+    let resp_str = state
         .runtime
-        .block_on(handle_apply_profile(engine, width, height, fps, bpp));
-    let Some(resp_str) = answer else {
-        return Ok(JString::default());
-    };
+        .block_on(handle_apply_profile(engine, width, height, fps, bpp))
+        .encode();
     match env.new_string(resp_str) {
         Ok(s) => Ok(s),
         Err(_) => Ok(JString::default()),
@@ -342,17 +340,16 @@ fn apply_profile<'caller>(
 
 /// applyProfile 线上请求的处理函数：几何透传与应答整形都在这里，
 /// 出口只做 JString/Env 搬运，测试不经 Env 直接驱动本函数钉住线契约。
-/// 返回 `None` = 无应答，Java 按「无应答」保持自己的生效基线。
 async fn handle_apply_profile(
     engine: Option<Arc<StreamingEngine>>,
     width: i32,
     height: i32,
     fps: i32,
     bpp: f32,
-) -> Option<String> {
+) -> Reply {
     let Some(engine) = engine else {
         log::warn!("applyProfile 时引擎未启动，拒绝档位请求");
-        return None;
+        return Reply::retry("applyProfile 时引擎未启动");
     };
 
     // 几何透传同协商缝：0 由引擎按暂停信号契约拒绝，负数钳成 0 只为保证不回绕
@@ -366,21 +363,21 @@ async fn handle_apply_profile(
         .await;
     let profile = match outcome {
         crate::streaming::ProfileApply::Applied(profile) => profile,
-        crate::streaming::ProfileApply::Rejected | crate::streaming::ProfileApply::NoSession => {
-            return None;
+        crate::streaming::ProfileApply::Rejected => {
+            return Reply::fatal("档位重配被编码器拒绝");
+        }
+        crate::streaming::ProfileApply::NoSession => {
+            return Reply::retry("无活跃会话");
         }
     };
-    Some(
-        serde_json::json!({
-            "width": profile.width(),
-            "height": profile.height(),
-            "fps": profile.fps(),
-            // 生效画质输入：与派生码率消费的钳制值一致（偏好本身不在档位事实里）
-            "bpp": encode::clamp_bpp(bpp),
-            "bitrate": profile.bitrate(),
-        })
-        .to_string(),
-    )
+    Reply::ok(serde_json::json!({
+        "width": profile.width(),
+        "height": profile.height(),
+        "fps": profile.fps(),
+        // 生效画质输入：与派生码率消费的钳制值一致（偏好本身不在档位事实里）
+        "bpp": encode::clamp_bpp(bpp),
+        "bitrate": profile.bitrate(),
+    }))
 }
 
 const _: jni::NativeMethod = native_method! {
@@ -488,9 +485,9 @@ fn query_encoder_caps<'caller>(
     env: &mut Env<'caller>,
     _class: JClass<'caller>,
 ) -> jni::errors::Result<JString<'caller>> {
-    // 纯读内存，不碰设备。返回本机全部可用后端及其 codec 与显卡名，由 Java 侧解析缓存
+    // 纯读内存，不碰设备。data 是本机全部可用后端及其 codec 与显卡名，由 Java 侧解析缓存
     // ——诊断界面按会话后端查表，显存直通门控按有无硬编判定，都从这一份快照派生。
-    let json = encode::encoder_caps().to_string();
+    let json = Reply::ok(encode::encoder_caps()).encode();
     match env.new_string(json) {
         Ok(s) => Ok(s),
         Err(_) => Ok(JString::default()),
@@ -500,7 +497,8 @@ fn query_encoder_caps<'caller>(
 const _: jni::NativeMethod = native_method! {
     java_type = "kairo.vistrel.streaming.natives.NativeBridge",
     export = "Java_kairo_vistrel_streaming_natives_NativeBridge_importVramSlots",
-    static fn import_vram_slots(binding_epoch: jlong, flat: jlong[]) -> jint,
+    error_policy = LogErrorAndDefault,
+    static fn import_vram_slots(binding_epoch: jlong, flat: jlong[]) -> JString,
 };
 
 fn import_vram_slots<'caller>(
@@ -508,32 +506,46 @@ fn import_vram_slots<'caller>(
     _class: JClass<'caller>,
     binding_epoch: jlong,
     flat: JPrimitiveArray<'caller, jlong>,
-) -> jni::errors::Result<jint> {
+) -> jni::errors::Result<JString<'caller>> {
+    let code = import_vram_slots_code(env, binding_epoch, flat);
+    let json = Reply::ok(serde_json::json!(code)).encode();
+    match env.new_string(json) {
+        Ok(s) => Ok(s),
+        Err(_) => Ok(JString::default()),
+    }
+}
+
+/// 槽位整批导入的领域结局：返回 `ControlStatus` 判别值，由外层统一装进 data。
+fn import_vram_slots_code<'caller>(
+    env: &mut Env<'caller>,
+    binding_epoch: jlong,
+    flat: JPrimitiveArray<'caller, jlong>,
+) -> i32 {
     // 0. 硬编能力预检：读启动期建立的快照，本机无硬编时直接拒绝
     if encode::hardware_backends().is_none() {
-        return Ok(ControlStatus::NoHardwareEncoder as i32);
+        return ControlStatus::NoHardwareEncoder as i32;
     }
 
     // 整批处理：Java 决定槽位数量，Native 只按协议切分收到的
     // 数组。长度不是每槽位 long 数的整数倍即整批拒绝，绝不按错位布局解析。
     let Ok(len) = flat.len(env) else {
-        return Ok(ControlStatus::MalformedBatch as i32);
+        return ControlStatus::MalformedBatch as i32;
     };
     if len == 0 || !len.is_multiple_of(FLAT_STRIDE) {
-        return Ok(ControlStatus::MalformedBatch as i32);
+        return ControlStatus::MalformedBatch as i32;
     }
 
     let mut buf = vec![0i64; len];
     if flat.get_region(env, 0, &mut buf).is_err() {
-        return Ok(ControlStatus::MalformedBatch as i32);
+        return ControlStatus::MalformedBatch as i32;
     }
 
     let Some(slots) = VramSlotDescriptor::parse_batch(&buf) else {
-        return Ok(ControlStatus::MalformedBatch as i32);
+        return ControlStatus::MalformedBatch as i32;
     };
 
     // 派发控制命令给 Actor 进行槽位导入与激活硬编
-    let code = if let Some(engine) = get_global().streaming_engine.load().as_ref() {
+    if let Some(engine) = get_global().streaming_engine.load().as_ref() {
         match engine
             .video()
             .import_vram_slots(binding_epoch as u64, slots)
@@ -543,8 +555,7 @@ fn import_vram_slots<'caller>(
         }
     } else {
         ControlStatus::ActorDead as i32
-    };
-    Ok(code)
+    }
 }
 
 const _: jni::NativeMethod = native_method! {
@@ -608,20 +619,31 @@ fn slot_state_block<'caller>(
 const _: jni::NativeMethod = native_method! {
     java_type = "kairo.vistrel.streaming.natives.NativeBridge",
     export = "Java_kairo_vistrel_streaming_natives_NativeBridge_clearVramSlots",
-    static fn clear_vram_slots(binding_epoch: jlong) -> jint,
+    error_policy = LogErrorAndDefault,
+    static fn clear_vram_slots(binding_epoch: jlong) -> JString,
 };
 
 fn clear_vram_slots<'caller>(
-    _env: &mut Env<'caller>,
+    env: &mut Env<'caller>,
     _class: JClass<'caller>,
     binding_epoch: jlong,
-) -> jni::errors::Result<jint> {
+) -> jni::errors::Result<JString<'caller>> {
+    let code = clear_vram_slots_code(binding_epoch);
+    let json = Reply::ok(serde_json::json!(code)).encode();
+    match env.new_string(json) {
+        Ok(s) => Ok(s),
+        Err(_) => Ok(JString::default()),
+    }
+}
+
+/// 槽位注销的领域结局：返回 `ControlStatus` 判别值，由外层统一装进 data。
+fn clear_vram_slots_code(binding_epoch: jlong) -> i32 {
     // 引擎未运行即无导入方：注销实际是空操作，Vacuous ACK 同样成立。
     // 这里返回非 OK 会让 Java 按「未获确认」保留导出资源，而编码器早已随引擎析构，
     // 保留只会白白丢掉三张导出纹理。
     let engine = get_global().streaming_engine.load();
     let Some(engine) = engine.as_ref() else {
-        return Ok(ControlStatus::Ok.code());
+        return ControlStatus::Ok.code();
     };
     let pipeline = engine.video();
 
@@ -637,7 +659,7 @@ fn clear_vram_slots<'caller>(
         // 结果码必须原样上报而不是装作成功
         log::warn!("显存槽位注销未获 Actor 确认 (code={code})，游戏侧导出资源暂缓销毁");
     }
-    Ok(code)
+    code
 }
 
 const _: jni::NativeMethod = native_method! {
@@ -795,7 +817,7 @@ mod tests {
     async fn test_negotiate_rejects_zero_geometry_as_pause_signal() {
         let (engine, _rx) = make_test_engine(false);
         for geometry in [(0, 0, 0), (-1, -1, -1)] {
-            let answer = handle_negotiate_offer(
+            let reply = handle_negotiate_offer(
                 Some(Arc::clone(&engine)),
                 true,
                 &offer_wire_json(),
@@ -808,9 +830,10 @@ mod tests {
             )
             .await;
             assert!(
-                answer.is_none(),
+                reply.message().contains("内容档位为 0"),
                 "几何 {geometry:?} 必须被拒绝而非修正成 1×1@1"
             );
+            assert!(reply.retryable(), "暂停是瞬时状态，内容恢复后可重试");
         }
     }
 
@@ -818,7 +841,7 @@ mod tests {
     #[tokio::test]
     async fn test_negotiate_refuses_while_shutting_down() {
         let (engine, _rx) = make_test_engine(false);
-        let answer = handle_negotiate_offer(
+        let reply = handle_negotiate_offer(
             Some(engine),
             false,
             &offer_wire_json(),
@@ -830,13 +853,14 @@ mod tests {
             None,
         )
         .await;
-        assert!(answer.is_none(), "关停期协商必须无应答");
+        assert!(reply.message().contains("引擎"));
+        assert!(reply.retryable(), "引擎重启后同一 offer 可重试");
     }
 
-    /// 引擎未启动 = 无应答，不是 panic 也不是错误应答
+    /// 引擎未启动 = 结构化拒绝，不是 panic
     #[tokio::test]
-    async fn test_negotiate_without_engine_returns_no_answer() {
-        let answer = handle_negotiate_offer(
+    async fn test_negotiate_without_engine_returns_typed_error() {
+        let reply = handle_negotiate_offer(
             None,
             true,
             &offer_wire_json(),
@@ -848,13 +872,14 @@ mod tests {
             None,
         )
         .await;
-        assert!(answer.is_none(), "无引擎协商必须无应答");
+        assert!(reply.message().contains("未启动"));
+        assert!(reply.retryable(), "引擎启动后同一 offer 可重试");
     }
 
     #[tokio::test]
-    async fn test_apply_profile_without_engine_returns_no_answer() {
-        let answer = handle_apply_profile(None, 1600, 900, 90, 0.2).await;
-        assert!(answer.is_none(), "无引擎档位请求必须无应答");
+    async fn test_apply_profile_without_engine_is_retryable() {
+        let reply = handle_apply_profile(None, 1600, 900, 90, 0.2).await;
+        assert!(reply.retryable(), "引擎重启后档位请求可重试");
     }
 
     /// 全线往返：协商建会话 → 档位生效 → 0 几何档位被拒。应答 JSON 的键集是 Java
@@ -864,7 +889,7 @@ mod tests {
     async fn test_negotiate_then_apply_roundtrip_pin_line_contract() {
         let (engine, _rx) = make_test_engine(false);
 
-        let answer = handle_negotiate_offer(
+        let reply = handle_negotiate_offer(
             Some(Arc::clone(&engine)),
             true,
             &offer_wire_json(),
@@ -876,38 +901,37 @@ mod tests {
             None,
         )
         .await;
-        let Some(answer_json) = answer else {
-            panic!("假后端上的合法协商必须得到应答");
-        };
-        let answer: serde_json::Value = serde_json::from_str(&answer_json).unwrap();
-        assert_eq!(answer["type"], "answer");
-        assert_eq!(answer["width"], 1920);
-        assert_eq!(answer["height"], 1080);
-        assert_eq!(answer["fps"], 60);
+        let answer_json = reply.data().expect("假后端上的合法协商必须得到应答");
+        assert_eq!(answer_json["type"], "answer");
+        assert_eq!(answer_json["width"], 1920);
+        assert_eq!(answer_json["height"], 1080);
+        assert_eq!(answer_json["fps"], 60);
         // sdp 原样透传给浏览器，保持 W3C 形态（嵌套对象携带 type 与 SDP 文本）
-        assert_eq!(answer["sdp"]["type"], "answer");
-        assert!(!answer["sdp"]["sdp"].as_str().unwrap_or_default().is_empty());
+        assert_eq!(answer_json["sdp"]["type"], "answer");
+        assert!(
+            !answer_json["sdp"]["sdp"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
+        );
         for key in [
             "width", "height", "fps", "bpp", "bitrate", "codec", "backend", "backends", "bppMin",
             "bppMax", "sdp",
         ] {
-            assert!(answer.get(key).is_some(), "offer 应答缺 {key} 键");
+            assert!(answer_json.get(key).is_some(), "offer 应答缺 {key} 键");
         }
         assert_eq!(
-            answer["backend"], "software",
+            answer_json["backend"], "software",
             "回执后端是假 Actor 实际建成的身份，不是偏好值"
         );
         assert_eq!(
-            answer["backends"],
+            answer_json["backends"],
             serde_json::json!([{ "kind": "software", "codecs": ["H264"], "gpu": "" }]),
             "未探测环境的能力清单只含软件编码（软件编码恒收尾）"
         );
 
-        let applied = handle_apply_profile(Some(Arc::clone(&engine)), 1600, 900, 90, 0.2).await;
-        let Some(applied_json) = applied else {
-            panic!("活跃会话上的合法档位必须生效");
-        };
-        let applied: serde_json::Value = serde_json::from_str(&applied_json).unwrap();
+        let reply = handle_apply_profile(Some(Arc::clone(&engine)), 1600, 900, 90, 0.2).await;
+        let applied = reply.data().expect("活跃会话上的合法档位必须生效");
         assert_eq!(applied["width"], 1600);
         for key in ["width", "height", "fps", "bpp", "bitrate"] {
             assert!(applied.get(key).is_some(), "档位应答缺 {key} 键");
@@ -920,22 +944,19 @@ mod tests {
             );
         }
 
-        assert!(
-            handle_apply_profile(Some(Arc::clone(&engine)), 0, 0, 0, 0.2)
-                .await
-                .is_none(),
-            "0 几何档位必须按暂停信号契约被拒"
-        );
+        let reply = handle_apply_profile(Some(Arc::clone(&engine)), 0, 0, 0, 0.2).await;
+        assert!(reply.data().is_none(), "拒绝不得携带 data");
+        assert!(!reply.retryable(), "同一档位重试不会成功");
     }
 
     /// 编码偏好的硬约束契约：词表外令牌、清单外后端、本机无法满足的 codec 一律协商
-    /// 拒绝（无应答 = Java 回错误帧），绝不静默降级——「无法满足即报错」
+    /// 拒绝，绝不静默降级——「无法满足即报错」
     #[tokio::test]
     async fn test_negotiate_rejects_unhonorable_preferences() {
         let (engine, _rx) = make_test_engine(false);
 
         // 词表外的令牌：契约漂移，拒绝
-        let answer = handle_negotiate_offer(
+        let reply = handle_negotiate_offer(
             Some(Arc::clone(&engine)),
             true,
             &offer_wire_json(),
@@ -947,10 +968,11 @@ mod tests {
             None,
         )
         .await;
-        assert!(answer.is_none(), "词表外 codec 必须显式拒绝");
+        assert!(reply.message().contains("codec"));
+        assert!(!reply.retryable(), "同一偏好重试不会成功");
 
         // 可识别但不可行：单测无探测快照（等价离线软编机），指定硬编必须拒绝
-        let answer = handle_negotiate_offer(
+        let reply = handle_negotiate_offer(
             Some(Arc::clone(&engine)),
             true,
             &offer_wire_json(),
@@ -962,10 +984,11 @@ mod tests {
             Some("Vulkan_Video"),
         )
         .await;
-        assert!(answer.is_none(), "清单外后端必须显式拒绝");
+        assert!(reply.message().contains("编码后端"));
+        assert!(!reply.retryable(), "同一偏好重试不会成功");
 
         // 可识别但不可行：软编机指定 AV1——「没有 AV1 的机器上远程玩家指定 AV1 就返回错误」
-        let answer = handle_negotiate_offer(
+        let reply = handle_negotiate_offer(
             Some(Arc::clone(&engine)),
             true,
             &offer_wire_json(),
@@ -977,10 +1000,11 @@ mod tests {
             None,
         )
         .await;
-        assert!(answer.is_none(), "软编机指定 AV1 必须显式拒绝");
+        assert!(reply.message().contains("codec"));
+        assert!(!reply.retryable(), "同一偏好重试不会成功");
 
         // 指定软编在能力清单内（软件编码恒可选）：照常协商成功，回执如实携带软编身份
-        let answer = handle_negotiate_offer(
+        let reply = handle_negotiate_offer(
             Some(Arc::clone(&engine)),
             true,
             &offer_wire_json(),
@@ -992,10 +1016,7 @@ mod tests {
             Some("software"),
         )
         .await;
-        let Some(answer_json) = answer else {
-            panic!("能力清单内的软编偏好必须被满足");
-        };
-        let parsed: serde_json::Value = serde_json::from_str(&answer_json).unwrap();
-        assert_eq!(parsed["backend"], "software");
+        let answer_json = reply.data().expect("能力清单内的软编偏好必须被满足");
+        assert_eq!(answer_json["backend"], "software");
     }
 }

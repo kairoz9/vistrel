@@ -8,6 +8,7 @@ import kairo.vistrel.Constants;
 import kairo.vistrel.streaming.ProfileCoordinator;
 import kairo.vistrel.streaming.ClientEvent;
 import kairo.vistrel.streaming.SessionServer;
+import kairo.vistrel.streaming.NativeResult;
 import kairo.vistrel.util.Addresses;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
@@ -365,13 +366,13 @@ public class SignalingServer {
     /**
      * 文本提示帧：认证失败与协商错误共用同一形状
      */
-    private record TextSignal(String type, String message) {
+    private record TextSignal(String type, String message, Boolean retryable) {
         static TextSignal authFailed(String message) {
-            return new TextSignal("auth_failed", message);
+            return new TextSignal("auth_failed", message, null);
         }
 
-        static TextSignal error(String message) {
-            return new TextSignal("error", message);
+        static TextSignal error(String message, boolean retryable) {
+            return new TextSignal("error", message, retryable);
         }
     }
 
@@ -760,7 +761,8 @@ public class SignalingServer {
             // 信令面未就绪（引擎探测窗口内协调器尚未注入）直接拒绝
             if (delegate == null || profileCoordinator == null) {
                 ctx.writeAndFlush(WebSocketFrameCodec.textFrame(GSON.toJson(TextSignal.error(
-                        "Signaling delegate negotiate offer failed"
+                        "Signaling delegate negotiate offer failed",
+                        true
                 ))));
                 return;
             }
@@ -783,7 +785,7 @@ public class SignalingServer {
             String sdpJson = msg.sdp() != null ? msg.sdp().toString() : "{}";
             // 快照与内部状态同源：worker 内部持有渲染线程喂入的最新快照
             SessionServer.Tier target = profileCoordinator.plan(viewportWidth, viewportHeight, bpp);
-            String answerJson =
+            NativeResult result =
                     delegate.onOffer(
                             sdpJson,
                             target.width(),
@@ -793,22 +795,31 @@ public class SignalingServer {
                             msg.codec(),
                             msg.backend()
             );
-            if (answerJson != null && !answerJson.isEmpty()) {
-                // 已被新连接抢占：旧会话迟到的 Answer 不得落账
-                if (activeChannel.get() != ctx.channel() || !ctx.channel().isActive()) {
-                    return;
-                }
-                // Answer 落账并广播初始档位；其实际档位即显示几何初值，记账后等值唤醒不再推送
-                SessionServer.Tier settled = profileCoordinator.noteOfferAnswer(answerJson, bpp);
-                if (settled != null) {
-                    sentGeometry.set(geometryKey(settled.width(), settled.height()));
-                }
-                ctx.writeAndFlush(WebSocketFrameCodec.textFrame(answerJson));
-            } else {
-                ctx.writeAndFlush(WebSocketFrameCodec.textFrame(GSON.toJson(TextSignal.error(
-                        "Signaling delegate negotiate offer failed"
-                ))));
+            if (result == null) {
+                result = NativeResult.error(true, "Signaling delegate negotiate offer failed");
             }
+            if (!result.ok() || result.data() == null) {
+                // 拒绝按 Native 的 retry / fatal 语义下发，Web 据此决定是否重连
+                if (activeChannel.get() == ctx.channel() && ctx.channel().isActive()) {
+                    String message = result.message() != null ? result.message() : "协商被拒绝";
+                    ctx.writeAndFlush(WebSocketFrameCodec.textFrame(GSON.toJson(TextSignal.error(
+                            message,
+                            result.retryable()
+                    ))));
+                }
+                return;
+            }
+            // 已被新连接抢占：旧会话迟到的 Answer 不得落账
+            if (activeChannel.get() != ctx.channel() || !ctx.channel().isActive()) {
+                return;
+            }
+            String answerJson = result.data().toString();
+            // Answer 落账并广播初始档位；其实际档位即显示几何初值，记账后等值唤醒不再推送
+            SessionServer.Tier settled = profileCoordinator.noteOfferAnswer(answerJson, bpp);
+            if (settled != null) {
+                sentGeometry.set(geometryKey(settled.width(), settled.height()));
+            }
+            ctx.writeAndFlush(WebSocketFrameCodec.textFrame(answerJson));
         }
 
         /**

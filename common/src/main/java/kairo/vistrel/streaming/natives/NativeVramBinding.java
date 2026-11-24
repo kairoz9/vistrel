@@ -1,6 +1,7 @@
 package kairo.vistrel.streaming.natives;
 
 import kairo.vistrel.streaming.ControlStatus;
+import kairo.vistrel.streaming.NativeResult;
 import kairo.vistrel.streaming.VramBinding;
 
 /**
@@ -76,15 +77,19 @@ final class NativeVramBinding implements VramBinding {
             releaseStatus = ReleaseStatus.RELEASED;
             return releaseStatus;
         }
-        int code;
+        NativeResult result;
         try {
-            code = NativeBridge.clearVramSlots(bindingEpoch);
+            result = NativeResult.parse(NativeBridge.clearVramSlots(bindingEpoch));
         } catch (Throwable t) {
             // JNI 异常同样意味着未获确认：资源必须保留，重复 close 也返回同一结算
             releaseStatus = ReleaseStatus.RETAINED;
             throw t;
         }
-        releaseStatus = code == ControlStatus.OK.code() ? ReleaseStatus.RELEASED : ReleaseStatus.RETAINED;
+        boolean confirmed = result.ok()
+                && result.data() != null
+                && result.data().isJsonPrimitive()
+                && result.data().getAsInt() == ControlStatus.OK.code();
+        releaseStatus = confirmed ? ReleaseStatus.RELEASED : ReleaseStatus.RETAINED;
         return releaseStatus;
     }
 }

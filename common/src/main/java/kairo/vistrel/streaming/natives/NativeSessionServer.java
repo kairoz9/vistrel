@@ -2,6 +2,7 @@ package kairo.vistrel.streaming.natives;
 
 import kairo.vistrel.Constants;
 import kairo.vistrel.streaming.ClientEvent;
+import kairo.vistrel.streaming.NativeResult;
 import kairo.vistrel.streaming.SessionServer;
 import kairo.vistrel.streaming.ProfileCoordinator;
 import kairo.vistrel.util.Addresses;
@@ -14,7 +15,7 @@ public final class NativeSessionServer implements SessionServer {
     private final kairo.vistrel.streaming.signaling.SignalingServer signalingServer = new kairo.vistrel.streaming.signaling.SignalingServer(
             new kairo.vistrel.streaming.signaling.SignalingDelegate() {
                 @Override
-                public String onOffer(
+                public NativeResult onOffer(
                         String offerSdpJson,
                         int width,
                         int height,
@@ -23,7 +24,15 @@ public final class NativeSessionServer implements SessionServer {
                         String codec,
                         String backend
                 ) {
-                    return NativeBridge.negotiateOffer(offerSdpJson, width, height, fps, (float) bpp, codec, backend);
+                    return NativeResult.parse(NativeBridge.negotiateOffer(
+                            offerSdpJson,
+                            width,
+                            height,
+                            fps,
+                            (float) bpp,
+                            codec,
+                            backend
+                    ));
                 }
 
                 @Override
@@ -149,6 +158,11 @@ public final class NativeSessionServer implements SessionServer {
     @Override
     public String applyProfile(int width, int height, int fps, double bpp) {
         // JNI 声明为 float：原生侧按 f32 派生码率，边界上收窄一次
-        return NativeBridge.applyProfile(width, height, fps, (float) bpp);
+        NativeResult result = NativeResult.parse(NativeBridge.applyProfile(width, height, fps, (float) bpp));
+        if (!result.ok()) {
+            Constants.LOG.debug("档位请求未生效 ({}): {}", result.status(), result.message());
+            return "";
+        }
+        return result.data() != null ? result.data().toString() : "";
     }
 }

@@ -21,6 +21,8 @@ use crate::encode::StreamingProfile;
 use crate::encode::TierRequest;
 use crate::encode::VideoCodec;
 use crate::encode::VideoPipeline;
+use crate::encode::control::ControlStatus;
+use crate::jni::Reply;
 use crate::streaming::audio_loopback::AudioLoopback;
 use crate::streaming::session::{IceCandidateSink, SessionHandler, StreamingSession};
 
@@ -58,6 +60,17 @@ pub struct EncodePreferences {
     pub backend: Option<EncodeBackendKind>,
     /// Codec 偏好（`VideoCodec` 线上令牌；`None` 为自动）
     pub codec: Option<VideoCodec>,
+}
+
+/// 控制面失败到失败信封的映射：无硬编 / 建成失败 / 重配拒绝是永久拒绝，其余按瞬时处理
+fn reply_from_control(status: ControlStatus) -> Reply {
+    match status {
+        ControlStatus::NoHardwareEncoder => Reply::fatal("本机无可用硬件编码器"),
+        ControlStatus::EncoderBuildFailed => Reply::fatal("硬件编码器建成失败"),
+        ControlStatus::ReconfigureFailed => Reply::fatal("编码器拒绝重配"),
+        ControlStatus::MalformedBatch => Reply::fatal("控制命令协议错位"),
+        other => Reply::retry(format!("编码器未能在会话建立前就绪: {other:?}")),
+    }
 }
 
 /// 档位 ask 的应答（被动数据载体）：只有生效值能被回传。
@@ -171,7 +184,7 @@ impl StreamingEngine {
     ///
     /// 几何与帧率来自游戏内容快照（Java 侧已合并视口上限），bpp 与编码偏好来自
     /// 浏览器端；offer 成功即 Java 信令层自持的「活跃」起点。
-    pub async fn handle_offer(
+    pub(crate) async fn handle_offer(
         self: &Arc<Self>,
         offer: RTCSessionDescription,
         width: usize,
@@ -186,11 +199,11 @@ impl StreamingEngine {
             VideoCodec,
             EncodeBackendKind,
         ),
-        Box<dyn std::error::Error + Send + Sync>,
+        Reply,
     > {
         if width == 0 || height == 0 || fps == 0 {
             // 0×0 是暂停信号，不是需要「修正」的最小档位；协商必须被显式拒绝
-            return Err("内容档位为 0（暂停态不应发起协商）".into());
+            return Err(Reply::retry("内容档位为 0（暂停态不应发起协商）"));
         }
         let epoch = self.session_epoch.load(Ordering::SeqCst);
         let old_session = self.active_session.swap(None);
@@ -205,9 +218,9 @@ impl StreamingEngine {
             None => None,
             Some(kind) => {
                 if !crate::encode::is_selectable(kind) {
-                    return Err(
-                        format!("指定的编码后端 {kind:?} 不在本机能力清单内，协商拒绝").into(),
-                    );
+                    return Err(Reply::fatal(format!(
+                        "指定的编码后端 {kind:?} 不在本机能力清单内，协商拒绝"
+                    )));
                 }
                 Some(kind)
             }
@@ -222,8 +235,8 @@ impl StreamingEngine {
             None => backends.as_deref().and_then(|list| list.first()),
         };
         // codec 是协商产物（offer 提供 ∩ 服务端可行，偏好为硬约束）
-        let codec = resolve_codec(Some(&offer), caps_entry, preferences.codec)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        let codec =
+            resolve_codec(Some(&offer), caps_entry, preferences.codec).map_err(Reply::fatal)?;
         let request = resolve_initial_request(width, height, fps, bpp, caps_entry);
 
         // prepare 回执携带实际生效档位、codec 与后端身份；指定维度被替换（建败回退）在此拒绝
@@ -231,28 +244,28 @@ impl StreamingEngine {
             .video
             .prepare_encoder(request, codec, preferred)
             .await
-            .map_err(|e| format!("编码器未能在会话建立前就绪 (code={})", e.code()))?;
+            .map_err(reply_from_control)?;
         if let Some(kind) = preferred
             && backend != kind
         {
-            return Err(format!(
+            return Err(Reply::fatal(format!(
                 "指定的编码后端 {kind:?} 未能就绪（实际建成 {backend:?}），协商拒绝"
-            )
-            .into());
+            )));
         }
         if let Some(preferred_codec) = preferences.codec
             && codec != preferred_codec
         {
-            return Err(format!(
+            return Err(Reply::fatal(format!(
                 "指定的 codec {preferred_codec:?} 未能就绪（实际建成 {codec:?}），协商拒绝"
-            )
-            .into());
+            )));
         }
 
         let handler = self.candidate_handler();
 
         let (session, answer) =
-            StreamingSession::establish(self.as_ref(), offer, effective, codec, handler).await?;
+            StreamingSession::establish(self.as_ref(), offer, effective, codec, handler)
+                .await
+                .map_err(|e| Reply::retry(e.to_string()))?;
 
         // 安装结算：先落账再复核纪元
         let old_session = self.active_session.swap(Some(Arc::clone(&session)));
@@ -261,7 +274,7 @@ impl StreamingEngine {
             let mine = Some(Arc::clone(&session));
             let _ = self.active_session.compare_and_swap(&mine, None);
             session.close().await;
-            return Err("会话建立期间引擎已关闭，会话未安装".into());
+            return Err(Reply::retry("会话建立期间引擎已关闭，会话未安装"));
         }
         if let Some(old_session) = old_session {
             old_session.close().await;

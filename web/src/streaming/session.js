@@ -14,6 +14,8 @@ export const ConnectStatus = Object.freeze({
     CONNECTING: "connecting",
     CONNECTED: "connected",
     DISCONNECTED: "disconnected",
+    /** 服务端永久拒绝（retryable=false）：停止重连，等待用户改偏好后手动重试 */
+    REJECTED: "rejected",
     CLOSED: "closed",
 });
 
@@ -114,6 +116,7 @@ export class StreamingSession {
         this.currentPassword = "";
         this.isKicked = false;
         this.isAuthFailed = false;
+        this.isFatal = false;
         this.offerSent = false;
         this.statsInterval = null;
         this.statsBusyPc = null;
@@ -181,6 +184,7 @@ export class StreamingSession {
     start(password) {
         if (this.isKicked) return;
         this.isAuthFailed = false;
+        this.isFatal = false;
         this.auth = "pending";
         this.offerSent = false;
         this.currentPassword = password;
@@ -207,7 +211,7 @@ export class StreamingSession {
         };
 
         this.ws.onclose = (event) => {
-            if (this.isKicked || this.isAuthFailed) return;
+            if (this.isKicked || this.isAuthFailed || this.isFatal) return;
             this.setStatus(ConnectStatus.CLOSED);
             this.cleanupPeer();
             if (event && event.code === KICKED_CODE) {
@@ -315,10 +319,20 @@ export class StreamingSession {
             } else if (msg.type === WS_IN.ERROR) {
                 const message = msg.message || "unknown";
                 console.error("Vistrel: Signaling error from server:", message);
-                // 拒绝原因（如编码偏好不可满足）必须上屏：否则硬拒绝只是无声的重连循环
+                // 拒绝原因（如编码偏好不可满足）必须上屏，否则用户只看到断线而不知原因
                 this.emit(SESSION_EVENTS.ERROR, message);
+                if (msg.retryable === false) {
+                    // 永久拒绝：同一 offer 与偏好重试不会成功，停住重连闭环
+                    this.isFatal = true;
+                    this.clearReconnectTimer();
+                    this.setStatus(ConnectStatus.REJECTED);
+                    this.cleanupPeer();
+                    closeQuietly(this.ws);
+                    this.ws = null;
+                    return;
+                }
                 this.setStatus(ConnectStatus.DISCONNECTED);
-                // 信令错误视为可恢复：关闭信令连接，走 onclose 的 3 秒重连闭环
+                // 可恢复：关闭信令连接，走 onclose 的 3 秒重连闭环
                 if (this.ws && this.ws.readyState === WebSocket.OPEN) {
                     this.ws.close();
                 }

@@ -6,6 +6,10 @@
 
 pub mod api;
 pub mod callback;
+pub(crate) mod reply;
+
+pub(crate) use reply::Reply;
+
 use crate::streaming::StreamingEngine;
 use arc_swap::ArcSwapOption;
 use std::sync::atomic::AtomicBool;
