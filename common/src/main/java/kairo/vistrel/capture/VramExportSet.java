@@ -53,74 +53,6 @@ public final class VramExportSet {
      * 工作，只要求不超过共享块 busy 位容量。Rust 侧同槽数的导出替身对齐此值。
      */
     static final int SLOT_COUNT = 3;
-    /**
-     * 槽位纹理标签前缀：MixinVulkanGpuTexture 靠这个名字识别本导出集的纹理；
-     * 即使导出作用域因异常泄漏到无关的创建路径，也不会波及别的纹理分配
-     */
-    public static final String SLOT_TEXTURE_LABEL_PREFIX = "Vistrel Vulkan Dedicated Frame ";
-
-    /**
-     * 获取当前平台外部显存导出句柄类型 (Linux: OPAQUE_FD, Windows: OPAQUE_WIN32)
-     *
-     * @return {@code VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_*} 常量值
-     */
-    public static int getExternalMemoryHandleType() {
-        return Constants.IS_WINDOWS
-                ? VK11.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
-                : VK11.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-    }
-
-    /**
-     * 获取当前平台外部时间线信号量导出句柄类型 (Linux: OPAQUE_FD, Windows: OPAQUE_WIN32)
-     *
-     * @return {@code VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_*} 常量值
-     */
-    static int getExternalSemaphoreHandleType() {
-        return Constants.IS_WINDOWS
-                ? VK11.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT
-                : VK11.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
-    }
-
-    private static final ThreadLocal<ScopedExportAllocation> ACTIVE_EXPORT_SCOPE = new ThreadLocal<>();
-
-    /**
-     * 获取当前渲染线程活动的 VRAM 导出分配作用域 (供 MixinVulkanGpuTexture 读取)
-     *
-     * @return 当前线程的活动作用域（栈顶）；无活动作用域时返回 {@code null}
-     */
-    public static ScopedExportAllocation getActiveExportScope() {
-        return ACTIVE_EXPORT_SCOPE.get();
-    }
-
-    /**
-     * 显存导出分配作用域 (RAII，栈序嵌套)
-     */
-    public static final class ScopedExportAllocation implements AutoCloseable {
-        private final long exportPool;
-        private final ScopedExportAllocation previous;
-        private boolean closed = false;
-
-        private ScopedExportAllocation(long exportPool, ScopedExportAllocation previous) {
-            this.exportPool = exportPool;
-            this.previous = previous;
-        }
-
-        public long exportPool() {
-            return exportPool;
-        }
-
-        @Override
-        public void close() {
-            if (!closed) {
-                closed = true;
-                if (previous != null) {
-                    ACTIVE_EXPORT_SCOPE.set(previous);
-                } else {
-                    ACTIVE_EXPORT_SCOPE.remove();
-                }
-            }
-        }
-    }
 
     /**
      * 单个导出槽位的游戏侧资源：纹理、视图以及导出句柄对应的原生对象。
@@ -181,11 +113,10 @@ public final class VramExportSet {
                     .tiling(VK10.VK_IMAGE_TILING_OPTIMAL)
                     .usage(VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK10.VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
-                VkExternalMemoryImageCreateInfo extImageInfo =
-                        VkExternalMemoryImageCreateInfo
+                VkExternalMemoryImageCreateInfo extImageInfo = VkExternalMemoryImageCreateInfo
                     .calloc(stack)
                     .sType$Default()
-                    .handleTypes(getExternalMemoryHandleType());
+                    .handleTypes(VramExportScope.memoryHandleType());
                 testImgInfo.pNext(extImageInfo.address());
 
                 VmaAllocationCreateInfo testAllocInfo = VmaAllocationCreateInfo
@@ -206,7 +137,7 @@ public final class VramExportSet {
                 this.exportAllocInfo = VkExportMemoryAllocateInfoKHR
                     .calloc()
                     .sType$Default()
-                    .handleTypes(getExternalMemoryHandleType());
+                    .handleTypes(VramExportScope.memoryHandleType());
 
                 VmaPoolCreateInfo poolInfo =
                         VmaPoolCreateInfo
@@ -222,16 +153,17 @@ public final class VramExportSet {
                 this.exportPool = pPool.get(0);
             }
             // 2. 循环分配 3 槽位 Dedicated 纹理与 1:1 时间线信号量
-            try (ScopedExportAllocation _ = enterExportScope()) {
+            try (VramExportScope _ = VramExportScope.open(exportPool)) {
                 for (int i = 0; i < SLOT_COUNT; i++) {
-                    GpuTexture tex = device.createTexture(
-                            SLOT_TEXTURE_LABEL_PREFIX + i,
-                            textureUsage,
-                            GpuFormat.RGBA8_UNORM,
-                            width,
-                            height,
-                            1,
-                            1
+                    GpuTexture tex =
+                            device.createTexture(
+                                    VramExportScope.slotLabel(i),
+                                    textureUsage,
+                                    GpuFormat.RGBA8_UNORM,
+                                    width,
+                                    height,
+                                    1,
+                                    1
                     );
 
                     if (!(tex instanceof VulkanGpuTexture vkTex)) {
@@ -294,11 +226,10 @@ public final class VramExportSet {
                     long vkSemaphore = 0L;
                     long semHandle = 0;
                     try (MemoryStack stack = MemoryStack.stackPush()) {
-                        VkExportSemaphoreCreateInfoKHR expSemInfo =
-                                VkExportSemaphoreCreateInfoKHR
+                        VkExportSemaphoreCreateInfoKHR expSemInfo = VkExportSemaphoreCreateInfoKHR
                             .calloc(stack)
                             .sType$Default()
-                            .handleTypes(getExternalSemaphoreHandleType());
+                            .handleTypes(VramExportScope.semaphoreHandleType());
 
                         VkSemaphoreTypeCreateInfo typeInfo = VkSemaphoreTypeCreateInfo
                             .calloc(stack)
@@ -386,15 +317,6 @@ public final class VramExportSet {
      */
     VulkanSlot slot(int index) {
         return slots[index];
-    }
-
-    private ScopedExportAllocation enterExportScope() {
-        if (this.exportPool == 0L) {
-            throw new IllegalStateException("Cannot enter export scope: exportPool is not initialized");
-        }
-        ScopedExportAllocation scope = new ScopedExportAllocation(this.exportPool, ACTIVE_EXPORT_SCOPE.get());
-        ACTIVE_EXPORT_SCOPE.set(scope);
-        return scope;
     }
 
     /**
