@@ -8,11 +8,9 @@ import kairo.vistrel.streaming.VramBinding;
 /**
  * 基于 JNI 的显存绑定：槽位表与在途状态全在 Native，本类只持一个不透明句柄。
  *
- * <p>构造由 {@link NativeEncoderChannel#bindVram} 完成；本类只做取槽、投递、心跳判定与注销，
- * 不持有 Vulkan 纹理或导出池（那些归采集侧的导出集）。
- *
- * <p>{@link #acquire(int, long)} 每次向 Native 拉一次权威快照：在途掩码用于本地选位，
- * 心跳用于停滞判定。未投递的槽位在 Native 从未置位，因此不存在需要归还的本地账。
+ * <p>构造由 {@link NativeEncoderChannel#bindVram} 完成；本类不持有 Vulkan 纹理或导出池。
+ * {@link #acquire(int, long)} 每次拉一次权威快照（在途掩码 + 心跳）；未投递的槽位在
+ * Native 从未置位，因此不存在需要归还的本地账。
  */
 final class NativeVramBinding implements VramBinding {
     private static final long IN_FLIGHT_MASK = (1L << NativeWireContract.MASK_BITS) - 1;
@@ -68,7 +66,7 @@ final class NativeVramBinding implements VramBinding {
         }
         if (status == ControlStatus.STALE_BINDING || status == ControlStatus.PIPELINE_DEAD) {
             // 旧绑定/引擎不在：不刷新心跳基准，让停滞判定在阈值后接管
-            return -1;
+            return BINDING_UNAVAILABLE;
         }
         if (status != ControlStatus.OK) {
             throw new ControlException("NativeBridge.vramSlotState 失败", status);
@@ -189,7 +187,7 @@ final class NativeVramBinding implements VramBinding {
      * @param preferredIdx 首选槽位索引；非法值直接降级
      * @param freeMask     空闲位图
      * @param slotCount    本绑定槽位数
-     * @return 槽位索引；全忙返回 -1
+     * @return 槽位索引；全忙返回 {@link VramBinding#NO_FREE_SLOT}
      */
     static int pickSlot(int preferredIdx, long freeMask, int slotCount) {
         if (preferredIdx >= 0 && preferredIdx < slotCount && (freeMask & (1L << preferredIdx)) != 0) {
@@ -200,6 +198,6 @@ final class NativeVramBinding implements VramBinding {
                 return i;
             }
         }
-        return -1;
+        return NO_FREE_SLOT;
     }
 }

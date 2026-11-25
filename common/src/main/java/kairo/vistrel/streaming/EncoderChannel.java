@@ -44,6 +44,9 @@ public interface EncoderChannel {
      * <p>整批处理：要么全成要么全败。绑定只对导入时取得的绑定句柄有效；编码器重建后
      * 旧绑定的推送在 Native 入口丢弃，调用方应重新导入。
      *
+     * <p>一旦提交给 Native，这批槽位的原始系统句柄就由 Native 一次性接管：导入失败后
+     * 句柄也不可再次提交，调用方必须弃用整个导出集。
+     *
      * @param slots 槽位描述，索引与几何由调用方与 Native 双重校验
      * @return 已导入的显存绑定
      * @throws UnsupportedOperationException 实现不支持显存直通

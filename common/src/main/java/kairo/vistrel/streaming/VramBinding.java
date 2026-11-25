@@ -3,13 +3,12 @@ package kairo.vistrel.streaming;
 /**
  * 一段导出显存绑定到某个编码器代次的 Java 侧句柄：槽位取用、帧投递、心跳判定与注销结算。
  *
- * <p>生命周期由采集侧持有；构造即整批导入（全成全败），{@link #close()} 是唯一注销入口。
- * 绑定只对导入时取得的句柄有效：编码器重建/失效重配后 Native 摘除绑定，旧句柄的推送
- * 在入口丢弃。槽位表、在途位与心跳全在 Native，Java 不持有任何共享内存视图。
+ * <p>构造即整批导入（全成全败），{@link #close()} 是唯一注销入口。绑定只对导入时取得的
+ * 句柄有效：编码器重建或失效重配后 Native 摘除绑定，旧句柄的推送在入口丢弃。槽位表、
+ * 在途位与心跳全在 Native，Java 不持有共享内存视图。
  *
- * <p>线程约定：{@link #acquire(int, long)} / {@link #push(int, long)} /
- * {@link #heartbeatTimedOut(long)} 在渲染线程调用；{@link #stallDiagnostics()} 只在超时后
- * 调用；{@link #close()} 在管线拆除路径调用。
+ * <p>线程约定：{@link #acquire} / {@link #push} / {@link #heartbeatTimedOut} 在渲染线程
+ * 调用；{@link #stallDiagnostics()} 只在超时后调用；{@link #close()} 在管线拆除路径调用。
  */
 public interface VramBinding {
     /**
@@ -19,6 +18,14 @@ public interface VramBinding {
      * （含全忙丢帧的 tick）——卡死后 push 会停，判定不能跟着停。
      */
     long STALL_HEARTBEAT_TIMEOUT_NS = 1_000_000_000L;
+    /**
+     * 本 tick 没有空闲槽位：主动丢帧，不是故障
+     */
+    int NO_FREE_SLOT = -1;
+    /**
+     * 绑定已失效或引擎已不在：本帧无法投递，等停滞判定触发自愈
+     */
+    int BINDING_UNAVAILABLE = -2;
 
     /**
      * 取一个空闲槽位：向 Native 拉一次权威快照（在途掩码 + 心跳），本地选位。
@@ -28,7 +35,8 @@ public interface VramBinding {
      *
      * @param preferredIdx 首选槽位索引；非法或忙时按索引序降级
      * @param nowNanos     本帧开始时刻（{@code System.nanoTime()} 域），用作心跳基准
-     * @return 槽位索引；全忙或绑定已失效返回 -1（对应主动丢帧，不是故障）
+     * @return 槽位索引；全忙返回 {@link #NO_FREE_SLOT}，绑定/引擎失效返回
+     *         {@link #BINDING_UNAVAILABLE}——两者都按主动丢帧处理，不升级为 Failed
      * @throws IllegalStateException 绑定已关闭
      * @throws EncoderChannel.ControlException Native 返回未知/致命状态
      */

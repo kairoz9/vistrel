@@ -98,8 +98,7 @@ public final class NativeEncoderChannel implements EncoderChannel, InputEventSou
                     "显存槽位数量超过掩码容量: " + slots.size() + " > " + NativeWireContract.MAX_VRAM_SLOTS
             );
         }
-        // 导入与句柄由 Native 一次给出：没有"取块"第二步，也就不存在取块失败的 TOCTOU。
-        // 导入失败（Actor 死亡/后端拒绝）由调用方按整条显存管线失败处理。
+        // 导入与句柄由 Native 一次给出；失败即整条显存管线失败，原始句柄已被 Native 消费。
         long[] flat = encodeSlots(slots);
         NativeResult result = NativeResult.parse(NativeBridge.importVramSlots(flat));
         if (!result.ok() || result.data() == null || !result.data().isJsonObject()) {

@@ -49,12 +49,17 @@ class NativeVramBindingTest {
         Assertions.assertEquals(0, NativeVramBinding.pickSlot(2, 0b011L, 3), "首选忙时按索引序降级");
         Assertions.assertEquals(2, NativeVramBinding.pickSlot(-1, 0b100L, 3), "非法首选退化为索引序");
         Assertions.assertEquals(2, NativeVramBinding.pickSlot(9, 0b100L, 3), "越界首选同样退化");
-        Assertions.assertEquals(-1, NativeVramBinding.pickSlot(0, 0L, 3), "全忙返回 -1");
+        Assertions.assertEquals(VramBinding.NO_FREE_SLOT, NativeVramBinding.pickSlot(0, 0L, 3), "全忙返回无空闲哨兵");
     }
 
     @Test
     void testPickSlotNeverEscapesSlotCount() {
-        Assertions.assertEquals(-1, NativeVramBinding.pickSlot(5, 1L << 5, 3), "槽位数外的高位不得被选中");
+        Assertions.assertEquals(VramBinding.NO_FREE_SLOT, NativeVramBinding.pickSlot(5, 1L << 5, 3), "槽位数外的高位不得被选中");
+    }
+
+    @Test
+    void testUnavailableSentinelIsDistinctFromNoFreeSlot() {
+        Assertions.assertNotEquals(VramBinding.NO_FREE_SLOT, VramBinding.BINDING_UNAVAILABLE);
     }
 
     @Test

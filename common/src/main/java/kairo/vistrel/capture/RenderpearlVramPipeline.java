@@ -201,7 +201,8 @@ public class RenderpearlVramPipeline implements FrameSource {
      * @param generation 新编码器代次；与控制面快照中的对象身份一致
      * @throws IllegalArgumentException                     generation 为 {@code null}
      * @throws kairo.vistrel.streaming.EncoderChannel.ControlException Native 拒绝重新导入
-     *         或新编码器不可用；失败后本管线已无可用的显存绑定
+     *         或新编码器不可用；失败后本管线已无可用的显存绑定，且导出集句柄已被 Native
+     *         消费，不得用同一导出集重试
      */
     public void rebind(SessionServer.EncoderGeneration generation) {
         if (generation == null) {
@@ -248,8 +249,7 @@ public class RenderpearlVramPipeline implements FrameSource {
     }
 
     /**
-     * 心跳超时：判定编码线程卡死，一次性停推显存帧并移交自愈回调。
-     * 此刻编码器可能仍映射着槽位纹理，任何写入都是跨 API 竞态，必须立即收手
+     * 心跳超时：判定编码线程卡死，停推显存帧并移交自愈回调
      */
     private void onHeartbeatTimeout() {
         stopVramPush(String.format(
@@ -260,7 +260,7 @@ public class RenderpearlVramPipeline implements FrameSource {
     }
 
     /**
-     * 毒化：编码器等待超时后，在途提交可能仍在读槽位纹理，必须停推并自愈
+     * 毒化：等待超时后，在途提交可能仍在读槽位纹理，必须停推并自愈
      */
     private void onEncoderPoisoned() {
         stopVramPush("显存直通毒化：编码器等待超时，在途提交可能仍在读槽位纹理，停推显存帧并触发引擎自愈");
@@ -355,6 +355,11 @@ public class RenderpearlVramPipeline implements FrameSource {
             if (binding.heartbeatTimedOut(nowNanos)) {
                 CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
                 onHeartbeatTimeout();
+                return CaptureOutcome.Dropped;
+            }
+            if (slotIdx == VramBinding.BINDING_UNAVAILABLE) {
+                // 绑定已被摘除或引擎不在：不是槽位压力，停滞判定会接管自愈
+                CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
                 return CaptureOutcome.Dropped;
             }
             // 全忙是**主动**丢帧：管线健康，只是编码器暂时没消费完。必须与 Failed 区分——

@@ -170,7 +170,7 @@ pub(crate) struct VulkanVideoBackend {
     /// 当前 codec
     codec: VideoCodec,
     slots: SlotTable<VramSlot>,
-    /// 槽位所有权共享块：编码出口归还位（毒化时粘滞），与 Actor 同代
+    /// 引擎级编码进度：本后端只写阶段码，心跳由 Actor 循环推进
     progress: Arc<ActorProgress>,
     /// 本设备为该 codec 声明的 `pictureAccessGranularity`
     ///

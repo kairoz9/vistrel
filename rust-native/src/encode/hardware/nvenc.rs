@@ -185,7 +185,7 @@ pub(crate) struct NvencBackend {
     /// 池块强引用：与帧池、会话共享，重构几何时据此重建输入缓冲
     block_handles: Vec<Arc<PinnedHost>>,
     slots: SlotTable<SlotEntry>,
-    /// 槽位所有权共享块：编码出口归还位，与 Actor 同代
+    /// 引擎级编码进度：本后端只写阶段码，心跳由 Actor 循环推进
     progress: Arc<ActorProgress>,
     /// 必须排在 session / slots 之后（字段按声明顺序析构）：NVENC 在 set_io 时
     /// 拷贝句柄值并在会话存续期间持续使用，流对象必须比会话活得久（先销毁流会导致编码
@@ -269,7 +269,7 @@ impl NvencBackend {
     /// 显存槽位编码：等待生产者就绪 → 映射 → 提交 → 锁定 → 拷出 → 解映射
     ///
     /// 前置校验失败（查不到槽位/未注册/几何过期）与编码失败统一以 Err 出口；
-    /// 所有权归还由调用方在出口统一处理，本方法只写共享块的阶段码
+    /// 槽位认领随帧载荷析构归还，本方法只写阶段码
     fn encode_vram_slot(
         &mut self,
         slot_idx: u32,

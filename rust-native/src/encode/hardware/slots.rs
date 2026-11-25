@@ -352,8 +352,7 @@ impl ActorProgress {
 /// 句柄在新引擎上重新有效，旧绑定的帧就能推进新引擎的槽位表。
 static NEXT_BINDING_HANDLE: AtomicU64 = AtomicU64::new(1);
 
-/// 一次显存绑定的全部所有权状态。与 Java 侧 `VramBinding` 是同一个领域对象的两个面：
-/// Native 持有事实，Java 只持有 `handle`。
+/// 一次显存绑定的全部所有权状态：Native 持有事实，Java 只持有 `handle`。
 pub(crate) struct VramBinding {
     handle: u64,
     /// 已导入槽位的位掩码：Java 只能使用这些索引
@@ -459,10 +458,8 @@ impl VramBinding {
     }
 }
 
-/// 一次已移交槽位的所有权：Drop 即归还（ack）。
-///
-/// 命名沿用 `OwnedFd` 的约定——持有即承担归还义务。`suppress` 用于提交仍在途、
-/// GPU 可能仍读取槽位的失败路径：此后 Drop 不再归还。
+/// 一次已移交槽位的所有权：Drop 即归还（ack）。命名沿用 `OwnedFd` 的约定——持有即
+/// 承担归还义务；毒化路径置位 `suppress` 后 Drop 不再归还。
 pub(crate) struct OwnedSlot {
     binding: Arc<VramBinding>,
     slot: u32,
