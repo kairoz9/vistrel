@@ -7,6 +7,7 @@
 //!
 
 use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
@@ -47,7 +48,7 @@ pub(crate) fn new_cuda_context(ordinal: i32) -> Result<Arc<CudaContext>, String>
 /// 在指定流上排队等待外部时间线信号量到达 `value`
 pub(crate) fn wait_timeline_sem(
     ctx: &CudaContext,
-    sem: CUexternalSemaphore,
+    sem: NonNull<CUextSemaphore_st>,
     value: u64,
     stream: CUstream,
 ) -> Result<(), String> {
@@ -55,7 +56,7 @@ pub(crate) fn wait_timeline_sem(
     // 全零位模式合法；CUDA 约定调用方零初始化参数结构后按信号类型填写 params
     let mut wait_params: CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS = unsafe { std::mem::zeroed() };
     wait_params.params.fence.value = value;
-    let sem_arr = [sem];
+    let sem_arr = [sem.as_ptr()];
     let params_arr = [wait_params];
     ctx.bind_to_thread()
         .map_err(|e| format!("CUDA 上下文绑定失败: {e}"))?;
@@ -133,16 +134,19 @@ pub(crate) fn enumerate_devices() -> Vec<CudaDeviceInfo> {
 /// PCIe DMA 从同一个指针读帧（`backend.rs` 的系统内存输入缓冲路径）。
 ///
 /// 分配与释放都自带幂等上下文绑定，是唯一允许脱离编码 actor 线程析构的 CUDA 资源
-/// （设备块的最后一个 Arc 可能落在管线拆除线程或在途帧的析构线程）。
+/// （设备块的最后一个 `Arc` 可能落在管线拆除线程或在途帧的析构线程）。
 pub(crate) struct PinnedHost {
-    ptr: *mut c_void,
+    ptr: NonNull<c_void>,
     cap: usize,
     ctx: Arc<CudaContext>,
 }
 
-// SAFETY: ptr 由 cuMemAllocHost_v2 分配并随本结构独占持有，任何时刻只有一个所有者；
-// 跨线程移动只转移所有权，不产生共享可变访问
+// SAFETY: 构造后字段只读；`ptr` 随最后一个 `Arc` 恰好释放一次，跨线程移动只转移所有权。
 unsafe impl Send for PinnedHost {}
+
+// SAFETY: `&PinnedHost` 只暴露指针/容量/上下文身份，不触碰字节内容；字节只在
+// `FrameBuf` 独占期由 CPU 写、在帧在途期由设备读，二者由帧池保证不重叠。
+unsafe impl Sync for PinnedHost {}
 
 impl std::fmt::Debug for PinnedHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -154,17 +158,13 @@ impl std::fmt::Debug for PinnedHost {
 
 impl Drop for PinnedHost {
     fn drop(&mut self) {
-        if self.ptr.is_null() {
-            return;
-        }
         // 唯一可能脱离编码 actor 线程析构的 CUDA 资源：设备块的最后一个 Arc 可能落在
-        // 管线拆除线程或在途帧的析构线程（见 `PinnedFrame` 文档），幂等绑定兜底
+        // 管线拆除线程或在途帧的析构线程（见 `FrameBuf` 文档），幂等绑定兜底
         let _ = self.ctx.bind_to_thread();
         unsafe {
             // SAFETY: ptr 由 cuMemAllocHost_v2 成功分配且尚未释放，此处释放一次
-            let _ = cuMemFreeHost(self.ptr);
+            let _ = cuMemFreeHost(self.ptr.as_ptr());
         }
-        self.ptr = std::ptr::null_mut();
     }
 }
 
@@ -180,10 +180,12 @@ impl PinnedHost {
         unsafe {
             // SAFETY: 出参 ptr 由驱动写入；失败时不接管任何所有权
             let res = cuMemAllocHost_v2(&mut ptr, cap);
-            if res != CUresult::CUDA_SUCCESS || ptr.is_null() {
+            if res != CUresult::CUDA_SUCCESS {
                 return Err(format!("cuMemAllocHost_v2 failed: {:?}", res));
             }
         }
+        let ptr =
+            NonNull::new(ptr).ok_or_else(|| format!("cuMemAllocHost_v2 返回空指针 (cap {cap})"))?;
         Ok(Self {
             ptr,
             cap,
@@ -198,7 +200,7 @@ impl PinnedHost {
 
     #[inline]
     pub(crate) fn as_ptr(&self) -> *const u8 {
-        self.ptr as *const u8
+        self.ptr.as_ptr() as *const u8
     }
 
     /// 所属 CUDA 上下文的身份
@@ -220,10 +222,10 @@ impl PinnedHost {
 /// 显存）；原始系统句柄（fd / Win32 HANDLE）在驱动接管后即刻关闭。CUDA 调用只
 /// 发生在上下文已绑定的编码 actor 线程，`Send` 仅服务一次性所有权移交
 pub(crate) struct VramSlot {
-    ext_mem: CUexternalMemory,
-    mipmap_array: CUmipmappedArray,
-    pub(crate) cu_array: CUarray,
-    pub(crate) ext_sem: CUexternalSemaphore,
+    ext_mem: NonNull<CUextMemory_st>,
+    mipmap_array: NonNull<CUmipmappedArray_st>,
+    pub(crate) cu_array: NonNull<CUarray_st>,
+    pub(crate) ext_sem: NonNull<CUextSemaphore_st>,
     pub(crate) width: u32,
     pub(crate) height: u32,
 }
@@ -239,26 +241,17 @@ impl Drop for VramSlot {
         // SAFETY: 只在编码 actor 线程析构，CUDA 上下文已绑定；三个句柄均由导入
         // 成功时刻起归本结构独占（失败路径由 SlotImportGuard 收尾），且尚未销毁
         unsafe {
-            if !self.ext_sem.is_null() {
-                let _ = cuDestroyExternalSemaphore(self.ext_sem);
-                self.ext_sem = std::ptr::null_mut();
-            }
-            if !self.mipmap_array.is_null() {
-                let _ = cuMipmappedArrayDestroy(self.mipmap_array);
-                self.mipmap_array = std::ptr::null_mut();
-            }
-            if !self.ext_mem.is_null() {
-                let _ = cuDestroyExternalMemory(self.ext_mem);
-                self.ext_mem = std::ptr::null_mut();
-            }
+            let _ = cuDestroyExternalSemaphore(self.ext_sem.as_ptr());
+            let _ = cuMipmappedArrayDestroy(self.mipmap_array.as_ptr());
+            let _ = cuDestroyExternalMemory(self.ext_mem.as_ptr());
         }
     }
 }
 
 struct SlotImportGuard {
-    ext_mem: CUexternalMemory,
-    mipmap_array: CUmipmappedArray,
-    ext_sem: CUexternalSemaphore,
+    ext_mem: Option<NonNull<CUextMemory_st>>,
+    mipmap_array: Option<NonNull<CUmipmappedArray_st>>,
+    ext_sem: Option<NonNull<CUextSemaphore_st>>,
     mem_handle: Option<i64>,
     sem_handle: Option<i64>,
 }
@@ -266,32 +259,38 @@ struct SlotImportGuard {
 impl SlotImportGuard {
     fn new(mem_handle: i64, sem_handle: i64) -> Self {
         Self {
-            ext_mem: std::ptr::null_mut(),
-            mipmap_array: std::ptr::null_mut(),
-            ext_sem: std::ptr::null_mut(),
+            ext_mem: None,
+            mipmap_array: None,
+            ext_sem: None,
             mem_handle: (mem_handle > 0).then_some(mem_handle),
             sem_handle: (sem_handle > 0).then_some(sem_handle),
         }
     }
 
-    fn finish(mut self, cu_array: CUarray, width: u32, height: u32) -> VramSlot {
-        let ext_mem = self.ext_mem;
-        let mipmap_array = self.mipmap_array;
-        let ext_sem = self.ext_sem;
-        self.ext_mem = std::ptr::null_mut();
-        self.mipmap_array = std::ptr::null_mut();
-        self.ext_sem = std::ptr::null_mut();
+    fn finish(
+        mut self,
+        cu_array: NonNull<CUarray_st>,
+        width: u32,
+        height: u32,
+    ) -> Result<VramSlot, String> {
+        // 先整体校验再取走：任一缺失时三个句柄仍归守卫所有，由 Drop 逆序回滚
+        if self.ext_mem.is_none() || self.mipmap_array.is_none() || self.ext_sem.is_none() {
+            return Err("CUDA 导入句柄不完整，拒绝提交槽位".to_string());
+        }
+        let ext_mem = self.ext_mem.take().expect("已校验非空");
+        let mipmap_array = self.mipmap_array.take().expect("已校验非空");
+        let ext_sem = self.ext_sem.take().expect("已校验非空");
         self.mem_handle = None;
         self.sem_handle = None;
 
-        VramSlot {
+        Ok(VramSlot {
             ext_mem,
             mipmap_array,
             cu_array,
             ext_sem,
             width,
             height,
-        }
+        })
     }
 }
 
@@ -307,14 +306,14 @@ impl Drop for SlotImportGuard {
             if let Some(h) = self.mem_handle.take() {
                 close_raw_handle(h);
             }
-            if !self.ext_sem.is_null() {
-                let _ = cuDestroyExternalSemaphore(self.ext_sem);
+            if let Some(sem) = self.ext_sem.take() {
+                let _ = cuDestroyExternalSemaphore(sem.as_ptr());
             }
-            if !self.mipmap_array.is_null() {
-                let _ = cuMipmappedArrayDestroy(self.mipmap_array);
+            if let Some(array) = self.mipmap_array.take() {
+                let _ = cuMipmappedArrayDestroy(array.as_ptr());
             }
-            if !self.ext_mem.is_null() {
-                let _ = cuDestroyExternalMemory(self.ext_mem);
+            if let Some(mem) = self.ext_mem.take() {
+                let _ = cuDestroyExternalMemory(mem.as_ptr());
             }
         }
     }
@@ -390,7 +389,7 @@ pub(crate) fn import_cuda_slot(slot: &mut VramSlotDescriptor) -> Result<VramSlot
             ));
         }
     }
-    guard.ext_mem = ext_mem;
+    guard.ext_mem = NonNull::new(ext_mem);
 
     // SAFETY: 导入成功后驱动全权接管该 fd 的生命周期（见上方导入调用），原始
     // 系统句柄此刻归调用方所有且尚未关闭；close_raw_handle 自带正值守卫
@@ -426,7 +425,7 @@ pub(crate) fn import_cuda_slot(slot: &mut VramSlotDescriptor) -> Result<VramSlot
             ));
         }
     }
-    guard.mipmap_array = mipmap_array;
+    guard.mipmap_array = NonNull::new(mipmap_array);
 
     let mut cu_array: CUarray = std::ptr::null_mut();
     unsafe {
@@ -439,6 +438,7 @@ pub(crate) fn import_cuda_slot(slot: &mut VramSlotDescriptor) -> Result<VramSlot
             ));
         }
     }
+    let cu_array = NonNull::new(cu_array).expect("上一段已校验非空");
 
     // 3. 导入时间线信号量 (Linux: POSIX fd, Windows: Win32 HANDLE)
     #[cfg(unix)]
@@ -476,7 +476,7 @@ pub(crate) fn import_cuda_slot(slot: &mut VramSlotDescriptor) -> Result<VramSlot
             ));
         }
     }
-    guard.ext_sem = ext_sem;
+    guard.ext_sem = NonNull::new(ext_sem);
 
     // SAFETY: 同显存句柄——导入成功后驱动接管信号量生命周期，原始系统句柄归
     // 调用方所有且尚未关闭
@@ -486,5 +486,5 @@ pub(crate) fn import_cuda_slot(slot: &mut VramSlotDescriptor) -> Result<VramSlot
         }
     }
 
-    Ok(guard.finish(cu_array, width, height))
+    guard.finish(cu_array, width, height)
 }

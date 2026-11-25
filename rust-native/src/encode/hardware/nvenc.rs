@@ -182,8 +182,8 @@ impl Drop for SlotEntry {
 pub(crate) struct NvencBackend {
     cuda_ctx: Arc<CudaContext>,
     session: NvencSession,
-    /// 池块基址（池所有权清单）：跨会话存活，重构几何时据此重建输入缓冲
-    block_ptrs: Vec<*const u8>,
+    /// 池块强引用：与帧池、会话共享，重构几何时据此重建输入缓冲
+    block_handles: Vec<Arc<PinnedHost>>,
     slots: SlotTable<SlotEntry>,
     /// 槽位所有权共享块：编码出口归还位，与 Actor 同代
     slot_state: &'static SlotStateBlock,
@@ -239,13 +239,13 @@ impl NvencBackend {
 
         // 池块先分配：会话构造期就要用它们的基址包装成系统内存输入缓冲，
         // 会话因此不会出现「已建但还没有输入缓冲」的状态
-        let (blocks, block_ptrs) = allocate_host_frames(&cuda_ctx)?;
+        let (blocks, block_handles) = allocate_host_frames(&cuda_ctx)?;
         let session = NvencSession::new(
             driver,
             cuda_ctx.clone(),
             profile,
             codec,
-            &block_ptrs,
+            &block_handles,
             stream.cu_stream(),
         )?;
 
@@ -253,7 +253,7 @@ impl NvencBackend {
             Self {
                 cuda_ctx,
                 session,
-                block_ptrs,
+                block_handles,
                 slots: SlotTable::new(),
                 slot_state,
                 stream,
@@ -361,7 +361,7 @@ impl VideoEncodeBackend for NvencBackend {
             let slot = &entry.cuda;
             match self.session.register_resource(
                 NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY,
-                slot.cu_array as *mut c_void,
+                slot.cu_array.as_ptr().cast(),
                 slot.width,
                 slot.height,
                 0,
@@ -429,7 +429,7 @@ impl VideoEncodeBackend for NvencBackend {
             self.cuda_ctx.clone(),
             new_profile,
             new_codec,
-            &self.block_ptrs,
+            &self.block_handles,
             self.stream.cu_stream(),
         )?;
 
@@ -528,18 +528,18 @@ impl VideoEncodeBackend for NvencBackend {
 /// 帧块：CUDA 锁页内存，最大几何容量（一次性）
 ///
 /// 必须建在**本后端自己的 CUDA 上下文**上；整批分配失败时已分配的块随 `?` 逆序释放。
-/// 基址随批返回：后端据此为每块创建 NVENC 系统内存输入缓冲
+/// 每块以 `Arc` 交给帧池与后端，任一侧先放手都不悬空。
 fn allocate_host_frames(
     cuda_ctx: &Arc<CudaContext>,
-) -> Result<(Vec<HostBlock>, Vec<*const u8>), String> {
+) -> Result<(Vec<HostBlock>, Vec<Arc<PinnedHost>>), String> {
     let mut blocks = Vec::with_capacity(POOL_DEPTH);
-    let mut ptrs = Vec::with_capacity(POOL_DEPTH);
+    let mut handles = Vec::with_capacity(POOL_DEPTH);
     for _ in 0..POOL_DEPTH {
-        let pinned = PinnedHost::alloc(cuda_ctx, HOST_SLOT_BYTES)?;
-        ptrs.push(pinned.as_ptr());
+        let pinned = Arc::new(PinnedHost::alloc(cuda_ctx, HOST_SLOT_BYTES)?);
+        handles.push(Arc::clone(&pinned));
         blocks.push(HostBlock::Cuda(pinned));
     }
-    Ok((blocks, ptrs))
+    Ok((blocks, handles))
 }
 
 #[cfg(test)]

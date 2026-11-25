@@ -1,8 +1,8 @@
 //! 主机帧池 (Host Frame Pool)
 //!
-//! 采集侧独占的**唯一**主机帧所有权：渲染线程从中取块写入整帧，编码后端从块里读。
-//! 池是长期持有者，编码后端只是租户——块由后端在**自己的设备/上下文**上分配，
-//! 经控制面装进池（[`FramePool::attach`]）后即与后端脱钩。
+//! 采集侧取用主机帧的统一入口：渲染线程从中取块写入整帧，编码后端从块里读。
+//! 块由后端在**自己的设备/上下文**上分配，经 [`FramePool::attach`] 装进池；池负责取用
+//! 与归还，后端保留 `Arc` 用于重建会话。池、后端、在途帧都不再引用时块才真正释放。
 //!
 //! 三条不变量：
 //! 1. **块的身份随块走**：每块自带所属内存域（CUDA 上下文 / `VideoDevice` 的地址），
@@ -53,8 +53,8 @@ const DOMAIN_HEAP: usize = usize::MAX;
 /// 三种家族只在「谁读得懂这块内存」上不同，对生产者都是可直写的字节区。
 /// 跨线程流转，指针值无诊断意义，故 `Debug` 只报家族。
 pub(crate) enum HostBlock {
-    /// CUDA 锁页内存：NVENC 后端直接异步 H2D
-    Cuda(PinnedHost),
+    /// CUDA 锁页内存：NVENC 后端直接异步 H2D；与后端共享同一 `Arc`，池先析构不悬空
+    Cuda(Arc<PinnedHost>),
     /// Vulkan 持久映射的 host-visible 缓冲：Vulkan Video 后端可零拷贝直用
     Vulkan(HostBuffer),
     /// 普通堆内存：软编自给自足，不需要设备可读
@@ -123,7 +123,7 @@ impl HostBlock {
 
     pub(crate) fn cuda_host(&self) -> Option<&PinnedHost> {
         match self {
-            Self::Cuda(host) => Some(host),
+            Self::Cuda(host) => Some(host.as_ref()),
             _ => None,
         }
     }
@@ -224,8 +224,9 @@ impl FramePool {
 
     /// 装新批：后端新建/换域后调用（「只在编码线程碰设备」的不变量见模块文档 2/3）
     ///
-    /// 旧批与全部 `stale` 在这里析构（可能含 `vkDeviceWaitIdle`），必须在锁外做。
-    /// 空批表示「内存域没变」，保留当前批——但 `stale` 照样释放，所以「任何一次 `attach`
+    /// 旧批与全部 `stale` 在这里放手（可能含 `vkDeviceWaitIdle`），必须在锁外做；
+    /// CUDA 底层分配若仍被后端 `Arc` 持有，会延后到最后一个引用释放。
+    /// 空批表示「内存域没变」，保留当前批——但 `stale` 照样放手，所以「任何一次 `attach`
     /// 都收走上一批」是无条件成立的。
     pub(crate) fn attach(&self, blocks: Vec<HostBlock>) {
         // 一批块是同一次分配出来的，域必然一致；取首块的域即整批的域
@@ -240,7 +241,7 @@ impl FramePool {
             }
             stale
         };
-        // 旧批属于已换下的设备/上下文：就地析构合法——本函数只在编码线程执行
+        // 旧批属于已换下的设备/上下文：就地放手合法——本函数只在编码线程执行
         // （模块文档不变量 2 的落地处）
         drop(stale);
     }

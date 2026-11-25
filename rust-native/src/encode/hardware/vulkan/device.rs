@@ -8,6 +8,7 @@
 //! 用引用共享比纠结「谁拥有设备」的所有权更容易写对，也不会写出自引用结构。
 
 use std::ffi::{CString, c_char};
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 // `push` 是 `TaggedStructure` trait 的方法，不导入就无法链 pNext
@@ -761,8 +762,8 @@ pub struct HostBuffer {
     device: VideoDevice,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
-    /// 持久映射的基址：`Drop` 里解映射之前恒有效
-    ptr: *mut u8,
+    /// 持久映射的基址：解映射之前恒有效，`map_memory` 成功即非空
+    ptr: NonNull<u8>,
     size: u64,
     /// 落点是否为“可缓存且非设备本地”的系统内存——决定整帧写入用普通还是非暂存存储
     cached_ram: bool,
@@ -864,7 +865,17 @@ impl HostBuffer {
                 .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
         };
         let ptr = match ptr {
-            Ok(ptr) => ptr as *mut u8,
+            Ok(ptr) => match NonNull::new(ptr as *mut u8) {
+                Some(ptr) => ptr,
+                None => {
+                    // SAFETY: buffer 与 memory 均已创建且尚未销毁，此处各归还一次
+                    unsafe {
+                        device.device().destroy_buffer(buffer, None);
+                        device.device().free_memory(memory, None);
+                    }
+                    return Err(format!("{what}映射返回空指针"));
+                }
+            },
             Err(e) => {
                 // SAFETY: buffer 与 memory 均已创建且尚未销毁，此处各归还一次
                 unsafe {
@@ -915,7 +926,7 @@ impl HostBuffer {
     /// 写入范围与生命周期由持有者（`PinnedBlock::Vulkan`）用容量检查与 RAII 归还保证
     #[inline]
     pub fn as_ptr(&self) -> *mut u8 {
-        self.ptr
+        self.ptr.as_ptr()
     }
 
     /// 把 `src` 拷到缓冲起始处（主机侧，不产生任何 GPU 命令）
@@ -946,7 +957,7 @@ impl HostBuffer {
         // 源是 Rust 侧切片，与驱动映射显存不重叠；两条分支都不要求 32B 对齐
         // （copy_streaming 自带对齐与 AVX2 特性检测）
         unsafe {
-            let dst = self.ptr.add(offset);
+            let dst = self.ptr.as_ptr().add(offset);
             if self.cached_ram {
                 std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
             } else {
@@ -965,7 +976,7 @@ impl HostBuffer {
         }
         // SAFETY: ptr 覆盖 [0, size)，len 已按 size 校验；调用方保证这 len 字节
         // 此刻没有并发写者（GPU 侧提交已完成）
-        let src = unsafe { std::slice::from_raw_parts(self.ptr, len) };
+        let src = unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), len) };
         // `to_vec` 直接分配 + 拷贝，不像 `vec![0; len]` 那样先清零再整体覆盖一遍
         Ok(src.to_vec())
     }
@@ -979,7 +990,7 @@ impl HostBuffer {
             return Err(format!("读取长度 {len} 超出缓冲大小 {}", self.size));
         }
         // SAFETY: 同 `read`，ptr 覆盖 [0, size)、len 已校验、无并发写者
-        let src = unsafe { std::slice::from_raw_parts(self.ptr, len) };
+        let src = unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), len) };
         let mut out = Vec::with_capacity(prefix.len() + len);
         out.extend_from_slice(prefix);
         out.extend_from_slice(src);
@@ -993,7 +1004,7 @@ impl HostBuffer {
             return Err(format!("填充长度 {len} 超出缓冲大小 {}", self.size));
         }
         // SAFETY: 同上，写入范围落在映射内
-        unsafe { std::ptr::write_bytes(self.ptr, byte, len) };
+        unsafe { std::ptr::write_bytes(self.ptr.as_ptr(), byte, len) };
         Ok(())
     }
 }

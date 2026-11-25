@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
 
+use super::cuda::PinnedHost;
 use super::dl::NvencDriver;
 use super::ffi::*;
 use super::session_params::{
@@ -81,17 +82,18 @@ impl Drop for InflightEncode<'_> {
     }
 }
 
-/// 一个主机帧块的登记式输入：帧池块基址与它在本次会话上的注册句柄
+/// 一个主机帧块的登记式输入：帧池块与它在本次会话上的注册句柄
 ///
 /// 块按 `CUDADEVICEPTR` 登记——UVA 下锁页内存的基址即设备可访指针，NVENC 经 PCIe
 /// 直读帧内容，零拷贝。**不得改回 `nvEncCreateInputBuffer(pSysMemBuffer)` 创建式
 /// 输入**：该形态在本机 Linux 驱动上静默产出空壳码流（GL 黑屏排查时的真机实证），
 /// 且登记资源类型枚举里本就不存在 SYSMEM。
-/// 两个值都只在会话存活期间有意义——句柄由 `nvEncRegisterResource` 创建，必须由
-/// 持有 encoder 的本会话注销；系统内存归帧池所有，注销只解除驱动包装
+///
+/// 句柄由 `nvEncRegisterResource` 创建、必须由本会话注销；`block` 的 `Arc` 让会话
+/// 自己钉住内存，注销先于最后一个引用释放。
 struct DeviceInput {
-    /// 帧池块基址
-    block: *const u8,
+    /// 帧池块：会话持有强引用，保证登记与逐帧映射期间基址不悬空
+    block: Arc<PinnedHost>,
     /// 本会话上的登记句柄
     registered: RegisteredResource,
 }
@@ -150,8 +152,8 @@ impl Drop for NvencSession {
             }
         }
 
-        // 输入登记随会话作废：句柄由本会话创建，注销要 encoder 存活。
-        // 系统内存归帧池，这里只解除驱动的包装
+        // 注销输入登记要 encoder 存活；系统内存由帧池与会话的 `Arc` 共享，
+        // 这里只解除驱动包装
         self.destroy_device_inputs();
 
         // 编码器本身由 `EncoderHandle` 的 Drop 收尾：字段在本方法体之后才析构，
@@ -180,15 +182,15 @@ impl NvencSession {
 
     /// 会话构造：开会话、建编码参数、把给定池块登记为编码输入资源
     ///
-    /// `blocks` 由调用方（帧池）持有：必须是按本档位几何可容纳的锁页内存，且活到
-    /// 本会话析构之后。构造即完整——会话不存在「还没有输入资源」的状态；任一
-    /// 环节失败，已建的部分随本会话析构逆序释放
+    /// `blocks` 是帧池的锁页内存块；会话为每块保留一份 `Arc`，调用方此后可以放手。
+    /// 构造即完整——会话不存在「还没有输入资源」的状态；任一环节失败，已建的部分随
+    /// 本会话析构逆序释放
     pub fn new(
         driver: NvencDriver,
         cuda_ctx: Arc<CudaContext>,
         profile: StreamingProfile,
         codec: VideoCodec,
-        blocks: &[*const u8],
+        blocks: &[Arc<PinnedHost>],
         io_stream: CUstream,
     ) -> Result<Self, String> {
         let (width, height) = (profile.width() as u32, profile.height() as u32);
@@ -224,7 +226,8 @@ impl NvencSession {
         // pSysMemBuffer 输入在本驱动上静默空编，禁用——理由见 `DeviceInput` 文档
         let mut device_inputs = Vec::new();
         let register = nvfn!(driver, nvEncRegisterResource);
-        for (i, &block) in blocks.iter().enumerate() {
+        for (i, block) in blocks.iter().enumerate() {
+            let base = block.as_ptr();
             // SAFETY: 该结构为 bindgen 生成的 C POD，成员均为整型/指针或 0 值合法的
             // 枚举（UNDEFINED / DIRECTX 等），全零位模式合法；NVENC 约定调用方零初始化
             // 并回填 version，保留字段必须保持 0
@@ -235,11 +238,11 @@ impl NvencSession {
             reg_params.width = width;
             reg_params.height = height;
             reg_params.pitch = width;
-            reg_params.resourceToRegister = block as *mut c_void;
+            reg_params.resourceToRegister = base.cast_mut().cast();
             reg_params.bufferFormat = buffer_format;
             let registered = unsafe {
-                // SAFETY: reg_params 已完整初始化；block 为 cuMemAllocHost 锁页内存，
-                // 归帧池所有且活到本会话销毁之后；encoder 由本会话独占持有且此刻存活
+                // SAFETY: reg_params 已完整初始化；block 由本会话的 `Arc` 保证存活；
+                // encoder 由本会话独占持有
                 let res = register(encoder.as_raw(), &mut reg_params);
                 if res != NVENCSTATUS::NV_ENC_SUCCESS {
                     return Err(format!("block {i}: nvEncRegisterResource failed: {res:?}"));
@@ -247,7 +250,10 @@ impl NvencSession {
                 RegisteredResource::from_raw(reg_params.registeredResource)
             }
             .ok_or_else(|| format!("block {i}: nvEncRegisterResource 返回成功但句柄为空"))?;
-            device_inputs.push(DeviceInput { block, registered });
+            device_inputs.push(DeviceInput {
+                block: Arc::clone(block),
+                registered,
+            });
         }
 
         let session = Self {
@@ -336,7 +342,12 @@ impl NvencSession {
     /// 登记是一次性的句柄契约，改几何只能注销后重登。全成全败：新几何登记失败时
     /// 回滚到旧几何，保持会话仍可编码（否则一次失败的切换会把整条编码链打死）
     fn reregister_device_inputs(&mut self, width: usize, height: usize) -> Result<(), String> {
-        let blocks: Vec<*const u8> = self.device_inputs.iter().map(|input| input.block).collect();
+        // 先克隆强引用再注销：注销会释放会话侧引用，批必须活到重登完成
+        let blocks: Vec<Arc<PinnedHost>> = self
+            .device_inputs
+            .iter()
+            .map(|input| Arc::clone(&input.block))
+            .collect();
         let old = (self.profile.width(), self.profile.height());
         // 先全部注销：之后无论成败都没有残留句柄指向旧几何
         self.destroy_device_inputs();
@@ -358,13 +369,14 @@ impl NvencSession {
     /// 把一批池块按给定几何登记为编码输入
     fn register_blocks(
         &self,
-        blocks: &[*const u8],
+        blocks: &[Arc<PinnedHost>],
         width: usize,
         height: usize,
     ) -> Result<Vec<DeviceInput>, String> {
         let register = nvfn!(self.driver, nvEncRegisterResource);
         let mut inputs: Vec<DeviceInput> = Vec::with_capacity(blocks.len());
-        for (i, &block) in blocks.iter().enumerate() {
+        for (i, block) in blocks.iter().enumerate() {
+            let base = block.as_ptr();
             // SAFETY: 该结构为 bindgen 生成的 C POD，成员均为整型/指针或 0 值合法的
             // 枚举（UNDEFINED / DIRECTX 等），全零位模式合法；NVENC 约定调用方零初始化
             // 并回填 version，保留字段必须保持 0
@@ -375,11 +387,11 @@ impl NvencSession {
             reg_params.width = width as u32;
             reg_params.height = height as u32;
             reg_params.pitch = width as u32;
-            reg_params.resourceToRegister = block as *mut c_void;
+            reg_params.resourceToRegister = base.cast_mut().cast();
             reg_params.bufferFormat = NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12;
             let register_res = unsafe {
-                // SAFETY: reg_params 已完整初始化；block 为池持有的锁页内存，
-                // 活到本会话销毁之后；encoder 由本会话独占持有且此刻存活
+                // SAFETY: reg_params 已完整初始化；block 由调用方的 `Arc` 保证存活；
+                // encoder 由本会话独占持有
                 register(self.encoder.as_raw(), &mut reg_params)
             };
             let Some(registered) = (register_res == NVENCSTATUS::NV_ENC_SUCCESS)
@@ -392,7 +404,10 @@ impl NvencSession {
                 }
                 return Err(format!("block {i}: nvEncRegisterResource failed"));
             };
-            inputs.push(DeviceInput { block, registered });
+            inputs.push(DeviceInput {
+                block: Arc::clone(block),
+                registered,
+            });
         }
         Ok(inputs)
     }
@@ -629,7 +644,7 @@ impl NvencSession {
     fn device_input(&self, block: *const u8) -> Result<RegisteredResource, String> {
         self.device_inputs
             .iter()
-            .find(|input| input.block == block)
+            .find(|input| input.block.as_ptr() == block)
             .map(|input| input.registered)
             .ok_or_else(|| "主机帧块基址不在本会话的登记表里".to_string())
     }
