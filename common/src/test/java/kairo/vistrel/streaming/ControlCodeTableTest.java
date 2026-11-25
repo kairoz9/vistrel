@@ -45,4 +45,23 @@ public class ControlCodeTableTest {
         Assertions.assertTrue(ControlStatus.describe(14).startsWith("未知错误码"), "表外的码才允许落进未知");
         Assertions.assertNull(ControlStatus.fromCode(14), "表外的码不映射到枚举");
     }
+
+    /**
+     * 编码器不可用的判定必须包含「Actor 已死」：降级 RAM 无法恢复一条没有编码器的流。
+     */
+    @Test
+    void testPipelineDeadCountsAsEncoderUnavailable() {
+        Assertions.assertTrue(new EncoderChannel.ControlException("dead", ControlStatus.PIPELINE_DEAD)
+            .encoderUnavailable()
+        );
+        Assertions.assertTrue(new EncoderChannel.ControlException("no hw", ControlStatus.NO_HARDWARE_ENCODER)
+            .encoderUnavailable()
+        );
+        Assertions.assertTrue(new EncoderChannel.ControlException("build", ControlStatus.ENCODER_BUILD_FAILED)
+            .encoderUnavailable()
+        );
+        Assertions.assertFalse(new EncoderChannel.ControlException("ack", ControlStatus.ACK_TIMEOUT)
+            .encoderUnavailable()
+        );
+    }
 }

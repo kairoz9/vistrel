@@ -123,7 +123,10 @@ public interface EncoderChannel {
          * @return true 表示应触发引擎自愈而不是降级到 RAM
          */
         public boolean encoderUnavailable() {
-            return status == ControlStatus.NO_HARDWARE_ENCODER || status == ControlStatus.ENCODER_BUILD_FAILED;
+            return status == ControlStatus.NO_HARDWARE_ENCODER
+                    || status == ControlStatus.ENCODER_BUILD_FAILED
+                    // Actor 已死：降级 RAM 救不了没有编码器的流，只能整引擎自愈
+            || status == ControlStatus.PIPELINE_DEAD;
         }
     }
 }
