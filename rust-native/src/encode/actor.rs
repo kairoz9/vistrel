@@ -194,7 +194,7 @@ impl EncoderActor {
         match cmd {
             ControlCommand::Shutdown => {
                 self.stage.set(EncodeStage::Shutdown);
-                // 摘除绑定并清空在途帧：后续 push 一律 StaleBinding
+                // 摘除绑定并清空在途帧：句柄从此失效
                 self.invalidate_binding();
                 // 编码器随 Actor 一起析构：先摘掉引用，避免后续路径误用已排空的编码器
                 self.encoder = None;
@@ -310,7 +310,7 @@ impl EncoderActor {
         drop(self.inbox.take_discarded());
     }
 
-    /// 摘除当前绑定并清空在途帧：句柄从此失效，后续 push 一律 `StaleBinding`。
+    /// 摘除当前绑定并清空在途帧：句柄从此失效。
     /// 指针替换前已载入旧绑定的 push 仍可能把旧代帧塞进收件箱，由入口代次校验丢弃。
     fn invalidate_binding(&mut self) {
         if self.binding.load().is_none() {
@@ -347,7 +347,7 @@ impl EncoderActor {
             return ControlStatus::ReleaseFailed;
         }
         self.stage.set(EncodeStage::ClearSlots);
-        // 排空成功：先摘绑定（锁内清空旧帧），再释放导入
+        // 排空成功：先摘绑定并清空在途帧，再释放导入
         self.invalidate_binding();
         encoder.clear_vram_slots();
         self.encoder = Some(encoder);
@@ -749,13 +749,8 @@ impl EncoderActor {
 
     /// 处理取出的最新帧：换代拒收先于编码
     ///
-    /// 两种在入口丢弃的槽位帧同记 `FenceDropped`：
-    /// - 档位已换、槽位表待重导入期间到达的帧引用旧表（几何过期或索引悬空，
-    ///   旧 sync_value 还可能落到新导入的信号量上长期等待）；
-    /// - `push` 载入旧绑定后 Actor 完成换代的窄窗口内晚到的帧，代次已不是当前绑定。
-    ///
-    /// 主机帧自带像素、不引用表，照常编码。显存帧的槽位认领随载荷析构归还旧代，
-    /// 各出口都不会泄漏或提前释放。
+    /// 旧表/旧代槽位帧在入口记 `FenceDropped`：旧 sync_value 可能落到新导入的信号量上
+    /// 长期等待，旧索引也会按新表解释。主机帧自带像素，照常编码；槽位认领随载荷析构归还旧代。
     fn handle_frame(&mut self, mut frame: VideoFrame) {
         if self.rejecting_frames && matches!(frame.payload, FramePayload::VramSlot { .. }) {
             self.inbox.outcomes().record_with(
@@ -1625,7 +1620,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_millis(500))
             .expect("槽位导入应答超时")
         {
-            Ok(_lease) => ControlStatus::Ok,
+            Ok(_handle) => ControlStatus::Ok,
             Err(code) => code,
         }
     }
