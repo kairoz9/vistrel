@@ -4,7 +4,8 @@ use super::encoder::{EncodeBackendKind, VideoEncoder};
 use super::frame::FramePayload;
 use super::pool::FramePool;
 use super::{StreamingProfile, VideoCodec};
-use crate::encode::hardware::slots::{ActorProgress, VramBinding};
+use crate::encode::StageCell;
+use crate::encode::hardware::slots::VramBinding;
 use crate::encode::hardware::vulkan::vram_export::VramSlotProducer;
 use crate::encode::nv12_len;
 use std::collections::BTreeSet;
@@ -244,12 +245,11 @@ fn perf_binding() -> std::sync::Arc<VramBinding> {
         .clone()
 }
 
-/// perf 矩阵共用的编码进度：后端只写心跳与阶段
-fn perf_progress() -> std::sync::Arc<ActorProgress> {
-    static PROGRESS: std::sync::OnceLock<std::sync::Arc<ActorProgress>> =
-        std::sync::OnceLock::new();
-    PROGRESS
-        .get_or_init(|| std::sync::Arc::new(ActorProgress::new()))
+/// perf 矩阵共用的阶段出口：后端只写阶段码
+fn perf_stage() -> std::sync::Arc<StageCell> {
+    static STAGE: std::sync::OnceLock<std::sync::Arc<StageCell>> = std::sync::OnceLock::new();
+    STAGE
+        .get_or_init(|| std::sync::Arc::new(StageCell::new()))
         .clone()
 }
 
@@ -294,7 +294,7 @@ fn run_cell(
         StreamingProfile::new(resolution.width, resolution.height, FPS, MATRIX_BITRATE_BPS);
     // 池由采集侧持有；后端构造时交回自己的块（软编是堆块，硬编是设备块）
     let (mut encoder, blocks) =
-        VideoEncoder::new_backend(profile, codec, backend, Some(perf_progress()))?;
+        VideoEncoder::new_backend(profile, codec, backend, Some(perf_stage()))?;
     let pool = FramePool::new();
     pool.attach(blocks);
     let (coded_width, coded_height) = encoder.coded_extent();
@@ -601,7 +601,7 @@ fn nvenc_host_input_produces_real_bitstream() {
         profile,
         VideoCodec::Av1,
         EncodeBackendKind::Nvenc,
-        Some(perf_progress()),
+        Some(perf_stage()),
     )
     .expect("NVENC 后端应能构建");
     let pool = FramePool::new();

@@ -258,95 +258,9 @@ impl<S> SlotTable<S> {
     }
 }
 
-/// 编码 Actor 当前阻塞的阶段码，心跳冻结时由游戏侧读回定位卡点
-#[repr(u64)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ActorStage {
-    /// 主循环等待输入
-    Idle = 0,
-    /// 重配或重建编码器
-    Reconfigure = 1,
-    /// 排空编码器与 CUDA 上下文
-    Drain = 2,
-    /// 导入显存槽位
-    ImportSlots = 3,
-    /// 注销显存槽位
-    ClearSlots = 4,
-    /// 关停编码线程
-    Shutdown = 5,
-    /// 等待外部时间线信号量
-    WaitTimeline = 6,
-    /// 映射输入资源
-    MapInput = 7,
-    /// 提交编码
-    EncodeSubmit = 8,
-    /// 锁定码流
-    LockBitstream = 9,
-    /// 帧编码（软编与未细分阶段的后端）
-    EncodeFrame = 10,
-}
-
-impl ActorStage {
-    /// 阶段码转诊断标签；表外数值原样展示
-    pub(crate) fn describe(code: u64) -> String {
-        let label = match code {
-            0 => "空闲等待",
-            1 => "重配编码器",
-            2 => "排空编码器",
-            3 => "导入显存槽位",
-            4 => "注销显存槽位",
-            5 => "编码器关停",
-            6 => "等待时间线信号量",
-            7 => "映射输入资源",
-            8 => "提交编码",
-            9 => "锁定码流",
-            10 => "帧编码",
-            _ => return format!("未知阶段({code})"),
-        };
-        label.to_string()
-    }
-}
-
 /// 槽位掩码容量：与游戏侧 `NativeWireContract.MAX_VRAM_SLOTS` 同一条约定，
 /// 只限制掩码宽度，不代表实际导入的槽位数
 pub(crate) const MAX_VRAM_SLOTS: usize = 8;
-
-/// 编码 Actor 的进度：心跳计数与最后进入的阶段。
-///
-/// 按引擎持有（旧 Actor 持旧 `Arc`），不需要泄漏分配：被弃线程写不到后继引擎的实例。
-pub(crate) struct ActorProgress {
-    heartbeat: AtomicU64,
-    stage: AtomicU64,
-}
-
-impl ActorProgress {
-    pub(crate) fn new() -> Self {
-        Self {
-            heartbeat: AtomicU64::new(0),
-            stage: AtomicU64::new(ActorStage::Idle as u64),
-        }
-    }
-
-    /// 标记 Actor 进入某阶段：只在可能长时间阻塞的调用前后写
-    pub(crate) fn set_stage(&self, stage: ActorStage) {
-        self.stage.store(stage as u64, Ordering::Release);
-    }
-
-    /// 当前阶段码：仅供 JNI 诊断读取
-    pub(crate) fn stage(&self) -> u64 {
-        self.stage.load(Ordering::Acquire)
-    }
-
-    /// Actor 每轮循环开始时 +1：心跳冻结即编码线程停止迭代
-    pub(crate) fn heartbeat_bump(&self) {
-        self.heartbeat.fetch_add(1, Ordering::Release);
-    }
-
-    /// 当前心跳计数：游戏侧按相等比较判定冻结
-    pub(crate) fn heartbeat(&self) -> u64 {
-        self.heartbeat.load(Ordering::Acquire)
-    }
-}
 
 /// 进程级绑定句柄分配。句柄必须全局单调：每个引擎从 1 重新开始会让旧引擎的
 /// 句柄在新引擎上重新有效，旧绑定的帧就能推进新引擎的槽位表。
@@ -361,21 +275,18 @@ pub(crate) struct VramBinding {
     in_flight: AtomicU64,
     /// 导入调用线程（渲染线程）；push 校验，clear 不校验（停机可能在其它线程）
     owner: ThreadId,
-    /// 引擎级心跳与阶段：绑定与引擎同寿命
-    progress: Arc<ActorProgress>,
     /// 提交等待超时后置位：在途 GPU 工作可能仍在读槽位纹理，绑定不再接受推送
     poisoned: AtomicBool,
 }
 
 impl VramBinding {
     /// 新建绑定并分配进程级唯一句柄
-    pub(crate) fn new(slot_mask: u64, owner: ThreadId, progress: Arc<ActorProgress>) -> Self {
+    pub(crate) fn new(slot_mask: u64, owner: ThreadId) -> Self {
         Self {
             handle: NEXT_BINDING_HANDLE.fetch_add(1, Ordering::Relaxed),
             slot_mask,
             in_flight: AtomicU64::new(0),
             owner,
-            progress,
             poisoned: AtomicBool::new(false),
         }
     }
@@ -388,16 +299,6 @@ impl VramBinding {
     /// 导入时的渲染线程
     pub(crate) fn owner(&self) -> ThreadId {
         self.owner
-    }
-
-    /// 编码 Actor 的当前心跳
-    pub(crate) fn heartbeat(&self) -> u64 {
-        self.progress.heartbeat()
-    }
-
-    /// 编码 Actor 最后进入的阶段码
-    pub(crate) fn stage(&self) -> u64 {
-        self.progress.stage()
     }
 
     /// 当前在途掩码（快照）
@@ -445,11 +346,7 @@ impl VramBinding {
     #[cfg(test)]
     pub(crate) fn new_for_test(slot_count: u32) -> Arc<Self> {
         let mask = (1u64 << slot_count) - 1;
-        Arc::new(Self::new(
-            mask,
-            std::thread::current().id(),
-            Arc::new(ActorProgress::new()),
-        ))
+        Arc::new(Self::new(mask, std::thread::current().id()))
     }
 
     #[cfg(test)]
@@ -744,33 +641,6 @@ mod tests {
         assert!(bindings.with_current(new.handle(), |_| ()).is_some());
     }
 
-    /// 阶段码只在 Native 内使用；JNI 诊断按它取标签
-    #[test]
-    fn test_progress_heartbeat_and_stage() {
-        let progress = ActorProgress::new();
-        assert_eq!(progress.heartbeat(), 0);
-        progress.heartbeat_bump();
-        progress.heartbeat_bump();
-        assert_eq!(progress.heartbeat(), 2);
-
-        progress.set_stage(ActorStage::LockBitstream);
-        assert_eq!(progress.stage(), ActorStage::LockBitstream as u64);
-        assert_eq!(ActorStage::describe(0), "空闲等待");
-        assert_eq!(ActorStage::describe(9), "锁定码流");
-        assert_eq!(ActorStage::describe(99), "未知阶段(99)");
-        assert_eq!(ActorStage::Idle as u64, 0);
-        assert_eq!(ActorStage::Reconfigure as u64, 1);
-        assert_eq!(ActorStage::Drain as u64, 2);
-        assert_eq!(ActorStage::ImportSlots as u64, 3);
-        assert_eq!(ActorStage::ClearSlots as u64, 4);
-        assert_eq!(ActorStage::Shutdown as u64, 5);
-        assert_eq!(ActorStage::WaitTimeline as u64, 6);
-        assert_eq!(ActorStage::MapInput as u64, 7);
-        assert_eq!(ActorStage::EncodeSubmit as u64, 8);
-        assert_eq!(ActorStage::LockBitstream as u64, 9);
-        assert_eq!(ActorStage::EncodeFrame as u64, 10);
-    }
-
     /// 合法槽位描述符策略：句柄与尺寸用全域随机值并声明已接管，
     /// 防止描述符 Drop 把测试进程的真实 fd 当句柄关闭
     fn valid_slot_strategy() -> impl Strategy<Value = VramSlotDescriptor> {
@@ -849,16 +719,6 @@ mod tests {
                 let list = parsed.expect("整步长形状必须解析成功");
                 prop_assert_eq!(list.len(), flat.len() / FLAT_STRIDE);
             }
-        }
-
-        // 心跳计数与 bump 次数严格一致
-        #[test]
-        fn heartbeat_counts_exactly_one_per_bump(bumps in 0u64..2048) {
-            let progress = ActorProgress::new();
-            for _ in 0..bumps {
-                progress.heartbeat_bump();
-            }
-            prop_assert_eq!(progress.heartbeat(), bumps);
         }
     }
 }

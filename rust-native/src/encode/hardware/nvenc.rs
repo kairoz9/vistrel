@@ -42,11 +42,9 @@ use cudarc::driver::{CudaContext, CudaStream};
 #[cfg(test)]
 use crate::encode::encoder::BackendStageTimings;
 use crate::encode::encoder::{EncodeBackendKind, VideoEncodeBackend};
-use crate::encode::hardware::slots::{
-    ActorProgress, ActorStage, SlotTable, VramSlotDescriptor, ensure_batch_geometry,
-};
+use crate::encode::hardware::slots::{SlotTable, VramSlotDescriptor, ensure_batch_geometry};
 use crate::encode::pool::{HOST_SLOT_BYTES, HostBlock, POOL_DEPTH};
-use crate::encode::{FramePayload, StreamingProfile, VideoCodec};
+use crate::encode::{EncodeStage, FramePayload, StageCell, StreamingProfile, VideoCodec};
 
 pub(crate) use cuda::new_cuda_context;
 use cuda::{PinnedHost, VramSlot, import_cuda_slot, wait_timeline_sem};
@@ -185,8 +183,8 @@ pub(crate) struct NvencBackend {
     /// 池块强引用：与帧池、会话共享，重构几何时据此重建输入缓冲
     block_handles: Vec<Arc<PinnedHost>>,
     slots: SlotTable<SlotEntry>,
-    /// 引擎级编码进度：本后端只写阶段码，心跳由 Actor 循环推进
-    progress: Arc<ActorProgress>,
+    /// 编码阻塞阶段出口：本后端只写阶段码，心跳由编码循环推进
+    stage: Arc<StageCell>,
     /// 必须排在 session / slots 之后（字段按声明顺序析构）：NVENC 在 set_io 时
     /// 拷贝句柄值并在会话存续期间持续使用，流对象必须比会话活得久（先销毁流会导致编码
     /// 路径 SIGSEGV，本机实验证实）；cudarc 流内部持有的 Arc<CudaContext> 也是全后端
@@ -229,7 +227,7 @@ impl NvencBackend {
     pub(crate) fn new(
         profile: StreamingProfile,
         codec: VideoCodec,
-        progress: Arc<ActorProgress>,
+        stage: Arc<StageCell>,
     ) -> Result<(Self, Vec<HostBlock>), String> {
         let driver = NvencDriver::load()?;
         let cuda_ctx = new_cuda_context(crate::encode::hardware::nvenc_device_ordinal())?;
@@ -255,7 +253,7 @@ impl NvencBackend {
                 session,
                 block_handles,
                 slots: SlotTable::new(),
-                progress,
+                stage,
                 stream,
                 // 测试并发闸：字段按声明顺序析构，声明在最后才能等整套 CUDA
                 // 资源清完之后再归还闸位
@@ -298,7 +296,7 @@ impl NvencBackend {
             ));
         }
         // 2. 时间线信号量等待：异步入队进专属 CUDA Stream，由 GPU 硬件流调度
-        self.progress.set_stage(ActorStage::WaitTimeline);
+        self.stage.set(EncodeStage::WaitTimeline);
         wait_timeline_sem(&self.cuda_ctx, ext_sem, sync_value, self.stream.cu_stream())?;
         // 3. 映射 → 提交 → 锁定 → 拷出 → 解映射
         let spec = InputSpec {
@@ -308,7 +306,7 @@ impl NvencBackend {
             buffer_format: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR,
         };
         self.session
-            .encode_from_resource(registered, spec, force_idr, frame_idx, &self.progress)
+            .encode_from_resource(registered, spec, force_idr, frame_idx, &self.stage)
     }
 }
 
@@ -470,7 +468,7 @@ impl VideoEncodeBackend for NvencBackend {
                 // 池块已按 CUDADEVICEPTR 登记（UVA 主机别名，零拷贝）：每帧映射后由
                 // 引擎经 PCIe 直读帧内容，没有 H2D 拷贝也没有主机同步点
                 self.session
-                    .encode_host(host.as_ptr(), force_idr, frame_idx, &self.progress)?
+                    .encode_host(host.as_ptr(), force_idr, frame_idx, &self.stage)?
             }
             FramePayload::VramSlot { slot, sync_value } => {
                 // 同步编码：`lock_bitstream` 返回时输入已读完；槽位认领随帧载荷析构归还
@@ -555,7 +553,7 @@ mod tests {
     fn test_reconfigure_across_resolutions_yields_idr() {
         let p1080 = StreamingProfile::new(1920, 1080, 30, 3_700_000);
         let (mut backend, blocks) =
-            match NvencBackend::new(p1080, VideoCodec::Av1, Arc::new(ActorProgress::new())) {
+            match NvencBackend::new(p1080, VideoCodec::Av1, Arc::new(StageCell::new())) {
                 Ok(pair) => pair,
                 Err(e) => {
                     println!("硬编不可用（{e}），跳过分辨率重配用例");
@@ -749,7 +747,7 @@ mod tests {
             let (width, height) = (profile.width(), profile.height());
 
             let (mut backend, blocks) =
-                match NvencBackend::new(profile, codec, Arc::new(ActorProgress::new())) {
+                match NvencBackend::new(profile, codec, Arc::new(StageCell::new())) {
                     Ok(pair) => pair,
                     Err(e) => {
                         println!(
@@ -788,7 +786,7 @@ mod tests {
         let (width, height) = (profile.width(), profile.height());
 
         let (mut backend, blocks) =
-            match NvencBackend::new(profile, VideoCodec::H264, Arc::new(ActorProgress::new())) {
+            match NvencBackend::new(profile, VideoCodec::H264, Arc::new(StageCell::new())) {
                 Ok(pair) => pair,
                 Err(e) => {
                     println!("Skipping test: NVENC not available ({})", e);

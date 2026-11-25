@@ -2,8 +2,9 @@
 // 告警落在每个导出项的宏调用点上（本文件自身代码不产生弃用告警）；依赖侧修复前在此豁免。
 #![allow(deprecated)]
 
+use crate::encode::EncodeStage;
 use crate::encode::control::ControlStatus;
-use crate::encode::hardware::slots::{ActorStage, MAX_VRAM_SLOTS};
+use crate::encode::hardware::slots::MAX_VRAM_SLOTS;
 use crate::encode::hardware::{FLAT_STRIDE, VramSlotDescriptor};
 use crate::encode::pipeline::{pack_reply, pack_status};
 use crate::encode::{self, VideoPipeline};
@@ -679,7 +680,7 @@ fn stall_diagnostics<'caller>(
         .load()
         .as_ref()
         .and_then(|engine| engine.video().stall_stage(handle as u64))
-        .map(ActorStage::describe)
+        .map(EncodeStage::describe)
         .unwrap_or_else(|| "引擎未运行".to_string());
     match env.new_string(label) {
         Ok(s) => Ok(s),

@@ -12,9 +12,9 @@ use std::sync::Arc;
 use super::hardware::nvenc::NvencBackend;
 use super::hardware::vulkan::VulkanVideoBackend;
 use super::software::SoftwareBackend;
-use crate::encode::hardware::slots::{ActorProgress, VramSlotDescriptor};
+use crate::encode::hardware::slots::VramSlotDescriptor;
 use crate::encode::pool::{HostBlock, heap_blocks};
-use crate::encode::{FramePayload, StreamingProfile, VideoCodec};
+use crate::encode::{FramePayload, StageCell, StreamingProfile, VideoCodec};
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -147,15 +147,15 @@ impl VideoEncoder {
     /// 按显式后端类型构建
     ///
     /// 生产路径经 [`Self::new_software`] 与 Actor 的硬编工厂进入；后端生命周期用例
-    /// 借此直接指定目标后端（请求即所得）。硬编种类必须携带编码进度（心跳与阶段），
-    /// 缺进度直接报错——那是停滞判定的锚点，不是可选项
+    /// 借此直接指定目标后端（请求即所得）。硬编种类必须携带阶段出口，缺它直接报错——
+    /// 停滞时需要知道后端卡在哪一步
     pub(crate) fn new_backend(
         profile: StreamingProfile,
         codec: VideoCodec,
         kind: EncodeBackendKind,
-        progress: Option<Arc<ActorProgress>>,
+        stage: Option<Arc<StageCell>>,
     ) -> Result<(Self, Vec<HostBlock>), String> {
-        Self::build(profile, codec, kind, progress)
+        Self::build(profile, codec, kind, stage)
     }
 
     /// 测试用：绕过探测与全局后端发布，直接用给定后端装配门面
@@ -178,19 +178,19 @@ impl VideoEncoder {
         profile: StreamingProfile,
         codec: VideoCodec,
         kind: EncodeBackendKind,
-        progress: Option<Arc<ActorProgress>>,
+        stage: Option<Arc<StageCell>>,
     ) -> Result<(Self, Vec<HostBlock>), String> {
         // 硬件后端在自己的设备/上下文上分配帧块并随构造一并交回（失败即整体构造失败）；
         // 软编吃堆块，走的是同一个池——帧只有一条路，按内存域区分而已
         let (backend, blocks): (Box<dyn VideoEncodeBackend>, Vec<HostBlock>) = match kind {
             EncodeBackendKind::Nvenc => {
-                let progress = progress.ok_or("NVENC 后端缺少编码进度")?;
-                let (backend, blocks) = NvencBackend::new(profile, codec, progress)?;
+                let stage = stage.ok_or("NVENC 后端缺少阶段出口")?;
+                let (backend, blocks) = NvencBackend::new(profile, codec, stage)?;
                 (Box::new(backend), blocks)
             }
             EncodeBackendKind::VulkanVideo => {
-                let progress = progress.ok_or("Vulkan Video 后端缺少编码进度")?;
-                let (backend, blocks) = VulkanVideoBackend::new(profile, codec, progress)?;
+                let stage = stage.ok_or("Vulkan Video 后端缺少阶段出口")?;
+                let (backend, blocks) = VulkanVideoBackend::new(profile, codec, stage)?;
                 (Box::new(backend), blocks)
             }
             EncodeBackendKind::Software => (

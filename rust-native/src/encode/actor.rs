@@ -13,13 +13,11 @@ use tokio::sync::mpsc::Receiver;
 use crate::encode::control::{ControlCommand, ControlStatus};
 use crate::encode::frame::{FrameInbox, FrameOutbox, FrameOutcome, VideoFrame};
 use crate::encode::hardware::VramSlotDescriptor;
-use crate::encode::hardware::slots::{
-    ActorProgress, ActorStage, MAX_VRAM_SLOTS, VramBinding, VramBindings,
-};
+use crate::encode::hardware::slots::{MAX_VRAM_SLOTS, VramBinding, VramBindings};
 use crate::encode::pool::{FramePool, HostBlock};
 use crate::encode::{
-    FramePayload, StampedVideoPacket, StreamingProfile, TierRequest, VideoCodec, VideoPacket,
-    nv12_len,
+    EncodeStage, FramePayload, Heartbeat, StageCell, StampedVideoPacket, StreamingProfile,
+    TierRequest, VideoCodec, VideoPacket, nv12_len,
 };
 
 use super::encoder::{EncodeBackendKind, VideoEncoder};
@@ -29,7 +27,7 @@ type HardwareBuilder = dyn Fn(
         StreamingProfile,
         VideoCodec,
         EncodeBackendKind,
-        Arc<ActorProgress>,
+        Arc<StageCell>,
     ) -> Result<(VideoEncoder, Vec<HostBlock>), String>
     + Send
     + Sync;
@@ -58,8 +56,10 @@ pub struct EncoderActor {
     codec: VideoCodec,
     /// 主机帧池：只持一个弱引用，用来把后端新分配的块装进池。
     pool: Weak<FramePool>,
-    /// 编码 Actor 的进度：心跳与阶段，按引擎持有
-    progress: Arc<ActorProgress>,
+    /// 编码循环的存活信号：主循环每轮 +1
+    heartbeat: Arc<Heartbeat>,
+    /// 编码路径的当前阶段：主循环与硬件后端写入
+    stage: Arc<StageCell>,
     /// 当前显存绑定注册表：导入时安装，注销/换档时摘除
     bindings: Arc<VramBindings>,
     /// 当前生效的绑定：与注册表同源，保留句柄以便换档时摘除
@@ -80,17 +80,19 @@ impl EncoderActor {
         inbox: Arc<FrameInbox>,
         output: Arc<FrameOutbox>,
         pool: Weak<FramePool>,
-        progress: Arc<ActorProgress>,
+        heartbeat: Arc<Heartbeat>,
+        stage: Arc<StageCell>,
         bindings: Arc<VramBindings>,
     ) -> Self {
         Self::new_with_hardware_builder(
             inbox,
             output,
             pool,
-            progress,
+            heartbeat,
+            stage,
             bindings,
-            Arc::new(|profile, codec, kind, progress| {
-                VideoEncoder::new_backend(profile, codec, kind, Some(progress))
+            Arc::new(|profile, codec, kind, stage| {
+                VideoEncoder::new_backend(profile, codec, kind, Some(stage))
             }),
         )
     }
@@ -100,7 +102,8 @@ impl EncoderActor {
         inbox: Arc<FrameInbox>,
         output: Arc<FrameOutbox>,
         pool: Weak<FramePool>,
-        progress: Arc<ActorProgress>,
+        heartbeat: Arc<Heartbeat>,
+        stage: Arc<StageCell>,
         bindings: Arc<VramBindings>,
         hardware_builder: Arc<HardwareBuilder>,
     ) -> Self {
@@ -113,7 +116,8 @@ impl EncoderActor {
             profile: StreamingProfile::default(),
             codec: VideoCodec::H264,
             pool,
-            progress,
+            heartbeat,
+            stage,
             bindings,
             binding: None,
             hardware_builder,
@@ -147,7 +151,7 @@ impl EncoderActor {
         runtime.block_on(async move {
             loop {
                 // 1. 阻塞等待第一个输入。
-                self.progress.set_stage(ActorStage::Idle);
+                self.stage.set(EncodeStage::Idle);
                 tokio::select! {
                     msg = control_rx.recv() => match msg {
                         Some(cmd) => {
@@ -162,7 +166,7 @@ impl EncoderActor {
                 }
 
                 // 2. 心跳：Actor 停止迭代即心跳冻结，游戏侧据此判定编码线程停滞
-                self.progress.heartbeat_bump();
+                self.heartbeat.bump();
 
                 // 3. 补归还被收件箱覆盖的显存帧：这些帧从未被编码，纹理无人读取，
                 //    生产侧正等着位清零后重新认领
@@ -191,7 +195,7 @@ impl EncoderActor {
     fn apply(&mut self, cmd: ControlCommand) -> bool {
         match cmd {
             ControlCommand::Shutdown => {
-                self.progress.set_stage(ActorStage::Shutdown);
+                self.stage.set(EncodeStage::Shutdown);
                 // 摘除绑定并清空在途帧：后续 push 一律 StaleBinding
                 self.invalidate_binding();
                 // 编码器随 Actor 一起析构：先摘掉引用，避免后续路径误用已排空的编码器
@@ -199,7 +203,7 @@ impl EncoderActor {
                 return false;
             }
             ControlCommand::BitrateChange(bitrate) => {
-                self.progress.set_stage(ActorStage::Reconfigure);
+                self.stage.set(EncodeStage::Reconfigure);
                 self.bitrate = bitrate;
                 Self::apply_bitrate(&mut self.encoder, bitrate);
             }
@@ -268,7 +272,7 @@ impl EncoderActor {
     /// 置阶段码、清收件箱，返回命令前快照 `(档位, codec, 此前是否硬编在位)`——
     /// 只有硬编可能持有槽位注册，软编在位时无从谈起拒收
     fn begin_profile_command(&mut self) -> (StreamingProfile, VideoCodec, bool) {
-        self.progress.set_stage(ActorStage::Reconfigure);
+        self.stage.set(EncodeStage::Reconfigure);
         self.discard_frames_before_rebuild();
         (
             self.profile,
@@ -334,14 +338,14 @@ impl EncoderActor {
             self.invalidate_binding();
             return ControlStatus::Ok;
         };
-        self.progress.set_stage(ActorStage::Drain);
+        self.stage.set(EncodeStage::Drain);
         if let Err(e) = encoder.drain() {
             // 排空失败即上下文不可信：后端整体弃置（mem::forget 永不析构）
             std::mem::forget(encoder);
             log::error!("槽位注销前排空失败，后端弃置，保留导入引用: {e}");
             return ControlStatus::ReleaseFailed;
         }
-        self.progress.set_stage(ActorStage::ClearSlots);
+        self.stage.set(EncodeStage::ClearSlots);
         // 排空成功：先摘绑定（锁内清空旧帧），再释放导入
         self.invalidate_binding();
         encoder.clear_vram_slots();
@@ -371,25 +375,21 @@ impl EncoderActor {
             return ControlStatus::NoHardwareEncoder;
         };
         // 换表全清前置 drain
-        self.progress.set_stage(ActorStage::Drain);
+        self.stage.set(EncodeStage::Drain);
         if let Err(e) = encoder.drain() {
             // 排空失败即上下文不可信：后端整体弃置（mem::forget 永不析构）
             std::mem::forget(encoder);
             log::error!("槽位导入前排空失败，后端弃置，整批拒绝: {e}");
             return ControlStatus::NoHardwareEncoder;
         }
-        self.progress.set_stage(ActorStage::ImportSlots);
+        self.stage.set(EncodeStage::ImportSlots);
         match encoder.import_vram_slots(&mut slots) {
             Ok(()) => {
                 self.encoder = Some(encoder);
                 let slot_mask = slots.iter().fold(0u64, |mask, descriptor| {
                     mask | (1u64 << descriptor.slot_idx)
                 });
-                let binding = Arc::new(VramBinding::new(
-                    slot_mask,
-                    owner,
-                    Arc::clone(&self.progress),
-                ));
+                let binding = Arc::new(VramBinding::new(slot_mask, owner));
                 // 换表与清空同锁：并发 push 要么落在换表前被清掉，要么落进新表
                 let bindings = Arc::clone(&self.bindings);
                 let inbox = Arc::clone(&self.inbox);
@@ -555,12 +555,8 @@ impl EncoderActor {
             self.install_software(profile, codec);
             self.encoder.is_some()
         } else {
-            match (self.hardware_builder.as_ref())(
-                profile,
-                codec,
-                target,
-                Arc::clone(&self.progress),
-            ) {
+            match (self.hardware_builder.as_ref())(profile, codec, target, Arc::clone(&self.stage))
+            {
                 Ok((hw, blocks)) => {
                     log::debug!("硬件编码器就绪!");
                     self.attach(blocks);
@@ -712,7 +708,7 @@ impl EncoderActor {
         }
 
         let force_keyframe = std::mem::take(&mut self.pending_keyframe);
-        self.progress.set_stage(ActorStage::EncodeFrame);
+        self.stage.set(EncodeStage::EncodeFrame);
         let payload = &*payload;
         match encoder.encode(payload, force_keyframe) {
             Ok((nalu, is_keyframe)) if !nalu.is_empty() => {
@@ -783,9 +779,10 @@ mod tests {
     use crate::encode::encoder::{EncodeBackendKind, VideoEncodeBackend};
     use crate::encode::frame::{Mailbox, VideoFrame};
     use crate::encode::hardware::VramSlotDescriptor;
-    use crate::encode::hardware::slots::{ActorProgress, VramBinding, VramBindings};
+    use crate::encode::hardware::slots::{VramBinding, VramBindings};
     use crate::encode::pool::test_support::host_payload;
     use crate::encode::pool::{FramePool, POOL_DEPTH, fake_device_blocks};
+    use crate::encode::{Heartbeat, StageCell};
 
     use super::*;
 
@@ -860,7 +857,7 @@ mod tests {
 
     /// 假硬编工厂：按给定后端身份交出编码器与新域块，形状与生产入口一致
     fn fake_hardware_builder() -> Arc<HardwareBuilder> {
-        Arc::new(move |profile, codec, kind, _progress| {
+        Arc::new(move |profile, codec, kind, _stage| {
             Ok((
                 VideoEncoder::from_backend(profile, codec, Box::new(FakeBackend { kind })),
                 fake_device_blocks(FAKE_DEVICE_DOMAIN),
@@ -876,8 +873,8 @@ mod tests {
         test_actor_with_builder(
             inbox,
             output,
-            Arc::new(|profile, codec, kind, progress| {
-                VideoEncoder::new_backend(profile, codec, kind, Some(progress))
+            Arc::new(|profile, codec, kind, stage| {
+                VideoEncoder::new_backend(profile, codec, kind, Some(stage))
             }),
         )
     }
@@ -893,7 +890,8 @@ mod tests {
             inbox,
             output,
             Arc::downgrade(&pool),
-            Arc::new(ActorProgress::new()),
+            Arc::new(Heartbeat::new()),
+            Arc::new(StageCell::new()),
             VramBindings::new(),
             hardware_builder,
         );
@@ -967,7 +965,7 @@ mod tests {
         let (mut actor, _pool) = test_actor_with_builder(
             inbox,
             Arc::clone(&output),
-            Arc::new(|_profile, _codec, _kind, _progress| Err("硬编构建失败".to_string())),
+            Arc::new(|_profile, _codec, _kind, _stage| Err("硬编构建失败".to_string())),
         );
         let request = tier(1280, 720, 60);
 
@@ -1015,7 +1013,7 @@ mod tests {
         let (mut actor, _pool) = test_actor_with_builder(
             inbox,
             Arc::clone(&output),
-            Arc::new(|_profile, _codec, _kind, _progress| Err("硬编构建失败".to_string())),
+            Arc::new(|_profile, _codec, _kind, _stage| Err("硬编构建失败".to_string())),
         );
         let request = tier(1280, 720, 60);
 
@@ -1309,7 +1307,8 @@ mod tests {
                     actor_inbox,
                     actor_output,
                     actor_pool,
-                    Arc::new(ActorProgress::new()),
+                    Arc::new(Heartbeat::new()),
+                    Arc::new(StageCell::new()),
                     VramBindings::new(),
                 );
                 actor.run(ctl_rx, actor_bell);
@@ -1502,7 +1501,7 @@ mod tests {
 
     /// 围栏测试工厂：交出硬件身份编码器（行为按用例配置）
     fn fence_backend_builder(drain_ok: bool, import_ok: bool) -> Arc<HardwareBuilder> {
-        Arc::new(move |profile, codec, _kind, _progress| {
+        Arc::new(move |profile, codec, _kind, _stage| {
             Ok((
                 VideoEncoder::from_backend(
                     profile,
@@ -1529,7 +1528,8 @@ mod tests {
             inbox,
             output,
             Arc::downgrade(&pool),
-            Arc::new(ActorProgress::new()),
+            Arc::new(Heartbeat::new()),
+            Arc::new(StageCell::new()),
             VramBindings::new(),
             fence_backend_builder(drain_ok, import_ok),
         );

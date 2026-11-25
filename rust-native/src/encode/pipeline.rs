@@ -24,10 +24,10 @@ use crate::encode::frame::{
     FrameInbox, FrameOutbox, FrameOutcome, FramePayload, Mailbox, VideoFrame,
 };
 use crate::encode::hardware::VramSlotDescriptor;
-use crate::encode::hardware::slots::{ActorProgress, VramBindings};
+use crate::encode::hardware::slots::VramBindings;
 use crate::encode::pool::FramePool;
 use crate::encode::{
-    StreamingProfile, TierRequest, VideoCodec, bootstrap_hardware_caps,
+    Heartbeat, StageCell, StreamingProfile, TierRequest, VideoCodec, bootstrap_hardware_caps,
     is_hardware_caps_bootstrapped,
 };
 /// 关停等待编码线程的上限
@@ -75,6 +75,10 @@ pub struct VideoPipeline {
     pool: Arc<FramePool>,
     /// 当前显存绑定注册表：同一时刻至多一个绑定，Java 只持有句柄
     bindings: Arc<VramBindings>,
+    /// 编码循环的存活信号：Actor 每轮 +1，JNI 快照只读
+    heartbeat: Arc<Heartbeat>,
+    /// 编码路径的当前阶段：Actor 与后端写入，JNI 诊断只读
+    stage: Arc<StageCell>,
     /// 发件箱（唯一活跃会话从它取件）：没有会话时帧照编照丢
     output: Arc<FrameOutbox>,
     /// 编码线程句柄，只在关停时取用一次
@@ -147,10 +151,12 @@ impl VideoPipeline {
         // 这样第一帧到达时池里已有可用块
         let pool = FramePool::new();
         let actor_pool = Arc::downgrade(&pool);
-        // 进度与绑定注册表随引擎持有；旧 Actor 拿旧 Arc，写不到后继引擎
-        let progress = Arc::new(ActorProgress::new());
+        // 心跳、阶段与绑定注册表随引擎持有；旧 Actor 拿旧 Arc，写不到后继引擎
+        let heartbeat = Arc::new(Heartbeat::new());
+        let stage = Arc::new(StageCell::new());
         let bindings = VramBindings::new();
-        let actor_progress = Arc::clone(&progress);
+        let actor_heartbeat = Arc::clone(&heartbeat);
+        let actor_stage = Arc::clone(&stage);
         let actor_bindings = Arc::clone(&bindings);
 
         let handle = std::thread::Builder::new()
@@ -162,7 +168,8 @@ impl VideoPipeline {
                         actor_inbox,
                         actor_output,
                         actor_pool,
-                        actor_progress,
+                        actor_heartbeat,
+                        actor_stage,
                         actor_bindings,
                     );
                     actor.run(control_rx, actor_doorbell);
@@ -184,6 +191,8 @@ impl VideoPipeline {
             control: ControlSender::new(control_tx, Arc::clone(&doorbell)),
             pool,
             bindings,
+            heartbeat,
+            stage,
             output,
             actor_handle: Mutex::new(Some(handle)),
         })
@@ -200,6 +209,8 @@ impl VideoPipeline {
             control,
             pool: FramePool::new(),
             bindings: VramBindings::new(),
+            heartbeat: Arc::new(Heartbeat::new()),
+            stage: Arc::new(StageCell::new()),
             output: Arc::new(Mailbox::new(inbox.outcomes_arc())),
             actor_handle: Mutex::new(None),
         }
@@ -272,31 +283,26 @@ impl VideoPipeline {
     pub(crate) fn vram_slot_state(&self, handle: u64) -> u64 {
         match self.bindings.with_current(handle, |binding| {
             if binding.is_poisoned() {
-                (
-                    ControlStatus::Poisoned,
-                    binding.in_flight(),
-                    binding.heartbeat(),
-                )
+                (ControlStatus::Poisoned, binding.in_flight())
             } else {
-                (ControlStatus::Ok, binding.in_flight(), binding.heartbeat())
+                (ControlStatus::Ok, binding.in_flight())
             }
         }) {
-            Some((status, in_flight, heartbeat)) => pack_reply(status, in_flight, heartbeat),
+            Some((status, in_flight)) => pack_reply(status, in_flight, self.heartbeat.get()),
             None => pack_reply(ControlStatus::StaleBinding, 0, 0),
         }
     }
 
-    /// 绑定时编码 Actor 所在的阶段码（诊断冷路径）
+    /// 句柄有效时返回编码路径当前阶段码（诊断冷路径）
     pub(crate) fn stall_stage(&self, handle: u64) -> Option<u64> {
-        self.bindings
-            .with_current(handle, |binding| binding.stage())
+        self.bindings.with_current(handle, |_| self.stage.get())
     }
 
     /// 关停编码线程：投递 Shutdown 后**有界**等待
     ///
     /// 代价：超时返回后**不再保证 Actor 已退出**，调用方不得再假定显存槽位等资源已释放。
     /// 进程退出与编码停滞自愈重启都会走到本路径；被弃置的线程携带自己的编码上下文
-    /// 与绑定引用继续存活，进度与绑定注册表按引擎隔离（新引擎是新的 `Arc`），
+    /// 与绑定引用继续存活，心跳、阶段与绑定注册表按引擎隔离（新引擎是新的 `Arc`），
     /// 其干扰不到后继引擎，泄漏资源随进程退出回收。
     pub fn shutdown(&self) {
         // 只投递不等回复：受理与否只说明命令是否入队，退出与否由下面的有界等待回答

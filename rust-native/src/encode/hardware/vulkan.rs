@@ -23,11 +23,9 @@ mod vram_slot;
 #[cfg(test)]
 use crate::encode::encoder::BackendStageTimings;
 use crate::encode::encoder::{EncodeBackendKind, VideoEncodeBackend};
-use crate::encode::hardware::slots::{
-    ActorProgress, SlotTable, VramSlotDescriptor, ensure_batch_geometry,
-};
+use crate::encode::hardware::slots::{SlotTable, VramSlotDescriptor, ensure_batch_geometry};
 use crate::encode::pool::{HOST_SLOT_BYTES, HostBlock, POOL_DEPTH};
-use crate::encode::{FramePayload, StreamingProfile, VideoCodec, nv12_len};
+use crate::encode::{FramePayload, StageCell, StreamingProfile, VideoCodec, nv12_len};
 
 use std::sync::Arc;
 
@@ -170,8 +168,8 @@ pub(crate) struct VulkanVideoBackend {
     /// 当前 codec
     codec: VideoCodec,
     slots: SlotTable<VramSlot>,
-    /// 引擎级编码进度：本后端只写阶段码，心跳由 Actor 循环推进
-    progress: Arc<ActorProgress>,
+    /// 编码阻塞阶段出口：本后端只写阶段码，心跳由编码循环推进
+    stage: Arc<StageCell>,
     /// 本设备为该 codec 声明的 `pictureAccessGranularity`
     ///
     /// 采集侧必须按它出帧（`StreamingProfile::coded_extent`）。存成字段而不是每次回查
@@ -192,7 +190,7 @@ impl VulkanVideoBackend {
     pub(crate) fn new(
         profile: StreamingProfile,
         codec: VideoCodec,
-        progress: Arc<ActorProgress>,
+        stage: Arc<StageCell>,
     ) -> Result<(Self, Vec<HostBlock>), String> {
         let width = profile.width();
         let height = profile.height();
@@ -249,7 +247,7 @@ impl VulkanVideoBackend {
                 profile,
                 codec,
                 slots: SlotTable::new(),
-                progress,
+                stage,
                 coded_align: (
                     caps.picture_access_granularity.width.max(1),
                     caps.picture_access_granularity.height.max(1),
@@ -372,7 +370,7 @@ impl VideoEncodeBackend for VulkanVideoBackend {
 
         // 先建新后端再替换：新建失败时旧后端仍然可用。新后端带在自己的新设备上分配的帧块，
         // 由调用方装进帧池——池里旧域的块会落进 `stale`，等下次 `attach` 时释放
-        let (new_backend, blocks) = Self::new(new_profile, new_codec, Arc::clone(&self.progress))?;
+        let (new_backend, blocks) = Self::new(new_profile, new_codec, Arc::clone(&self.stage))?;
         *self = new_backend;
         Ok(blocks)
     }

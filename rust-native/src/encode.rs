@@ -8,6 +8,7 @@ pub mod hardware;
 mod perf;
 pub mod pipeline;
 pub(crate) mod pool;
+pub(crate) mod progress;
 pub mod software;
 
 use std::time::Duration;
@@ -23,6 +24,7 @@ pub use hardware::{
     hardware_backends, is_hardware_caps_bootstrapped, is_selectable,
 };
 pub use pipeline::VideoPipeline;
+pub(crate) use progress::{EncodeStage, Heartbeat, StageCell};
 use serde::{Deserialize, Serialize};
 
 /// 一个音频包：编码器产出一个音频帧的 Opus 码流，按 `Bytes` 零拷贝移交；
