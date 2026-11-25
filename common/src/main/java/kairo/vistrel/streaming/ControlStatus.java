@@ -19,7 +19,8 @@ public enum ControlStatus {
     ENCODER_BUILD_FAILED(9, "编码器建成失败 (候选后端全部创建失败，详见日志)"),
     STALE_BINDING(10, "显存绑定句柄已失效 (不属于当前引擎或已被换档/注销摘除)"),
     SLOT_NOT_FREE(11, "槽位已在途或未导入 (重复推送同一槽位)"),
-    WRONG_THREAD(12, "推送线程不是导入时的渲染线程");
+    WRONG_THREAD(12, "推送线程不是导入时的渲染线程"),
+    POISONED(13, "编码器等待超时毒化 (在途提交可能仍在读槽位纹理，绑定不再接受推送)");
     private final int code;
     private final String description;
 

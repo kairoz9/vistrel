@@ -3,6 +3,7 @@ package kairo.vistrel.capture;
 //? if vulkan_backend {
 import kairo.vistrel.Constants;
 import kairo.vistrel.capture.BlitPipelines.FlipBlit;
+import kairo.vistrel.streaming.ControlStatus;
 import kairo.vistrel.streaming.EncoderChannel;
 import kairo.vistrel.streaming.SessionServer;
 import kairo.vistrel.streaming.VramBinding;
@@ -251,15 +252,31 @@ public class RenderpearlVramPipeline implements FrameSource {
      * 此刻编码器可能仍映射着槽位纹理，任何写入都是跨 API 竞态，必须立即收手
      */
     private void onHeartbeatTimeout() {
+        stopVramPush(String.format(
+                "显存直通停滞：%ds 内编码线程心跳冻结（最后阶段：%s），判定编码线程死亡，停推显存帧并触发引擎自愈",
+                VramBinding.STALL_HEARTBEAT_TIMEOUT_NS / 1_000_000_000L,
+                vramBinding.stallDiagnostics()
+        ));
+    }
+
+    /**
+     * 毒化：编码器等待超时后，在途提交可能仍在读槽位纹理，必须停推并自愈
+     */
+    private void onEncoderPoisoned() {
+        stopVramPush("显存直通毒化：编码器等待超时，在途提交可能仍在读槽位纹理，停推显存帧并触发引擎自愈");
+    }
+
+    /**
+     * 一次性停推显存帧并移交自愈回调：卡死与毒化共用同一条出口。
+     *
+     * @param message 面向日志的原因；只打一次
+     */
+    private void stopVramPush(String message) {
         if (stallTriggered) {
             return;
         }
         stallTriggered = true;
-        Constants.LOG.error(
-                "显存直通停滞：{}s 内编码线程心跳冻结（最后阶段：{}），判定编码线程死亡，停推显存帧并触发引擎自愈",
-                VramBinding.STALL_HEARTBEAT_TIMEOUT_NS / 1_000_000_000L,
-                vramBinding.stallDiagnostics()
-        );
+        Constants.LOG.error(message);
         try {
             onEncoderStall.run();
         } catch (Throwable t) {
@@ -433,6 +450,13 @@ public class RenderpearlVramPipeline implements FrameSource {
             }
             // Native 未受理（旧绑定）：帧已被入口丢弃，按主动丢帧处理
             return queued ? CaptureOutcome.Delivered : CaptureOutcome.Dropped;
+        } catch (EncoderChannel.ControlException e) {
+            if (e.status == ControlStatus.POISONED) {
+                onEncoderPoisoned();
+                return CaptureOutcome.Dropped;
+            }
+            Constants.LOG.error("RenderpearlVramPipeline.capture 控制面异常: {}", e.getMessage());
+            return CaptureOutcome.Failed;
         } catch (Throwable t) {
             Constants.LOG.error("RenderpearlVramPipeline.capture 异常: {}", t.getMessage());
             return CaptureOutcome.Failed;

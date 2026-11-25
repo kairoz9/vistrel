@@ -25,14 +25,15 @@ public class ControlCodeTableTest {
         Assertions.assertEquals(10, ControlStatus.STALE_BINDING.code());
         Assertions.assertEquals(11, ControlStatus.SLOT_NOT_FREE.code());
         Assertions.assertEquals(12, ControlStatus.WRONG_THREAD.code());
+        Assertions.assertEquals(13, ControlStatus.POISONED.code());
     }
 
     /**
-     * 0..12 每个码都要有人话，不能落进 default 的「未知错误码」
+     * 0..13 每个码都要有人话，不能落进 default 的「未知错误码」
      */
     @Test
     void testEveryKnownCodeHasAReason() {
-        for (int code = 0; code <= 12; code++) {
+        for (int code = 0; code <= 13; code++) {
             Assertions.assertNotNull(ControlStatus.fromCode(code), "码 " + code + " 缺少枚举");
             Assertions.assertFalse(ControlStatus.describe(code).startsWith("未知错误码"), "码 " + code + " 缺少可读原因");
         }
@@ -41,7 +42,7 @@ public class ControlCodeTableTest {
                 ControlStatus.describe(ControlStatus.RECONFIGURE_FAILED.code()),
                 "档位重配失败必须与 ACK 超时区分开"
         );
-        Assertions.assertTrue(ControlStatus.describe(13).startsWith("未知错误码"), "表外的码才允许落进未知");
-        Assertions.assertNull(ControlStatus.fromCode(13), "表外的码不映射到枚举");
+        Assertions.assertTrue(ControlStatus.describe(14).startsWith("未知错误码"), "表外的码才允许落进未知");
+        Assertions.assertNull(ControlStatus.fromCode(14), "表外的码不映射到枚举");
     }
 }

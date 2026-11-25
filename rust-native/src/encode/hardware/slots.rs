@@ -5,7 +5,7 @@
 
 use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::ThreadId;
 
 use parking_lot::Mutex;
@@ -364,6 +364,8 @@ pub(crate) struct VramBinding {
     owner: ThreadId,
     /// 引擎级心跳与阶段：绑定与引擎同寿命
     progress: Arc<ActorProgress>,
+    /// 提交等待超时后置位：在途 GPU 工作可能仍在读槽位纹理，绑定不再接受推送
+    poisoned: AtomicBool,
 }
 
 impl VramBinding {
@@ -375,6 +377,7 @@ impl VramBinding {
             in_flight: AtomicU64::new(0),
             owner,
             progress,
+            poisoned: AtomicBool::new(false),
         }
     }
 
@@ -401,6 +404,16 @@ impl VramBinding {
     /// 当前在途掩码（快照）
     pub(crate) fn in_flight(&self) -> u64 {
         self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// 是否因提交等待超时毒化
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// 毒化本绑定：在途提交可能仍在读槽位纹理，后续推送一律拒绝
+    pub(crate) fn mark_poisoned(&self) {
+        self.poisoned.store(true, Ordering::Release);
     }
 
     /// 置位一个空闲槽位并交出所有权；越界、未导入、已在途都返回 `None`
@@ -470,9 +483,10 @@ impl OwnedSlot {
         self.slot
     }
 
-    /// 提交仍在途：Drop 不归还，槽位保持占用直到绑定整体废弃
-    pub(crate) fn suppress(&self) {
+    /// 毒化路径：抑制归还并让整个绑定停止接收推送
+    pub(crate) fn poison(&self) {
         self.suppress.set(true);
+        self.binding.mark_poisoned();
     }
 }
 
@@ -688,12 +702,13 @@ mod tests {
     }
 
     #[test]
-    fn test_suppressed_slot_stays_in_flight() {
-        let binding = VramBinding::new_for_test(1);
+    fn test_poison_marks_binding_and_suppresses_drop() {
+        let binding = VramBinding::new_for_test(2);
         let slot = binding.try_acquire(0).unwrap();
-        slot.suppress();
+        slot.poison();
+        assert!(binding.is_poisoned(), "毒化必须落在绑定上");
         drop(slot);
-        assert!(binding.is_in_flight(0), "suppress 后 Drop 不得归还");
+        assert!(binding.is_in_flight(0), "毒化后 Drop 不得归还");
     }
 
     #[test]

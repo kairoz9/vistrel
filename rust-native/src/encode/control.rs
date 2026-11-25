@@ -58,6 +58,8 @@ pub(crate) enum ControlStatus {
     SlotNotFree = 11,
     /// 推送线程不是导入时的渲染线程：绑定的线程约束被破坏
     WrongThread = 12,
+    /// 提交等待超时毒化：在途 GPU 工作可能仍在读槽位纹理，本绑定不再接受推送
+    Poisoned = 13,
 }
 
 /// 控制命令

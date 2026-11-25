@@ -244,6 +244,13 @@ impl VideoPipeline {
                     binding.heartbeat(),
                 );
             }
+            if binding.is_poisoned() {
+                return (
+                    ControlStatus::Poisoned,
+                    binding.in_flight(),
+                    binding.heartbeat(),
+                );
+            }
             // 先置位再入箱：编码极快时 ack 不能清掉尚未置的位
             let Some(owned) = binding.try_acquire(slot) else {
                 return (
@@ -270,11 +277,18 @@ impl VideoPipeline {
 
     /// 当前在途掩码与心跳快照：游戏侧每 tick 调用一次，同时刷新停滞判定基准
     pub(crate) fn vram_slot_state(&self, handle: u64) -> u64 {
-        match self
-            .bindings
-            .with_current(handle, |binding| (binding.in_flight(), binding.heartbeat()))
-        {
-            Some((in_flight, heartbeat)) => pack_reply(ControlStatus::Ok, in_flight, heartbeat),
+        match self.bindings.with_current(handle, |binding| {
+            if binding.is_poisoned() {
+                (
+                    ControlStatus::Poisoned,
+                    binding.in_flight(),
+                    binding.heartbeat(),
+                )
+            } else {
+                (ControlStatus::Ok, binding.in_flight(), binding.heartbeat())
+            }
+        }) {
+            Some((status, in_flight, heartbeat)) => pack_reply(status, in_flight, heartbeat),
             None => pack_reply(ControlStatus::StaleBinding, 0, 0),
         }
     }
@@ -413,6 +427,39 @@ mod tests {
         let frame = inbox.take().expect("帧必须入箱");
         drop(frame);
         assert!(!binding.is_in_flight(2), "载荷析构必须归还槽位");
+    }
+
+    /// 毒化后绑定拒绝推送，快照回报 Poisoned
+    #[test]
+    fn test_poisoned_binding_reports_poisoned() {
+        let doorbell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&doorbell)));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let pipeline =
+            VideoPipeline::assemble(ControlSender::new(tx, doorbell), Arc::clone(&inbox));
+
+        let binding = VramBinding::new_for_test(3);
+        pipeline.bindings().install(Arc::clone(&binding), || {});
+        let poisoned = binding.try_acquire(0).unwrap();
+        poisoned.poison();
+        drop(poisoned);
+        assert!(binding.is_poisoned());
+
+        let reply = pipeline.push_vram_slot(binding.handle(), 1, 0, 7);
+        assert_eq!(
+            ((reply >> 56) as i32) - 1,
+            ControlStatus::Poisoned.code(),
+            "毒化后推送必须回 Poisoned"
+        );
+        assert_eq!(binding.in_flight(), 1, "被拒推送不得置位新槽位");
+        assert!(inbox.take().is_none(), "毒化后的帧不得进入收件箱");
+
+        let state = pipeline.vram_slot_state(binding.handle());
+        assert_eq!(
+            ((state >> 56) as i32) - 1,
+            ControlStatus::Poisoned.code(),
+            "快照必须让游戏侧看到毒化"
+        );
     }
 
     /// 取出收件箱里的主机帧（唯一一帧，取完即空）

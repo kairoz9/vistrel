@@ -427,7 +427,7 @@ impl VideoEncodeBackend for VulkanVideoBackend {
                 let result =
                     self.encode_vram_slot(slot.slot(), *sync_value, force_keyframe, frame_idx);
                 if self.encoder.is_poisoned() {
-                    slot.suppress();
+                    slot.poison();
                 }
                 result
             }
