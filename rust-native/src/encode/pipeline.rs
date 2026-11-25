@@ -39,24 +39,12 @@ const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// 等待期间的轮询间隔：关停路径一次性的开销，10ms 足够且几乎不占 CPU
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// packed 回复里状态字节的偏移：高 8 位存 `code + 1`，0 留给 JNI 异常默认值
-const STATUS_SHIFT: u32 = 56;
-/// packed 回复里心跳字段的偏移
-const HEARTBEAT_SHIFT: u32 = 8;
-
-/// 状态码 + 1：JNI 包装在 panic 时返回 0，0 必须落在未知/故障一侧。
-pub(crate) fn pack_status(status: ControlStatus) -> i32 {
-    status.code() + 1
-}
-
-/// 把槽位状态、在途掩码与心跳打成一个 `u64`（`vramSlotState` 快照专用）。
-///
-/// 状态存 `code + 1`：JNI 包装在 panic 时返回 0，若 `Ok` 编码为 0，一次异常会被
-/// Java 读成「成功且全忙」，槽位永在途。0 必须落在未知/故障一侧。
-pub(crate) fn pack_reply(status: ControlStatus, in_flight: u64, heartbeat: u64) -> u64 {
-    ((pack_status(status) as u64) << STATUS_SHIFT)
-        | ((heartbeat & 0xFFFF_FFFF) << HEARTBEAT_SHIFT)
-        | (in_flight & 0xFF)
+/// `vramSlotState` 的领域快照：状态、在途掩码与编码心跳。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlotStateSnapshot {
+    pub(crate) status: ControlStatus,
+    pub(crate) in_flight: u64,
+    pub(crate) heartbeat: u64,
 }
 
 /// 编码管线组合根：一条编码段的全部协作组件与它们的唯一持有者
@@ -242,14 +230,11 @@ impl VideoPipeline {
         }
     }
 
-    /// 投递一帧显存直通画面（槽位需先经 [`ControlSender::import_vram_slots`] 导入）
+    /// 投递一帧显存直通画面：`handle` 来自导入，`slot` 选自 `vram_slot_state` 快照。
     ///
-    /// `handle` 是导入返回的绑定句柄，`slot` 是渲染线程从 `vram_slot_state` 快照里选中的
-    /// 空闲槽位。句柄、线程、槽位任一不符都在入口拒绝，帧不进入收件箱。
-    ///
-    /// 绑定指针在载入后仍可能被 Actor 换代；帧携带 `OwnedSlot` 的代次，Actor 取出时
-    /// 再校验一次，旧代帧在编码入口丢弃。只回答「帧收没收到」；掩码与心跳只在
-    /// `vram_slot_state` 快照里返回。
+    /// 句柄、线程、槽位任一不符都在入口拒绝；绑定载入后仍可能被 Actor 换代，
+    /// 帧携带 `OwnedSlot` 代次，由 Actor 取出时再校验。只回答「帧收没收到」；
+    /// 掩码与心跳只在 `vram_slot_state` 快照里返回。
     pub(crate) fn push_vram_slot(
         &self,
         handle: u64,
@@ -285,20 +270,32 @@ impl VideoPipeline {
     }
 
     /// 当前在途掩码与心跳快照：游戏侧每 tick 调用一次，同时刷新停滞判定基准
-    pub(crate) fn vram_slot_state(&self, handle: u64) -> u64 {
+    pub(crate) fn vram_slot_state(&self, handle: u64) -> SlotStateSnapshot {
         let current = self.binding.load();
         let Some(binding) = current.as_ref() else {
-            return pack_reply(ControlStatus::StaleBinding, 0, 0);
+            return SlotStateSnapshot {
+                status: ControlStatus::StaleBinding,
+                in_flight: 0,
+                heartbeat: 0,
+            };
         };
         if binding.handle() != handle {
-            return pack_reply(ControlStatus::StaleBinding, 0, 0);
+            return SlotStateSnapshot {
+                status: ControlStatus::StaleBinding,
+                in_flight: 0,
+                heartbeat: 0,
+            };
         }
         let status = if binding.is_poisoned() {
             ControlStatus::Poisoned
         } else {
             ControlStatus::Ok
         };
-        pack_reply(status, binding.in_flight(), self.heartbeat.get())
+        SlotStateSnapshot {
+            status,
+            in_flight: binding.in_flight(),
+            heartbeat: self.heartbeat.get(),
+        }
     }
 
     /// 句柄有效时返回编码路径当前阶段码（诊断冷路径）
@@ -426,8 +423,8 @@ mod tests {
         let old = VramBinding::new_for_test(2);
         pipeline.binding_slot().store(Some(Arc::clone(&old)));
         assert_eq!(
-            ((pipeline.vram_slot_state(old.handle()) >> 56) as i32) - 1,
-            ControlStatus::Ok.code()
+            pipeline.vram_slot_state(old.handle()).status,
+            ControlStatus::Ok
         );
         assert_eq!(
             pipeline.stall_stage(old.handle()),
@@ -438,8 +435,8 @@ mod tests {
         pipeline.binding_slot().store(Some(Arc::clone(&new)));
 
         assert_eq!(
-            ((pipeline.vram_slot_state(old.handle()) >> 56) as i32) - 1,
-            ControlStatus::StaleBinding.code(),
+            pipeline.vram_slot_state(old.handle()).status,
+            ControlStatus::StaleBinding,
             "旧句柄快照必须失效"
         );
         assert!(
@@ -447,8 +444,8 @@ mod tests {
             "旧句柄诊断必须失效"
         );
         assert_eq!(
-            ((pipeline.vram_slot_state(new.handle()) >> 56) as i32) - 1,
-            ControlStatus::Ok.code(),
+            pipeline.vram_slot_state(new.handle()).status,
+            ControlStatus::Ok,
             "新句柄快照必须立即生效"
         );
     }
@@ -469,6 +466,10 @@ mod tests {
         assert_eq!(reply, ControlStatus::Ok, "当前句柄必须受理");
         assert!(binding.is_in_flight(2), "push 必须置位在途");
         assert_eq!(binding.in_flight(), 1 << 2);
+
+        let state = pipeline.vram_slot_state(binding.handle());
+        assert_eq!(state.status, ControlStatus::Ok);
+        assert_eq!(state.in_flight, 1 << 2, "快照必须带上在途掩码");
 
         let frame = inbox.take().expect("帧必须入箱");
         drop(frame);
@@ -498,8 +499,8 @@ mod tests {
 
         let state = pipeline.vram_slot_state(binding.handle());
         assert_eq!(
-            ((state >> 56) as i32) - 1,
-            ControlStatus::Poisoned.code(),
+            state.status,
+            ControlStatus::Poisoned,
             "快照必须让游戏侧看到毒化"
         );
     }

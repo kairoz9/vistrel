@@ -3,10 +3,12 @@
 //! 统一汇聚 Java `NativeBridge` 与底层 Rust 原生引擎的双向调用与生命周期管理：
 //! - `api`: Java -> Rust 的 C-ABI 导出函数（以 `Java_kairo_vistrel_streaming_natives_NativeBridge_` 命名）
 //! - `callback`: Rust -> Java 的跨线程事件与状态反向推送
+//! - `wire`: `vramSlotState` / `pushVramSlot` 的 packed 线协议
 
 pub mod api;
 pub mod callback;
 pub(crate) mod reply;
+pub(crate) mod wire;
 
 pub(crate) use reply::Reply;
 

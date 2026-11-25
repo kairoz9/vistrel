@@ -6,9 +6,9 @@ use crate::encode::EncodeStage;
 use crate::encode::control::ControlStatus;
 use crate::encode::hardware::slots::MAX_VRAM_SLOTS;
 use crate::encode::hardware::{FLAT_STRIDE, VramSlotDescriptor};
-use crate::encode::pipeline::{pack_reply, pack_status};
 use crate::encode::{self, VideoPipeline};
 use crate::jni::callback;
+use crate::jni::wire::{pack_slot_state, pack_status};
 use crate::jni::{Reply, elapsed_birth_nanos, get_global};
 use crate::streaming::StreamingEngine;
 use crate::streaming::audio_loopback::AudioLoopback;
@@ -516,8 +516,7 @@ fn import_vram_slots<'caller>(
     }
 }
 
-/// 槽位整批导入：Native 读当前轮次交给 Actor（stale 时不消费句柄），
-/// 成功回送 lease 供 Java 取同一代次的块。
+/// 槽位整批导入：Actor 完成驱动导入后，由 Native 分配并回送绑定句柄。
 fn import_vram_slots_reply<'caller>(
     env: &mut Env<'caller>,
     flat: JPrimitiveArray<'caller, jlong>,
@@ -583,7 +582,7 @@ fn push_vram_slot<'caller>(
 ) -> jni::errors::Result<jint> {
     let birth_nanos = elapsed_birth_nanos();
 
-    // 句柄、线程与槽位校验全在 Native 侧：旧绑定的帧在入口丢弃，不进入收件箱
+    // 句柄、线程与槽位校验全在 Native 侧：旧绑定帧由推送入口或编码入口按代次丢弃
     let engine = get_global().streaming_engine.load();
     let Some(engine) = engine.as_ref() else {
         return Ok(pack_status(ControlStatus::ActorDead));
@@ -611,9 +610,10 @@ fn vram_slot_state<'caller>(
     // 每 tick 一次：权威在途快照 + 心跳。游戏侧据此选槽并判定停滞
     let engine = get_global().streaming_engine.load();
     let Some(engine) = engine.as_ref() else {
-        return Ok(pack_reply(ControlStatus::ActorDead, 0, 0) as jlong);
+        return Ok(pack_slot_state(ControlStatus::ActorDead, 0, 0) as jlong);
     };
-    Ok(engine.video().vram_slot_state(handle as u64) as jlong)
+    let state = engine.video().vram_slot_state(handle as u64);
+    Ok(pack_slot_state(state.status, state.in_flight, state.heartbeat) as jlong)
 }
 
 const _: jni::NativeMethod = native_method! {
@@ -674,7 +674,7 @@ fn stall_diagnostics<'caller>(
     _class: JClass<'caller>,
     handle: jlong,
 ) -> jni::errors::Result<JString<'caller>> {
-    // 冷路径：只在心跳超时后调用一次。阶段码表只留在 Native，Java 不再维护第二份映射
+    // 冷路径：只在心跳超时后调用一次。阶段码表与标签只在 Native 维护，Java 直接使用返回的标签
     let label = get_global()
         .streaming_engine
         .load()

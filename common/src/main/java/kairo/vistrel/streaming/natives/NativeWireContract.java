@@ -4,7 +4,7 @@ package kairo.vistrel.streaming.natives;
  * JNI 数据面线协议的 Java 侧唯一定义处。
  *
  * <p>Rust 端对应 {@code encode::hardware::slots}（槽位扁平协议）、
- * {@code encode::pipeline::pack_reply} / {@code pack_status}（回复打包）与
+ * {@code jni::wire::pack_slot_state} / {@code pack_status}（回复打包）与
  * {@code encode::control::ControlStatus}（结果码表）。项目当前没有自动跨语言 gate 或启动
  * 握手：修改本类必须同步 Rust 端；正常安装下内嵌原生库有 SHA-256 校验兜底。
  *
