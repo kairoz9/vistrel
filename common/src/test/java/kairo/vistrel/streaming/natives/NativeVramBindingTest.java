@@ -19,6 +19,14 @@ class NativeVramBindingTest {
     }
 
     @Test
+    void testPushStatusIsCodePlusOne() {
+        Assertions.assertNull(NativeVramBinding.statusOf(0), "JNI 异常默认值 0 不能读成 Ok");
+        Assertions.assertEquals(ControlStatus.OK, NativeVramBinding.statusOf(ControlStatus.OK.code() + 1), "push 只回状态码");
+        Assertions.assertEquals(ControlStatus.POISONED, NativeVramBinding.statusOf(ControlStatus.POISONED.code() + 1));
+        Assertions.assertNull(NativeVramBinding.statusOf(200), "表外码不映射到枚举");
+    }
+
+    @Test
     void testUnknownZeroReplyIsNotSuccess() {
         Assertions.assertNull(NativeVramBinding.statusOf(0), "JNI 异常默认值 0 必须按未知/故障处理，不能读成 Ok");
     }

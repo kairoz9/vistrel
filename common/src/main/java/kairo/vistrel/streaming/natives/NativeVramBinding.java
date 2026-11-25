@@ -81,7 +81,7 @@ final class NativeVramBinding implements VramBinding {
         if (closed) {
             throw new IllegalStateException("显存绑定已关闭，拒绝投递");
         }
-        long reply = NativeBridge.pushVramSlot(handle, slot, signalVal);
+        int reply = NativeBridge.pushVramSlot(handle, slot, signalVal);
         ControlStatus status = statusOf(reply);
         if (status == null) {
             throw new ControlException("NativeBridge.pushVramSlot 返回未知状态", ControlStatus.PIPELINE_DEAD);
@@ -148,17 +148,26 @@ final class NativeVramBinding implements VramBinding {
     }
 
     /**
-     * packed 回复里的结果码；0（JNI 异常默认值）返回 null，调用方必须按故障处理。
+     * push 回复里的结果码：Native 回送 {@code code + 1}。
+     *
+     * @param raw Native 原始返回值
+     * @return 状态；0（JNI 异常默认值）返回 null，调用方必须按故障处理
+     */
+    static ControlStatus statusOf(int raw) {
+        if (raw == 0) {
+            return null;
+        }
+        return ControlStatus.fromCode(raw - 1);
+    }
+
+    /**
+     * packed 快照回复里的结果码；0（JNI 异常默认值）返回 null。
      *
      * @param reply packed 回复
      * @return 状态；未知返回 null
      */
     static ControlStatus statusOf(long reply) {
-        int raw = (int) (reply >>> NativeWireContract.STATUS_SHIFT);
-        if (raw == 0) {
-            return null;
-        }
-        return ControlStatus.fromCode(raw - 1);
+        return statusOf((int) (reply >>> NativeWireContract.STATUS_SHIFT));
     }
 
     /**

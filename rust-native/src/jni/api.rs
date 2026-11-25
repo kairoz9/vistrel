@@ -5,7 +5,7 @@
 use crate::encode::control::ControlStatus;
 use crate::encode::hardware::slots::{ActorStage, MAX_VRAM_SLOTS};
 use crate::encode::hardware::{FLAT_STRIDE, VramSlotDescriptor};
-use crate::encode::pipeline::pack_reply;
+use crate::encode::pipeline::{pack_reply, pack_status};
 use crate::encode::{self, VideoPipeline};
 use crate::jni::callback;
 use crate::jni::{Reply, elapsed_birth_nanos, get_global};
@@ -570,7 +570,7 @@ const _: jni::NativeMethod = native_method! {
     java_type = "kairo.vistrel.streaming.natives.NativeBridge",
     export = "Java_kairo_vistrel_streaming_natives_NativeBridge_pushVramSlot",
     error_policy = LogErrorAndDefault,
-    static fn push_vram_slot(handle: jlong, slot: jint, sync_value: jlong) -> jlong,
+    static fn push_vram_slot(handle: jlong, slot: jint, sync_value: jlong) -> jint,
 };
 
 fn push_vram_slot<'caller>(
@@ -579,17 +579,20 @@ fn push_vram_slot<'caller>(
     handle: jlong,
     slot: jint,
     sync_value: jlong,
-) -> jni::errors::Result<jlong> {
+) -> jni::errors::Result<jint> {
     let birth_nanos = elapsed_birth_nanos();
 
     // 句柄、线程与槽位校验全在 Native 侧：旧绑定的帧在入口丢弃，不进入收件箱
     let engine = get_global().streaming_engine.load();
     let Some(engine) = engine.as_ref() else {
-        return Ok(pack_reply(ControlStatus::ActorDead, 0, 0) as jlong);
+        return Ok(pack_status(ControlStatus::ActorDead));
     };
-    Ok(engine
-        .video()
-        .push_vram_slot(handle as u64, slot as u32, birth_nanos, sync_value as u64) as jlong)
+    Ok(pack_status(engine.video().push_vram_slot(
+        handle as u64,
+        slot as u32,
+        birth_nanos,
+        sync_value as u64,
+    )))
 }
 
 const _: jni::NativeMethod = native_method! {

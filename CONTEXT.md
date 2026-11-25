@@ -432,7 +432,7 @@ The geometry-bound game-side VRAM resources (`VramExportSet`): the dedicated VMA
 _Avoid_: Vram Pipeline, Slot pool, Export scope (as the whole set)
 
 **Native Wire Contract**:
-The Java-side single definition of the JNI data-plane protocol (`NativeWireContract`): the flat slot stride, the packed slot-state reply layout (in-flight mask, heartbeat, status) and the control-status vocabulary. The Rust counterparts live in `encode::hardware::slots`, `encode::pipeline` and `encode::control`; the project deliberately has no automatic cross-language gate or startup handshake, so both sides must be changed together.
+The Java-side single definition of the JNI data-plane protocol (`NativeWireContract`): the flat slot stride, the packed `vramSlotState` reply layout (in-flight mask, heartbeat, status), the status-only `pushVramSlot` reply and the control-status vocabulary. The Rust counterparts live in `encode::hardware::slots`, `encode::pipeline` and `encode::control`; the project deliberately has no automatic cross-language gate or startup handshake, so both sides must be changed together.
 _Avoid_: ABI spec, Protocol model, Wire schema
 
 **External Handle**:

@@ -43,12 +43,17 @@ const STATUS_SHIFT: u32 = 56;
 /// packed 回复里心跳字段的偏移
 const HEARTBEAT_SHIFT: u32 = 8;
 
-/// 把槽位状态、在途掩码与心跳打成一个 `u64`：一次 JNI 穿越同时回答三件事。
+/// 状态码 + 1：JNI 包装在 panic 时返回 0，0 必须落在未知/故障一侧。
+pub(crate) fn pack_status(status: ControlStatus) -> i32 {
+    status.code() + 1
+}
+
+/// 把槽位状态、在途掩码与心跳打成一个 `u64`（`vramSlotState` 快照专用）。
 ///
 /// 状态存 `code + 1`：JNI 包装在 panic 时返回 0，若 `Ok` 编码为 0，一次异常会被
 /// Java 读成「成功且全忙」，槽位永在途。0 必须落在未知/故障一侧。
 pub(crate) fn pack_reply(status: ControlStatus, in_flight: u64, heartbeat: u64) -> u64 {
-    (((status.code() as u64) + 1) << STATUS_SHIFT)
+    ((pack_status(status) as u64) << STATUS_SHIFT)
         | ((heartbeat & 0xFFFF_FFFF) << HEARTBEAT_SHIFT)
         | (in_flight & 0xFF)
 }
@@ -229,50 +234,38 @@ impl VideoPipeline {
     ///
     /// `handle` 是导入返回的绑定句柄，`slot` 是渲染线程从 `vram_slot_state` 快照里选中的
     /// 空闲槽位。句柄、线程、槽位任一不符都在入口拒绝，帧不进入收件箱。
+    ///
+    /// 只回答「帧收没收到」；掩码与心跳只在 `vram_slot_state` 快照里返回。
     pub(crate) fn push_vram_slot(
         &self,
         handle: u64,
         slot: u32,
         birth_nanos: u64,
         sync_value: u64,
-    ) -> u64 {
-        let reply = self.bindings.with_current(handle, |binding| {
-            if binding.owner() != std::thread::current().id() {
-                return (
-                    ControlStatus::WrongThread,
-                    binding.in_flight(),
-                    binding.heartbeat(),
-                );
-            }
-            if binding.is_poisoned() {
-                return (
-                    ControlStatus::Poisoned,
-                    binding.in_flight(),
-                    binding.heartbeat(),
-                );
-            }
-            // 先置位再入箱：编码极快时 ack 不能清掉尚未置的位
-            let Some(owned) = binding.try_acquire(slot) else {
-                return (
-                    ControlStatus::SlotNotFree,
-                    binding.in_flight(),
-                    binding.heartbeat(),
-                );
-            };
-            self.inbox.push(VideoFrame {
-                birth_nanos,
-                payload: FramePayload::VramSlot {
-                    slot: owned,
-                    sync_value,
-                },
-            });
-            (ControlStatus::Ok, binding.in_flight(), binding.heartbeat())
-        });
-        match reply {
-            Some((status, in_flight, heartbeat)) => pack_reply(status, in_flight, heartbeat),
+    ) -> ControlStatus {
+        self.bindings
+            .with_current(handle, |binding| {
+                if binding.owner() != std::thread::current().id() {
+                    return ControlStatus::WrongThread;
+                }
+                if binding.is_poisoned() {
+                    return ControlStatus::Poisoned;
+                }
+                // 先置位再入箱：编码极快时 ack 不能清掉尚未置的位
+                let Some(owned) = binding.try_acquire(slot) else {
+                    return ControlStatus::SlotNotFree;
+                };
+                self.inbox.push(VideoFrame {
+                    birth_nanos,
+                    payload: FramePayload::VramSlot {
+                        slot: owned,
+                        sync_value,
+                    },
+                });
+                ControlStatus::Ok
+            })
             // 旧绑定：收件箱里没有新帧，也没有任何槽位被置位
-            None => pack_reply(ControlStatus::StaleBinding, 0, 0),
-        }
+            .unwrap_or(ControlStatus::StaleBinding)
     }
 
     /// 当前在途掩码与心跳快照：游戏侧每 tick 调用一次，同时刷新停滞判定基准
@@ -395,8 +388,8 @@ mod tests {
 
         let reply = pipeline.push_vram_slot(stale, 1, 0, 7);
         assert_eq!(
-            ((reply >> 56) as i32) - 1,
-            ControlStatus::StaleBinding.code(),
+            reply,
+            ControlStatus::StaleBinding,
             "旧句柄必须回 StaleBinding"
         );
         assert_eq!(binding.in_flight(), 0, "旧句柄不得触碰槽位");
@@ -416,11 +409,7 @@ mod tests {
         pipeline.bindings().install(Arc::clone(&binding), || {});
 
         let reply = pipeline.push_vram_slot(binding.handle(), 2, 0, 9);
-        assert_eq!(
-            ((reply >> 56) as i32) - 1,
-            ControlStatus::Ok.code(),
-            "当前句柄必须受理"
-        );
+        assert_eq!(reply, ControlStatus::Ok, "当前句柄必须受理");
         assert!(binding.is_in_flight(2), "push 必须置位在途");
         assert_eq!(binding.in_flight(), 1 << 2);
 
@@ -446,11 +435,7 @@ mod tests {
         assert!(binding.is_poisoned());
 
         let reply = pipeline.push_vram_slot(binding.handle(), 1, 0, 7);
-        assert_eq!(
-            ((reply >> 56) as i32) - 1,
-            ControlStatus::Poisoned.code(),
-            "毒化后推送必须回 Poisoned"
-        );
+        assert_eq!(reply, ControlStatus::Poisoned, "毒化后推送必须回 Poisoned");
         assert_eq!(binding.in_flight(), 1, "被拒推送不得置位新槽位");
         assert!(inbox.take().is_none(), "毒化后的帧不得进入收件箱");
 

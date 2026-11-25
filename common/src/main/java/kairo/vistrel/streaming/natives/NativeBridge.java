@@ -292,9 +292,9 @@ public class NativeBridge {
      * @param handle    导入时取得的绑定句柄
      * @param slot      渲染线程从 {@link #vramSlotState(long)} 快照里选中的空闲槽位
      * @param syncValue 时间线信号量信号值 (Vulkan) 或 0L (OpenGL / 其它无时间线信号量后端)
-     * @return packed 回复；位布局见 {@link NativeWireContract}
+     * @return {@code 状态码 + 1}；0 是 JNI 异常的默认值，表示未知/故障
      */
-    public static native long pushVramSlot(long handle, int slot, long syncValue);
+    public static native int pushVramSlot(long handle, int slot, long syncValue);
 
     /**
      * 拉取槽位状态快照：在途掩码 + 编码线程心跳，每采集 tick 一次
