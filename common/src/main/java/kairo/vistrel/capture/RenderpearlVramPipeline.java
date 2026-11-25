@@ -39,7 +39,7 @@ import java.util.Optional;
  * Minecraft 26.2+ 显存直通管线（vulkan_backend 门，驱动扩展支持运行期另判）。
  *
  * <p>资源分两层：{@link VramExportSet} 只随几何变化；{@link VramBinding} 只对导入时的
- * 绑定轮次有效。控制面新代次时 {@link #rebind} 先把旧绑定从 Native 注销：获得确认
+ * 绑定句柄有效。控制面新代次时 {@link #rebind} 先把旧绑定从 Native 注销：获得确认
  * 就复用导出集重新导入，未获确认则弃置整个导出集并新建，避免编码器仍持有跨 API 导入时
  * 销毁游戏侧资源。
  *
@@ -258,7 +258,7 @@ public class RenderpearlVramPipeline implements FrameSource {
         Constants.LOG.error(
                 "显存直通停滞：{}s 内编码线程心跳冻结（最后阶段：{}），判定编码线程死亡，停推显存帧并触发引擎自愈",
                 VramBinding.STALL_HEARTBEAT_TIMEOUT_NS / 1_000_000_000L,
-                vramBinding.stageName()
+                vramBinding.stallDiagnostics()
         );
         try {
             onEncoderStall.run();
@@ -329,33 +329,30 @@ public class RenderpearlVramPipeline implements FrameSource {
             return CaptureOutcome.Failed;
         }
 
-        int claimed = -1;
         try {
-            // 停滞判定每个 tick 都执行（含全忙丢帧）：卡死后 push 会停，判定不能跟着停
             long nowNanos = System.nanoTime();
+            int preferredIdx = (int) (globalFrameIndex % VramExportSet.SLOT_COUNT);
+            // 每次 tick 拉一次权威快照（含全忙丢帧）：选槽与心跳共用同一次 JNI 往返
+            int slotIdx = binding.acquire(preferredIdx, nowNanos);
+            // 停滞判定每个 tick 都执行（含全忙丢帧）：卡死后 push 会停，判定不能跟着停
             if (binding.heartbeatTimedOut(nowNanos)) {
                 CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
                 onHeartbeatTimeout();
                 return CaptureOutcome.Dropped;
             }
-            int preferredIdx = (int) (globalFrameIndex % VramExportSet.SLOT_COUNT);
-            VramExportSet.VulkanSlot preferred = exportSet.slot(preferredIdx);
-            if (preferred == null || preferred.blitTextureView == null) {
-                CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
-                return CaptureOutcome.Failed;
-            }
-            // 槽位所有权：读到 0 即占位为 1，绝不覆写编码器可能仍在读取的显存。
-            // 全忙是**主动**丢帧：管线健康，只是编码器暂时没消费完。必须与 Failed
-            // 区分——调度器若把它当故障，一次槽位压力就会永久降级到 RAM 回读
-            int slotIdx = binding.claim(preferredIdx);
+            // 全忙是**主动**丢帧：管线健康，只是编码器暂时没消费完。必须与 Failed 区分——
+            // 调度器若把它当故障，一次槽位压力就会永久降级到 RAM 回读
             if (slotIdx < 0) {
                 CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
                 pressureGate.accumulate(1L);
                 reportSlotPressure();
                 return CaptureOutcome.Dropped;
             }
-            claimed = slotIdx;
             VramExportSet.VulkanSlot slot = exportSet.slot(slotIdx);
+            if (slot == null || slot.blitTextureView == null) {
+                CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
+                return CaptureOutcome.Failed;
+            }
             CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
             // 1. 等比 Blit 缩放绘制到槽位专属导出颜色附件（行序契约见 FlipBlit 类文档）
             long stageStart = CaptureProfiler.begin();
@@ -426,25 +423,17 @@ public class RenderpearlVramPipeline implements FrameSource {
             encoder.submit();
             CaptureProfiler.end(CaptureProfiler.Stage.VRAM_SUBMIT, stageStart);
             stageStart = CaptureProfiler.begin();
+            boolean queued;
             try {
-                binding.push(slotIdx, signalVal);
-            } catch (Throwable pushError) {
+                queued = binding.push(slotIdx, signalVal);
+            } finally {
                 // submit 已在途，信号量必被信号到 signalVal：帧计数照常推进
                 globalFrameIndex++;
-                throw pushError;
-            } finally {
                 CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PUSH, stageStart);
             }
-            // 认领位随帧移交给编码器：编码出口（成功/失败）归还。此处记录心跳基准，
-            // 时刻用本帧开头那个，误差只是 blit+submit 的耗时（~0.1ms）
-            binding.markPushed(nowNanos);
-            globalFrameIndex++;
-            return CaptureOutcome.Delivered;
+            // Native 未受理（旧绑定）：帧已被入口丢弃，按主动丢帧处理
+            return queued ? CaptureOutcome.Delivered : CaptureOutcome.Dropped;
         } catch (Throwable t) {
-            // push 之前的任何异常路径归还认领位：帧没交出去，编码器不会来读
-            if (claimed >= 0) {
-                binding.release(claimed);
-            }
             Constants.LOG.error("RenderpearlVramPipeline.capture 异常: {}", t.getMessage());
             return CaptureOutcome.Failed;
         }

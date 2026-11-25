@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -22,7 +23,8 @@ use crate::encode::encoder::EncodeBackendKind;
 use crate::encode::frame::{
     FrameInbox, FrameOutbox, FrameOutcome, FramePayload, Mailbox, VideoFrame,
 };
-use crate::encode::hardware::slots::SlotStateBlock;
+use crate::encode::hardware::VramSlotDescriptor;
+use crate::encode::hardware::slots::{ActorProgress, VramBindings};
 use crate::encode::pool::FramePool;
 use crate::encode::{
     StreamingProfile, TierRequest, VideoCodec, bootstrap_hardware_caps,
@@ -35,6 +37,21 @@ const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 等待期间的轮询间隔：关停路径一次性的开销，10ms 足够且几乎不占 CPU
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// packed 回复里状态字节的偏移：高 8 位存 `code + 1`，0 留给 JNI 异常默认值
+const STATUS_SHIFT: u32 = 56;
+/// packed 回复里心跳字段的偏移
+const HEARTBEAT_SHIFT: u32 = 8;
+
+/// 把槽位状态、在途掩码与心跳打成一个 `u64`：一次 JNI 穿越同时回答三件事。
+///
+/// 状态存 `code + 1`：JNI 包装在 panic 时返回 0，若 `Ok` 编码为 0，一次异常会被
+/// Java 读成「成功且全忙」，槽位永在途。0 必须落在未知/故障一侧。
+pub(crate) fn pack_reply(status: ControlStatus, in_flight: u64, heartbeat: u64) -> u64 {
+    (((status.code() as u64) + 1) << STATUS_SHIFT)
+        | ((heartbeat & 0xFFFF_FFFF) << HEARTBEAT_SHIFT)
+        | (in_flight & 0xFF)
+}
 
 /// 编码管线组合根：一条编码段的全部协作组件与它们的唯一持有者
 ///
@@ -51,8 +68,8 @@ pub struct VideoPipeline {
     /// 帧块由当前后端在自己的设备上分配、经编码线程 `attach` 装进池；换代就在池内换批，
     /// 逐帧路径看不到「后端换了」——取不到块就丢帧，不会拿到别的设备的内存。
     pool: Arc<FramePool>,
-    /// 槽位所有权共享块（泄漏分配与跨代隔离的设计理由见 `SlotStateBlock` 文档）
-    slot_state: &'static SlotStateBlock,
+    /// 当前显存绑定注册表：同一时刻至多一个绑定，Java 只持有句柄
+    bindings: Arc<VramBindings>,
     /// 发件箱（唯一活跃会话从它取件）：没有会话时帧照编照丢
     output: Arc<FrameOutbox>,
     /// 编码线程句柄，只在关停时取用一次
@@ -60,9 +77,10 @@ pub struct VideoPipeline {
 }
 
 impl VideoPipeline {
-    /// 槽位所有权共享块（游戏侧经当前活跃管线取得）
-    pub(crate) fn slot_state(&self) -> &'static SlotStateBlock {
-        self.slot_state
+    /// 当前显存绑定注册表
+    #[cfg(test)]
+    pub(crate) fn bindings(&self) -> &Arc<VramBindings> {
+        &self.bindings
     }
 
     /// 发件箱：会话的写循环从这里取最新帧
@@ -77,13 +95,13 @@ impl VideoPipeline {
 
     /// 导入本次采集的显存槽位表（ask，阻塞式）
     ///
-    /// `binding_epoch` 是调用方持有的显存绑定令牌；与当前绑定轮次不符即整批拒绝
+    /// `owner` 是 JNI 入口捕获的渲染线程：随命令带入 Actor，供 push 校验线程归属。
     pub(crate) fn import_vram_slots(
         &self,
-        binding_epoch: u64,
-        slots: Vec<crate::encode::hardware::VramSlotDescriptor>,
-    ) -> Result<(), ControlStatus> {
-        self.control.import_vram_slots(binding_epoch, slots)
+        owner: ThreadId,
+        slots: Vec<VramSlotDescriptor>,
+    ) -> Result<u64, ControlStatus> {
+        self.control.import_vram_slots(owner, slots)
     }
 
     /// 会话建立前把编码器按定档请求与协商定死的 codec 就绪（ask），`Ok` 携带
@@ -100,8 +118,8 @@ impl VideoPipeline {
     }
 
     /// 释放显存槽位表（ask，阻塞式）
-    pub(crate) fn clear_vram_slots(&self, binding_epoch: u64) -> Result<(), ControlStatus> {
-        self.control.clear_vram_slots(binding_epoch)
+    pub(crate) fn clear_vram_slots(&self, handle: u64) -> Result<(), ControlStatus> {
+        self.control.clear_vram_slots(handle)
     }
 
     /// 构造全部 seam 并拉起编码线程
@@ -124,17 +142,24 @@ impl VideoPipeline {
         // 这样第一帧到达时池里已有可用块
         let pool = FramePool::new();
         let actor_pool = Arc::downgrade(&pool);
-        // 槽位所有权块与引擎同代泄漏分配（为什么必须泄漏见 `SlotStateBlock` 文档）
-        let slot_state = SlotStateBlock::new_leaked();
-        let actor_slot_state = slot_state;
+        // 进度与绑定注册表随引擎持有；旧 Actor 拿旧 Arc，写不到后继引擎
+        let progress = Arc::new(ActorProgress::new());
+        let bindings = VramBindings::new();
+        let actor_progress = Arc::clone(&progress);
+        let actor_bindings = Arc::clone(&bindings);
 
         let handle = std::thread::Builder::new()
             .name("vistrel-encoder-actor".to_string())
             .spawn(move || {
                 // `extern "system"` 不允许 unwind 穿过互操作边界，编码线程必须自己兜住 panic
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let actor =
-                        EncoderActor::new(actor_inbox, actor_output, actor_pool, actor_slot_state);
+                    let actor = EncoderActor::new(
+                        actor_inbox,
+                        actor_output,
+                        actor_pool,
+                        actor_progress,
+                        actor_bindings,
+                    );
                     actor.run(control_rx, actor_doorbell);
                 }));
                 if outcome.is_err() {
@@ -153,7 +178,7 @@ impl VideoPipeline {
             inbox,
             control: ControlSender::new(control_tx, Arc::clone(&doorbell)),
             pool,
-            slot_state,
+            bindings,
             output,
             actor_handle: Mutex::new(Some(handle)),
         })
@@ -169,7 +194,7 @@ impl VideoPipeline {
             inbox: Arc::clone(&inbox),
             control,
             pool: FramePool::new(),
-            slot_state: SlotStateBlock::new_leaked(),
+            bindings: VramBindings::new(),
             output: Arc::new(Mailbox::new(inbox.outcomes_arc())),
             actor_handle: Mutex::new(None),
         }
@@ -202,36 +227,70 @@ impl VideoPipeline {
 
     /// 投递一帧显存直通画面（槽位需先经 [`ControlSender::import_vram_slots`] 导入）
     ///
-    /// 旧绑定轮次的帧直接丢弃：槽位表已随编码器重建失效，继续投递只会让
-    /// 编码线程去查一张不存在的表。检查是共享块上的原子读，不做 JNI 往返
-    pub fn push_vram_slot(
+    /// `handle` 是导入返回的绑定句柄，`slot` 是渲染线程从 `vram_slot_state` 快照里选中的
+    /// 空闲槽位。句柄、线程、槽位任一不符都在入口拒绝，帧不进入收件箱。
+    pub(crate) fn push_vram_slot(
         &self,
-        binding_epoch: u64,
+        handle: u64,
+        slot: u32,
         birth_nanos: u64,
-        slot_idx: u32,
         sync_value: u64,
-    ) {
-        if binding_epoch != self.slot_state.binding_epoch() {
-            // 帧没进编码器：渲染线程已占用的所有权位必须归还，否则槽位会永久泄漏，
-            // 三轮之后 claim 全忙，显存直通被误判为持续丢帧
-            self.slot_state.mark_free(slot_idx);
-            return;
-        }
-        self.inbox.push(VideoFrame {
-            birth_nanos,
-            payload: FramePayload::VramSlot {
-                slot_idx,
-                sync_value,
-            },
+    ) -> u64 {
+        let reply = self.bindings.with_current(handle, |binding| {
+            if binding.owner() != std::thread::current().id() {
+                return (
+                    ControlStatus::WrongThread,
+                    binding.in_flight(),
+                    binding.heartbeat(),
+                );
+            }
+            // 先置位再入箱：编码极快时 ack 不能清掉尚未置的位
+            let Some(owned) = binding.try_acquire(slot) else {
+                return (
+                    ControlStatus::SlotNotFree,
+                    binding.in_flight(),
+                    binding.heartbeat(),
+                );
+            };
+            self.inbox.push(VideoFrame {
+                birth_nanos,
+                payload: FramePayload::VramSlot {
+                    slot: owned,
+                    sync_value,
+                },
+            });
+            (ControlStatus::Ok, binding.in_flight(), binding.heartbeat())
         });
+        match reply {
+            Some((status, in_flight, heartbeat)) => pack_reply(status, in_flight, heartbeat),
+            // 旧绑定：收件箱里没有新帧，也没有任何槽位被置位
+            None => pack_reply(ControlStatus::StaleBinding, 0, 0),
+        }
+    }
+
+    /// 当前在途掩码与心跳快照：游戏侧每 tick 调用一次，同时刷新停滞判定基准
+    pub(crate) fn vram_slot_state(&self, handle: u64) -> u64 {
+        match self
+            .bindings
+            .with_current(handle, |binding| (binding.in_flight(), binding.heartbeat()))
+        {
+            Some((in_flight, heartbeat)) => pack_reply(ControlStatus::Ok, in_flight, heartbeat),
+            None => pack_reply(ControlStatus::StaleBinding, 0, 0),
+        }
+    }
+
+    /// 绑定时编码 Actor 所在的阶段码（诊断冷路径）
+    pub(crate) fn stall_stage(&self, handle: u64) -> Option<u64> {
+        self.bindings
+            .with_current(handle, |binding| binding.stage())
     }
 
     /// 关停编码线程：投递 Shutdown 后**有界**等待
     ///
     /// 代价：超时返回后**不再保证 Actor 已退出**，调用方不得再假定显存槽位等资源已释放。
     /// 进程退出与编码停滞自愈重启都会走到本路径；被弃置的线程携带自己的编码上下文
-    /// 与槽位引用继续存活，槽位状态块的代际隔离（块随引擎实例创建）使其干扰不到
-    /// 后继引擎，泄漏资源随进程退出回收。
+    /// 与绑定引用继续存活，进度与绑定注册表按引擎隔离（新引擎是新的 `Arc`），
+    /// 其干扰不到后继引擎，泄漏资源随进程退出回收。
     pub fn shutdown(&self) {
         // 只投递不等回复：受理与否只说明命令是否入队，退出与否由下面的有界等待回答
         if !self.control.shutdown() {
@@ -261,6 +320,7 @@ impl VideoPipeline {
 mod tests {
     use super::*;
     use crate::encode::frame::FrameInbox;
+    use crate::encode::hardware::slots::VramBinding;
     use crate::encode::nv12_len;
     use crate::encode::pool::{HOST_SLOT_BYTES, HostBlock};
     use tokio::sync::Notify;
@@ -306,24 +366,53 @@ mod tests {
         );
     }
 
-    /// 旧轮次推送被丢弃时必须归还渲染线程已占用的所有权位，否则槽位永久泄漏
+    /// 旧句柄的推送必须被拒绝，且不触碰任何槽位
     #[test]
-    fn test_stale_vram_push_releases_claimed_slot() {
+    fn test_stale_vram_push_is_rejected_without_touching_slots() {
         let doorbell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(Arc::clone(&doorbell)));
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let pipeline =
             VideoPipeline::assemble(ControlSender::new(tx, doorbell), Arc::clone(&inbox));
 
-        pipeline.slot_state().set_busy(1);
-        let stale = pipeline.slot_state().binding_epoch() + 1;
-        pipeline.push_vram_slot(stale, 0, 1, 7);
+        let binding = VramBinding::new_for_test(3);
+        pipeline.bindings().install(Arc::clone(&binding), || {});
+        let stale = binding.handle() + 1_000;
 
-        assert!(
-            !pipeline.slot_state().is_busy(1),
-            "丢弃的帧没有编码器消费，所有权位必须立即归还"
+        let reply = pipeline.push_vram_slot(stale, 1, 0, 7);
+        assert_eq!(
+            ((reply >> 56) as i32) - 1,
+            ControlStatus::StaleBinding.code(),
+            "旧句柄必须回 StaleBinding"
         );
-        assert!(inbox.take().is_none(), "旧轮次帧不得进入收件箱");
+        assert_eq!(binding.in_flight(), 0, "旧句柄不得触碰槽位");
+        assert!(inbox.take().is_none(), "旧句柄的帧不得进入收件箱");
+    }
+
+    /// 当前句柄推送后槽位置位；载荷析构归还
+    #[test]
+    fn test_vram_push_marks_slot_and_drop_acks() {
+        let doorbell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&doorbell)));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let pipeline =
+            VideoPipeline::assemble(ControlSender::new(tx, doorbell), Arc::clone(&inbox));
+
+        let binding = VramBinding::new_for_test(3);
+        pipeline.bindings().install(Arc::clone(&binding), || {});
+
+        let reply = pipeline.push_vram_slot(binding.handle(), 2, 0, 9);
+        assert_eq!(
+            ((reply >> 56) as i32) - 1,
+            ControlStatus::Ok.code(),
+            "当前句柄必须受理"
+        );
+        assert!(binding.is_in_flight(2), "push 必须置位在途");
+        assert_eq!(binding.in_flight(), 1 << 2);
+
+        let frame = inbox.take().expect("帧必须入箱");
+        drop(frame);
+        assert!(!binding.is_in_flight(2), "载荷析构必须归还槽位");
     }
 
     /// 取出收件箱里的主机帧（唯一一帧，取完即空）

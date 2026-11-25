@@ -19,7 +19,7 @@ use super::{BitstreamHandle, EncoderHandle, InputSpec, RegisteredResource};
 use crate::encode::encoder::BackendStageTimings;
 use crate::encode::hardware::nvenc::nvfn;
 use crate::encode::hardware::nvenc::session_params::build_pic_params;
-use crate::encode::hardware::slots::{ActorStage, SlotStateBlock};
+use crate::encode::hardware::slots::{ActorProgress, ActorStage};
 use crate::encode::{StreamingProfile, VideoCodec};
 
 // ============================================================================
@@ -522,7 +522,7 @@ impl NvencSession {
         spec: InputSpec,
         force_idr: bool,
         frame_idx: u64,
-        stage: &SlotStateBlock,
+        stage: &ActorProgress,
     ) -> Result<(Vec<u8>, bool), String> {
         // 1. 映射。此处的 `?` 是安全的：映射尚未成功，没有需要归还的东西。
         stage.set_stage(ActorStage::MapInput);
@@ -585,7 +585,7 @@ impl NvencSession {
         block: *const u8,
         force_idr: bool,
         frame_idx: u64,
-        stage: &SlotStateBlock,
+        stage: &ActorProgress,
     ) -> Result<(Vec<u8>, bool), String> {
         let registered = self.device_input(block)?;
         let spec = InputSpec {
@@ -676,7 +676,7 @@ pub(super) fn encode_and_lock(
     handle: BitstreamHandle,
     pic_params: &mut NV_ENC_PIC_PARAMS,
     mapped: Option<*mut c_void>,
-    stage: &SlotStateBlock,
+    stage: &ActorProgress,
     #[cfg(test)] stages: &mut BackendStageTimings,
 ) -> Result<(Vec<u8>, bool), String> {
     let encode_picture = nvfn!(driver, nvEncEncodePicture);

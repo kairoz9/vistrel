@@ -10,6 +10,7 @@ use crate::encode::hardware::slots::VramSlotDescriptor;
 use crate::encode::{StreamingProfile, TierRequest, VideoCodec};
 use std::sync::Arc;
 use std::sync::mpsc::{RecvTimeoutError, SyncSender};
+use std::thread::ThreadId;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Sender;
@@ -51,8 +52,12 @@ pub(crate) enum ControlStatus {
     /// 硬编建成失败：探测认证过的候选后端全部建不起来。与 `NoHardwareEncoder`
     /// 的区别是后者表示「本机探测不到硬编」，本码表示「探测说有，实际建不出来」
     EncoderBuildFailed = 9,
-    /// 显存绑定轮次已前移：调用方持有的槽位导入令牌属于旧绑定，整批拒绝
+    /// 显存绑定句柄已失效：句柄不属于当前引擎，或绑定已被换档/注销摘除
     StaleBinding = 10,
+    /// 槽位已在途或索引未导入：重复推送同一槽位是协议违例
+    SlotNotFree = 11,
+    /// 推送线程不是导入时的渲染线程：绑定的线程约束被破坏
+    WrongThread = 12,
 }
 
 /// 控制命令
@@ -84,15 +89,16 @@ pub(crate) enum ControlCommand {
             Result<(StreamingProfile, VideoCodec, EncodeBackendKind), ControlStatus>,
         >,
     },
-    /// 导入显存直通槽位
+    /// 导入显存直通槽位；成功回送绑定句柄
     ImportVramSlots {
-        binding_epoch: u64,
+        /// JNI 入口捕获的渲染线程：随命令带入 Actor，供 push 校验线程归属
+        owner: ThreadId,
         slots: Vec<VramSlotDescriptor>,
-        reply: SyncSender<ControlStatus>,
+        reply: SyncSender<Result<u64, ControlStatus>>,
     },
     /// 释放槽位表但保持编码器存活
     ClearVramSlots {
-        binding_epoch: u64,
+        handle: u64,
         reply: SyncSender<ControlStatus>,
     },
 }
@@ -199,27 +205,26 @@ impl ControlSender {
     /// `std::sync::mpsc`（`oneshot::blocking_recv` 没有超时版本）。
     /// 投递同样非阻塞：队列满说明 Actor 已卡住不消费，此刻阻塞投递会连渲染线程
     /// 一起拖死，直接回 [`ControlStatus::QueueFull`] 让调用方走各自的降级分支。
+    ///
+    /// 成功返回绑定句柄：句柄是后续 push / poll / clear 的唯一准入凭证。
     pub(crate) fn import_vram_slots(
         &self,
-        binding_epoch: u64,
+        owner: ThreadId,
         slots: Vec<VramSlotDescriptor>,
-    ) -> Result<(), ControlStatus> {
+    ) -> Result<u64, ControlStatus> {
         self.ask_blocking(|reply| ControlCommand::ImportVramSlots {
-            binding_epoch,
+            owner,
             slots,
             reply,
-        })
+        })?
     }
 
     /// 释放槽位表但保持硬件编码器存活（ask）
     ///
     /// 次序是「先尝试排空设备队列、再丢弃导入」：最后一帧的跨 API 回执还在队列上，先丢弃导入
     /// 会让它写到已弃掉的信号量上。排空失败只记日志、不进结果码——`Ok` 只表示槽位已释放。
-    pub(crate) fn clear_vram_slots(&self, binding_epoch: u64) -> Result<(), ControlStatus> {
-        self.ask_blocking(|reply| ControlCommand::ClearVramSlots {
-            binding_epoch,
-            reply,
-        })
+    pub(crate) fn clear_vram_slots(&self, handle: u64) -> Result<(), ControlStatus> {
+        self.ask_status_blocking(|reply| ControlCommand::ClearVramSlots { handle, reply })
     }
 
     /// 非阻塞入队并唤醒 Actor
@@ -236,18 +241,26 @@ impl ControlSender {
         }
     }
 
-    /// 同步往返：投递一条带码应答的 ask 命令并等待 ACK
-    fn ask_blocking(
+    /// 同步往返：投递一条带应答的 ask 命令并等待 ACK
+    fn ask_blocking<T>(
         &self,
-        build: impl FnOnce(SyncSender<ControlStatus>) -> ControlCommand,
-    ) -> Result<(), ControlStatus> {
+        build: impl FnOnce(SyncSender<T>) -> ControlCommand,
+    ) -> Result<T, ControlStatus> {
         let (reply, wait) = std::sync::mpsc::sync_channel(1);
         self.send(build(reply)).map_err(Self::send_error)?;
         match wait.recv_timeout(self.ack_timeout) {
-            Ok(code) => code.into_result(),
+            Ok(value) => Ok(value),
             Err(RecvTimeoutError::Disconnected) => Err(ControlStatus::ActorDead),
             Err(RecvTimeoutError::Timeout) => Err(ControlStatus::AckTimeout),
         }
+    }
+
+    /// 只关心成败的 ask：把应答码折叠成 `Result<(), ControlStatus>`
+    fn ask_status_blocking(
+        &self,
+        build: impl FnOnce(SyncSender<ControlStatus>) -> ControlCommand,
+    ) -> Result<(), ControlStatus> {
+        self.ask_blocking(build)?.into_result()
     }
 }
 
@@ -306,7 +319,7 @@ mod tests {
                         reply.send(Ok((default, VideoCodec::H264, EncodeBackendKind::Software)));
                 }
                 ControlCommand::ImportVramSlots { reply, .. } => {
-                    let _ = reply.send(ControlStatus::Ok);
+                    let _ = reply.send(Ok(0));
                 }
                 ControlCommand::ClearVramSlots { reply, .. } => {
                     let _ = reply.send(ControlStatus::Ok);

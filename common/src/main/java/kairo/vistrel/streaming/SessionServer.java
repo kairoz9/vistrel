@@ -83,7 +83,7 @@ public interface SessionServer {
      *
      * <p>每次 offer 落账新建；{@link SessionState#withPhase} / {@link SessionState#withTier}
      * 原样携带。故意不覆写 {@code equals} / {@code hashCode}：backend/codec 相同也是不同代次，
-     * 在途 ask 与采集侧按引用区分。Native 绑定是否失效由共享块 {@code bindingEpoch} 回答。
+     * 在途 ask 与采集侧按引用区分。Native 绑定是否失效由导入返回的绑定句柄回答。
      */
     final class EncoderGeneration {
         private final String backend;
@@ -137,7 +137,7 @@ public interface SessionServer {
      * <p>编码器代次只在协商落账时写入，此后只经 {@link #withPhase} / {@link #withTier}
      * 原样携带。消费者在动作点经 {@code ProfileCoordinator#current()} 读当下状态。
      *
-     * <p>显存绑定的失效由 Native 共享块 {@code bindingEpoch} 决定，不看本对象；
+     * <p>显存绑定的失效由 Native 返回的绑定句柄决定，不看本对象；
      * 几何由 {@link Tier} 承载，fps/bpp 变化不重建显存绑定。
      *
      * @param generation 编码器代次（backend + codec）

@@ -265,47 +265,52 @@ public class NativeBridge {
      * 只在 {@link NativeWireContract} 定义一次，与 Native 侧
      * {@code encode::hardware::slots::FLAT_STRIDE} 是同一条约定的两端。
      *
-     * @param bindingEpoch 显存绑定轮次（共享块中的当前值）
      * @param slots 扁平 long[]：逐槽位依序排列的 7 元组，字段序见
      *              {@link NativeWireContract}
-     * @return 统一信封；成功时 {@code data} 是 {@link kairo.vistrel.streaming.ControlStatus}
-     *         判别值：0 为成功，非零为失败原因（协议错位 / 无硬编 / 导入失败 / 管线已死 /
-     *         ACK 超时 / 绑定轮次过期）
+     * @return 统一信封；成功时 {@code data} 是
+     *         {@code {"code":0,"handle":<绑定句柄>}}；失败时 {@code code} 为非零结果码
      */
-    public static native String importVramSlots(long bindingEpoch, long[] slots);
+    public static native String importVramSlots(long[] slots);
 
     /**
      * 安全注销并释放 Native 引擎内部缓存的所有外部显存槽位与同步原语
      *
-     * @param bindingEpoch 显存绑定轮次；旧轮次的注销按空操作成功（导入已随实例销毁）
+     * @param handle 导入时取得的绑定句柄；旧句柄的注销按空操作成功（导入已随实例销毁）
      * @return 统一信封；成功时 {@code data} 是 {@link kairo.vistrel.streaming.ControlStatus}
      *         判别值，仅 0 表示原生侧已确认注销完毕；未确认时调用方不得销毁导出资源——
      *         后果与处置在 {@link kairo.vistrel.streaming.VramBinding#close()} 与
      *         {@link kairo.vistrel.streaming.VramBinding.ReleaseStatus} 定义一次
      */
-    public static native String clearVramSlots(long bindingEpoch);
+    public static native String clearVramSlots(long handle);
 
     /**
      * 向 Native 引擎直通投递显存槽位（单向投递，不等待编码结果）
      *
      * <p>
-     * {@code slotIdx} 为显存槽位索引 (0 合法)。绑定轮次不匹配的帧在入口直接丢弃，
-     * 检查是共享块上的原子读，不做 JNI 往返。
+     * 旧绑定的帧在入口直接丢弃；槽位未取用、重复投递或线程不符返回协议错误。
      *
-     * @param bindingEpoch 显存绑定轮次
-     * @param slotIdx      已注册的显存槽位索引
-     * @param syncValue    时间线信号量信号值 (Vulkan) 或 0L (OpenGL / 其它无时间线信号量后端)
+     * @param handle    导入时取得的绑定句柄
+     * @param slot      渲染线程从 {@link #vramSlotState(long)} 快照里选中的空闲槽位
+     * @param syncValue 时间线信号量信号值 (Vulkan) 或 0L (OpenGL / 其它无时间线信号量后端)
+     * @return packed 回复；位布局见 {@link NativeWireContract}
      */
-    public static native void pushVramSlot(long bindingEpoch, int slotIdx, long syncValue);
+    public static native long pushVramSlot(long handle, int slot, long syncValue);
 
     /**
-     * 取当前活跃引擎的槽位所有权共享块；布局与轮次语义在
-     * {@link NativeWireContract} 定义一次（跨语言契约的 Java 端唯一定义处），
-     * 由 {@link kairo.vistrel.streaming.VramBinding} 包装消费
+     * 拉取槽位状态快照：在途掩码 + 编码线程心跳，每采集 tick 一次
      *
-     * @return 64 字节 DirectBuffer；引擎未运行时为 null
+     * @param handle 导入时取得的绑定句柄
+     * @return packed 回复；位布局见 {@link NativeWireContract}
      */
-    public static native ByteBuffer slotStateBlock();
+    public static native long vramSlotState(long handle);
+
+    /**
+     * 编码线程最后进入的阶段名（停滞日志用，冷路径）
+     *
+     * @param handle 导入时取得的绑定句柄
+     * @return 阶段中文名；句柄失效或引擎未运行时为 {@code 引擎未运行}
+     */
+    public static native String stallDiagnostics(long handle);
 
     /**
      * 向 Native 引擎投递系统内存帧 (PBO 读回 / 软编回退通道)

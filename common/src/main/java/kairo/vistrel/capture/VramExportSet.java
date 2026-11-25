@@ -50,7 +50,7 @@ import java.util.List;
 public final class VramExportSet {
     /**
      * 槽位环容量：采集侧的三重缓冲选择，不是线协议常量——Native 按实际导入的槽位数
-     * 工作，只要求不超过共享块 busy 位容量。Rust 侧同槽数的导出替身对齐此值。
+     * 工作，只要求不超过共享块槽位容量。Rust 侧同槽数的导出替身对齐此值。
      */
     static final int SLOT_COUNT = 3;
 
