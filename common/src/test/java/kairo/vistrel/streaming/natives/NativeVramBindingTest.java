@@ -6,8 +6,7 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 /**
- * 显存绑定 Java 侧的纯逻辑契约：packed 回复解析、选槽与心跳基准。
- * 不加载 Native 库，所有断言都只依赖线协议与服务端无关的本地状态。
+ * 显存绑定 Java 侧纯逻辑：packed 解析、选槽与心跳基准；不加载 Native 库。
  */
 class NativeVramBindingTest {
     private static final long TIMEOUT = VramBinding.STALL_HEARTBEAT_TIMEOUT_NS;
@@ -46,6 +45,15 @@ class NativeVramBindingTest {
     }
 
     @Test
+    void testPackedReplyLayoutGolden() {
+        Assertions.assertEquals(
+                0x0100001234567805L,
+                reply(ControlStatus.OK, 0b101L, 0x12345678L),
+                "Java 与 Rust 必须共用同一固定位布局"
+        );
+    }
+
+    @Test
     void testInFlightMaskKeepsOnlyLowBits() {
         long packed = reply(ControlStatus.OK, 0xFFL, 1L);
         Assertions.assertEquals(0xFFL, NativeVramBinding.inFlightOf(packed));
@@ -53,16 +61,18 @@ class NativeVramBindingTest {
 
     @Test
     void testPickSlotPrefersThenFallsBack() {
-        Assertions.assertEquals(1, NativeVramBinding.pickSlot(1, 0b011L, 3), "首选空闲必须直接取用");
-        Assertions.assertEquals(0, NativeVramBinding.pickSlot(2, 0b011L, 3), "首选忙时按索引序降级");
-        Assertions.assertEquals(2, NativeVramBinding.pickSlot(-1, 0b100L, 3), "非法首选退化为索引序");
-        Assertions.assertEquals(2, NativeVramBinding.pickSlot(9, 0b100L, 3), "越界首选同样退化");
-        Assertions.assertEquals(VramBinding.NO_FREE_SLOT, NativeVramBinding.pickSlot(0, 0L, 3), "全忙返回无空闲哨兵");
+        NativeVramBinding binding = new NativeVramBinding(1, 0b111L);
+        Assertions.assertEquals(1, binding.pickSlot(1, 0b011L), "首选空闲必须直接取用");
+        Assertions.assertEquals(0, binding.pickSlot(2, 0b011L), "首选忙时按索引序降级");
+        Assertions.assertEquals(2, binding.pickSlot(-1, 0b100L), "非法首选退化为索引序");
+        Assertions.assertEquals(2, binding.pickSlot(9, 0b100L), "越界首选同样退化");
+        Assertions.assertEquals(VramBinding.NO_FREE_SLOT, binding.pickSlot(0, 0L), "全忙返回无空闲哨兵");
     }
 
     @Test
-    void testPickSlotNeverEscapesSlotCount() {
-        Assertions.assertEquals(VramBinding.NO_FREE_SLOT, NativeVramBinding.pickSlot(5, 1L << 5, 3), "槽位数外的高位不得被选中");
+    void testPickSlotNeverEscapesImportedMask() {
+        NativeVramBinding binding = new NativeVramBinding(1, 0b111L);
+        Assertions.assertEquals(VramBinding.NO_FREE_SLOT, binding.pickSlot(5, 1L << 5), "导入掩码外的高位不得被选中");
     }
 
     @Test
@@ -72,7 +82,7 @@ class NativeVramBindingTest {
 
     @Test
     void testHeartbeatBaselineAdvancesOnlyOnProgress() {
-        NativeVramBinding binding = new NativeVramBinding(1, 3);
+        NativeVramBinding binding = new NativeVramBinding(1, 0b111L);
         long t0 = 1_000_000_000L;
         binding.observe(7, t0);
         Assertions.assertFalse(binding.heartbeatTimedOut(t0 + TIMEOUT - 1), "未达阈值不触发");
@@ -85,12 +95,20 @@ class NativeVramBindingTest {
     }
 
     @Test
-    void testConstructorRejectsInvalidHandleOrSlotCount() {
-        Assertions.assertThrows(IllegalArgumentException.class, () -> new NativeVramBinding(0, 3));
-        Assertions.assertThrows(IllegalArgumentException.class, () -> new NativeVramBinding(1, 0));
+    void testImportedMaskRejectsUnimportedSlotBits() {
+        NativeVramBinding binding = new NativeVramBinding(1, 0b101L);
+        Assertions.assertEquals(0, binding.pickSlot(-1, 0b101L));
+        Assertions.assertEquals(2, binding.pickSlot(-1, 0b100L));
+        Assertions.assertEquals(VramBinding.NO_FREE_SLOT, binding.pickSlot(1, 0b010L), "未导入的槽位不得被选中");
+    }
+
+    @Test
+    void testConstructorRejectsInvalidHandleOrMask() {
+        Assertions.assertThrows(IllegalArgumentException.class, () -> new NativeVramBinding(0, 0b111L));
+        Assertions.assertThrows(IllegalArgumentException.class, () -> new NativeVramBinding(1, 0L));
         Assertions.assertThrows(IllegalArgumentException.class, () -> new NativeVramBinding(
                 1,
-                NativeWireContract.MAX_VRAM_SLOTS + 1
+                1L << NativeWireContract.MAX_VRAM_SLOTS
         ));
     }
 }

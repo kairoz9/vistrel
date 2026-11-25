@@ -119,6 +119,10 @@ public final class NativeEncoderChannel implements EncoderChannel, InputEventSou
             throw new EncoderChannel.ControlException("显存槽位导入结果缺少句柄", ControlStatus.PIPELINE_DEAD);
         }
         long handle = data.get("handle").getAsLong();
-        return new NativeVramBinding(handle, slots.size());
+        long importedMask = 0L;
+        for (VramSlotDescriptor slot : slots) {
+            importedMask |= 1L << slot.slotIdx();
+        }
+        return new NativeVramBinding(handle, importedMask);
     }
 }

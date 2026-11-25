@@ -6,26 +6,23 @@ import kairo.vistrel.streaming.NativeResult;
 import kairo.vistrel.streaming.VramBinding;
 
 /**
- * 基于 JNI 的显存绑定：槽位表与在途状态全在 Native，本类只持一个不透明句柄。
+ * 基于 JNI 的显存绑定：槽位表、在途位与心跳全在 Native，本类只持句柄、导入掩码与心跳基准。
  *
  * <p>构造由 {@link NativeEncoderChannel#bindVram} 完成；本类不持有 Vulkan 纹理或导出池。
- * {@link #acquire(int, long)} 每次拉一次权威快照（在途掩码 + 心跳）；未投递的槽位在
- * Native 从未置位，因此不存在需要归还的本地账。
  */
 final class NativeVramBinding implements VramBinding {
     private static final long IN_FLIGHT_MASK = (1L << NativeWireContract.MASK_BITS) - 1;
+    private static final long MAX_SLOT_MASK = (1L << NativeWireContract.MAX_VRAM_SLOTS) - 1;
     /**
-     * 导入时取得的绑定句柄：推取/投递/注销都带上它，Native 据此拒绝旧绑定。
+     * 导入返回的绑定句柄；所有 JNI 调用携带它，Native 据此拒绝旧绑定。
      */
     private final long handle;
     /**
-     * 本绑定实际导入的槽位掩码。
+     * 本绑定实际导入的槽位掩码：只有这些索引可以取用。
      */
-    private final long slotMask;
-    private final int slotCount;
+    private final long importedMask;
     /**
-     * 关闭标志：close 可能在停机线程发生，acquire/push 在渲染线程读，volatile 保证可见。
-     * 注销结算本身由 close 的同步块保证幂等。
+     * close 可能在停机线程发生，acquire/push 在渲染线程读，volatile 保证可见。
      */
     private volatile boolean closed = false;
     private ReleaseStatus releaseStatus = null;
@@ -39,26 +36,26 @@ final class NativeVramBinding implements VramBinding {
     private long lastProgressNanos = System.nanoTime();
 
     /**
-     * @param handle    导入成功返回的绑定句柄，必须为正
-     * @param slotCount 本次导入的槽位数，1..{@link NativeWireContract#MAX_VRAM_SLOTS}
+     * @param handle       导入成功返回的绑定句柄，必须为正
+     * @param importedMask 本次实际导入的槽位掩码，非空且不超出协议容量
      */
-    NativeVramBinding(long handle, int slotCount) {
+    NativeVramBinding(long handle, long importedMask) {
         if (handle <= 0) {
             throw new IllegalArgumentException("显存绑定句柄非法: " + handle);
         }
-        if (slotCount <= 0 || slotCount > NativeWireContract.MAX_VRAM_SLOTS) {
-            throw new IllegalArgumentException("槽位数量越界: " + slotCount);
+        if (importedMask == 0L || (importedMask & ~MAX_SLOT_MASK) != 0L) {
+            throw new IllegalArgumentException("槽位掩码非法: " + importedMask);
         }
         this.handle = handle;
-        this.slotCount = slotCount;
-        this.slotMask = (1L << slotCount) - 1;
+        this.importedMask = importedMask;
     }
 
     @Override
-    public int acquire(int preferredIdx, long nowNanos) {
+    public int acquire(int preferredIdx) {
         if (closed) {
             throw new IllegalStateException("显存绑定已关闭，拒绝取槽");
         }
+        long nowNanos = System.nanoTime();
         long reply = NativeBridge.vramSlotState(handle);
         ControlStatus status = statusOf(reply);
         if (status == null) {
@@ -72,8 +69,8 @@ final class NativeVramBinding implements VramBinding {
             throw new ControlException("NativeBridge.vramSlotState 失败", status);
         }
         observe(heartbeatOf(reply), nowNanos);
-        long free = ~inFlightOf(reply) & slotMask;
-        return pickSlot(preferredIdx, free, slotCount);
+        long free = ~inFlightOf(reply) & importedMask;
+        return pickSlot(preferredIdx, free);
     }
 
     @Override
@@ -97,7 +94,14 @@ final class NativeVramBinding implements VramBinding {
     }
 
     @Override
-    public boolean heartbeatTimedOut(long nowNanos) {
+    public boolean heartbeatTimedOut() {
+        return heartbeatTimedOut(System.nanoTime());
+    }
+
+    /**
+     * 心跳超时的显式时刻入口，供测试注入时钟。
+     */
+    boolean heartbeatTimedOut(long nowNanos) {
         return !closed && nowNanos - lastProgressNanos >= STALL_HEARTBEAT_TIMEOUT_NS;
     }
 
@@ -136,9 +140,6 @@ final class NativeVramBinding implements VramBinding {
 
     /**
      * 心跳推进即刷新停滞基准；同一心跳重复观察不刷新。
-     *
-     * @param heartbeat 本 tick 快照里的心跳
-     * @param nowNanos  本帧开始时刻
      */
     void observe(long heartbeat, long nowNanos) {
         if (heartbeat != lastHeartbeat) {
@@ -148,10 +149,7 @@ final class NativeVramBinding implements VramBinding {
     }
 
     /**
-     * push 回复里的结果码：Native 回送 {@code code + 1}。
-     *
-     * @param raw Native 原始返回值
-     * @return 状态；0（JNI 异常默认值）返回 null，调用方必须按故障处理
+     * push 回包的结果码：0 是 JNI 异常默认值，返回 null。
      */
     static ControlStatus statusOf(int raw) {
         if (raw == 0) {
@@ -161,52 +159,43 @@ final class NativeVramBinding implements VramBinding {
     }
 
     /**
-     * packed 快照回复里的结果码；0（JNI 异常默认值）返回 null。
-     *
-     * @param reply packed 回复
-     * @return 状态；未知返回 null
+     * packed 快照里的结果码；0 返回 null。
      */
     static ControlStatus statusOf(long reply) {
         return statusOf((int) (reply >>> NativeWireContract.STATUS_SHIFT));
     }
 
     /**
-     * packed 回复里的在途掩码。
-     *
-     * @param reply packed 回复
-     * @return 在途位图
+     * packed 快照里的在途掩码。
      */
     static long inFlightOf(long reply) {
         return reply & IN_FLIGHT_MASK;
     }
 
     /**
-     * packed 回复里的心跳计数。
-     *
-     * @param reply packed 回复
-     * @return 单调心跳
+     * packed 快照里的心跳计数。
      */
     static long heartbeatOf(long reply) {
         return (reply >>> NativeWireContract.HEARTBEAT_SHIFT) & 0xFFFF_FFFFL;
     }
 
     /**
-     * 在空闲掩码里选槽：首选优先，忙则按索引序降级。
+     * 在导入槽位里选空闲位：首选可用则取首选，否则取最低空闲位。
      *
-     * @param preferredIdx 首选槽位索引；非法值直接降级
+     * @param preferredIdx 首选索引；非法或忙时忽略
      * @param freeMask     空闲位图
-     * @param slotCount    本绑定槽位数
      * @return 槽位索引；全忙返回 {@link VramBinding#NO_FREE_SLOT}
      */
-    static int pickSlot(int preferredIdx, long freeMask, int slotCount) {
-        if (preferredIdx >= 0 && preferredIdx < slotCount && (freeMask & (1L << preferredIdx)) != 0) {
+    int pickSlot(int preferredIdx, long freeMask) {
+        long free = freeMask & importedMask;
+        if (free == 0) {
+            return NO_FREE_SLOT;
+        }
+        if (preferredIdx >= 0
+                && preferredIdx < NativeWireContract.MAX_VRAM_SLOTS
+                && (free & (1L << preferredIdx)) != 0) {
             return preferredIdx;
         }
-        for (int i = 0; i < slotCount; i++) {
-            if ((freeMask & (1L << i)) != 0) {
-                return i;
-            }
-        }
-        return NO_FREE_SLOT;
+        return Long.numberOfTrailingZeros(free);
     }
 }

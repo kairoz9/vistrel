@@ -347,12 +347,11 @@ public class RenderpearlVramPipeline implements FrameSource {
         }
 
         try {
-            long nowNanos = System.nanoTime();
             int preferredIdx = (int) (globalFrameIndex % VramExportSet.SLOT_COUNT);
-            // 每次 tick 拉一次权威快照（含全忙丢帧）：选槽与心跳共用同一次 JNI 往返
-            int slotIdx = binding.acquire(preferredIdx, nowNanos);
-            // 停滞判定每个 tick 都执行（含全忙丢帧）：卡死后 push 会停，判定不能跟着停
-            if (binding.heartbeatTimedOut(nowNanos)) {
+            // 每 tick 拉一次快照：选槽与心跳共用同一次 JNI 往返
+            int slotIdx = binding.acquire(preferredIdx);
+            // 全忙也要判停滞：卡死后 push 会停
+            if (binding.heartbeatTimedOut()) {
                 CaptureProfiler.end(CaptureProfiler.Stage.VRAM_PREP, prepStart);
                 onHeartbeatTimeout();
                 return CaptureOutcome.Dropped;

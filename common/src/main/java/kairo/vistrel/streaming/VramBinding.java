@@ -14,8 +14,7 @@ public interface VramBinding {
     /**
      * 心跳冻结判定阈值：持续推流下心跳停在基准值超过此时长，判定编码线程卡死。
      *
-     * <p>编码端每轮推进心跳，不推进只有卡死一种解释；判定必须在每个 tick 执行
-     * （含全忙丢帧的 tick）——卡死后 push 会停，判定不能跟着停。
+     * <p>判定必须在每个 tick 执行（含全忙丢帧）——卡死后 push 会停，判定不能跟着停。
      */
     long STALL_HEARTBEAT_TIMEOUT_NS = 1_000_000_000L;
     /**
@@ -34,20 +33,19 @@ public interface VramBinding {
      * 未投递的槽位在 Native 侧从未置位，异常路径无须归还。
      *
      * @param preferredIdx 首选槽位索引；非法或忙时按索引序降级
-     * @param nowNanos     本帧开始时刻（{@code System.nanoTime()} 域），用作心跳基准
      * @return 槽位索引；全忙返回 {@link #NO_FREE_SLOT}，绑定/引擎失效返回
      *         {@link #BINDING_UNAVAILABLE}——两者都按主动丢帧处理，不升级为 Failed
      * @throws IllegalStateException 绑定已关闭
      * @throws EncoderChannel.ControlException Native 返回未知/致命状态
      */
-    int acquire(int preferredIdx, long nowNanos);
+    int acquire(int preferredIdx);
 
     /**
      * 投递一帧已取用的槽位（单向，不等待编码结果）。
      *
      * <p>成功后槽位所有权移交 Native，由帧载荷析构归还；同一槽位在归还前不得再次投递。
      *
-     * @param slot       {@link #acquire(int, long)} 返回的槽位索引
+     * @param slot       {@link #acquire(int)} 返回的槽位索引
      * @param signalVal  与 GPU 提交流绑定的时间线信号值
      * @return true 表示已入队；false 表示绑定已失效、帧被入口丢弃
      * @throws IllegalStateException 绑定已关闭
@@ -58,13 +56,12 @@ public interface VramBinding {
     /**
      * 心跳是否冻结超过停滞阈值。
      *
-     * <p>基准由 {@link #acquire(int, long)} 每次成功拉取快照时刷新；绑定失效时快照
+     * <p>基准由 {@link #acquire(int)} 每次成功拉取快照时刷新；绑定失效时快照
      * 不再推进，超过阈值即判定停滞并触发引擎自愈。
      *
-     * @param nowNanos 当前时刻（{@code System.nanoTime()} 域）
      * @return true 表示编码线程超过 1 秒没有推进心跳
      */
-    boolean heartbeatTimedOut(long nowNanos);
+    boolean heartbeatTimedOut();
 
     /**
      * 编码线程最后进入的阶段名，用于停滞日志；只在超时后调用。
