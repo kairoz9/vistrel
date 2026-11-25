@@ -14,6 +14,7 @@ use std::thread::JoinHandle;
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
@@ -24,7 +25,7 @@ use crate::encode::frame::{
     FrameInbox, FrameOutbox, FrameOutcome, FramePayload, Mailbox, VideoFrame,
 };
 use crate::encode::hardware::VramSlotDescriptor;
-use crate::encode::hardware::slots::VramBindings;
+use crate::encode::hardware::slots::VramBinding;
 use crate::encode::pool::FramePool;
 use crate::encode::{
     Heartbeat, StageCell, StreamingProfile, TierRequest, VideoCodec, bootstrap_hardware_caps,
@@ -73,8 +74,8 @@ pub struct VideoPipeline {
     /// 帧块由当前后端在自己的设备上分配、经编码线程 `attach` 装进池；换代就在池内换批，
     /// 逐帧路径看不到「后端换了」——取不到块就丢帧，不会拿到别的设备的内存。
     pool: Arc<FramePool>,
-    /// 当前显存绑定注册表：同一时刻至多一个绑定，Java 只持有句柄
-    bindings: Arc<VramBindings>,
+    /// 当前显存绑定：原子替换的当前代指针，Java 只持有句柄；旧代由在途帧保活
+    binding: Arc<ArcSwapOption<VramBinding>>,
     /// 编码循环的存活信号：Actor 每轮 +1，JNI 快照只读
     heartbeat: Arc<Heartbeat>,
     /// 编码路径的当前阶段：Actor 与后端写入，JNI 诊断只读
@@ -86,10 +87,10 @@ pub struct VideoPipeline {
 }
 
 impl VideoPipeline {
-    /// 当前显存绑定注册表
+    /// 当前显存绑定的共享指针：测试用它模拟换代
     #[cfg(test)]
-    pub(crate) fn bindings(&self) -> &Arc<VramBindings> {
-        &self.bindings
+    pub(crate) fn binding_slot(&self) -> &Arc<ArcSwapOption<VramBinding>> {
+        &self.binding
     }
 
     /// 发件箱：会话的写循环从这里取最新帧
@@ -151,13 +152,13 @@ impl VideoPipeline {
         // 这样第一帧到达时池里已有可用块
         let pool = FramePool::new();
         let actor_pool = Arc::downgrade(&pool);
-        // 心跳、阶段与绑定注册表随引擎持有；旧 Actor 拿旧 Arc，写不到后继引擎
+        // 心跳、阶段与当前绑定随引擎持有；旧 Actor 拿旧 Arc，写不到后继引擎
         let heartbeat = Arc::new(Heartbeat::new());
         let stage = Arc::new(StageCell::new());
-        let bindings = VramBindings::new();
+        let binding = Arc::new(ArcSwapOption::from(None));
         let actor_heartbeat = Arc::clone(&heartbeat);
         let actor_stage = Arc::clone(&stage);
-        let actor_bindings = Arc::clone(&bindings);
+        let actor_binding = Arc::clone(&binding);
 
         let handle = std::thread::Builder::new()
             .name("vistrel-encoder-actor".to_string())
@@ -170,7 +171,7 @@ impl VideoPipeline {
                         actor_pool,
                         actor_heartbeat,
                         actor_stage,
-                        actor_bindings,
+                        actor_binding,
                     );
                     actor.run(control_rx, actor_doorbell);
                 }));
@@ -190,7 +191,7 @@ impl VideoPipeline {
             inbox,
             control: ControlSender::new(control_tx, Arc::clone(&doorbell)),
             pool,
-            bindings,
+            binding,
             heartbeat,
             stage,
             output,
@@ -208,7 +209,7 @@ impl VideoPipeline {
             inbox: Arc::clone(&inbox),
             control,
             pool: FramePool::new(),
-            bindings: VramBindings::new(),
+            binding: Arc::new(ArcSwapOption::from(None)),
             heartbeat: Arc::new(Heartbeat::new()),
             stage: Arc::new(StageCell::new()),
             output: Arc::new(Mailbox::new(inbox.outcomes_arc())),
@@ -246,7 +247,9 @@ impl VideoPipeline {
     /// `handle` 是导入返回的绑定句柄，`slot` 是渲染线程从 `vram_slot_state` 快照里选中的
     /// 空闲槽位。句柄、线程、槽位任一不符都在入口拒绝，帧不进入收件箱。
     ///
-    /// 只回答「帧收没收到」；掩码与心跳只在 `vram_slot_state` 快照里返回。
+    /// 绑定指针在载入后仍可能被 Actor 换代；帧携带 `OwnedSlot` 的代次，Actor 取出时
+    /// 再校验一次，旧代帧在编码入口丢弃。只回答「帧收没收到」；掩码与心跳只在
+    /// `vram_slot_state` 快照里返回。
     pub(crate) fn push_vram_slot(
         &self,
         handle: u64,
@@ -254,55 +257,64 @@ impl VideoPipeline {
         birth_nanos: u64,
         sync_value: u64,
     ) -> ControlStatus {
-        self.bindings
-            .with_current(handle, |binding| {
-                if binding.owner() != std::thread::current().id() {
-                    return ControlStatus::WrongThread;
-                }
-                if binding.is_poisoned() {
-                    return ControlStatus::Poisoned;
-                }
-                // 先置位再入箱：编码极快时 ack 不能清掉尚未置的位
-                let Some(owned) = binding.try_acquire(slot) else {
-                    return ControlStatus::SlotNotFree;
-                };
-                self.inbox.push(VideoFrame {
-                    birth_nanos,
-                    payload: FramePayload::VramSlot {
-                        slot: owned,
-                        sync_value,
-                    },
-                });
-                ControlStatus::Ok
-            })
-            // 旧绑定：收件箱里没有新帧，也没有任何槽位被置位
-            .unwrap_or(ControlStatus::StaleBinding)
+        let current = self.binding.load();
+        let Some(binding) = current.as_ref() else {
+            return ControlStatus::StaleBinding;
+        };
+        if binding.handle() != handle {
+            return ControlStatus::StaleBinding;
+        }
+        if binding.owner() != std::thread::current().id() {
+            return ControlStatus::WrongThread;
+        }
+        if binding.is_poisoned() {
+            return ControlStatus::Poisoned;
+        }
+        // 先置位再入箱：编码极快时 ack 不能清掉尚未置的位
+        let Some(owned) = binding.try_acquire(slot) else {
+            return ControlStatus::SlotNotFree;
+        };
+        self.inbox.push(VideoFrame {
+            birth_nanos,
+            payload: FramePayload::VramSlot {
+                slot: owned,
+                sync_value,
+            },
+        });
+        ControlStatus::Ok
     }
 
     /// 当前在途掩码与心跳快照：游戏侧每 tick 调用一次，同时刷新停滞判定基准
     pub(crate) fn vram_slot_state(&self, handle: u64) -> u64 {
-        match self.bindings.with_current(handle, |binding| {
-            if binding.is_poisoned() {
-                (ControlStatus::Poisoned, binding.in_flight())
-            } else {
-                (ControlStatus::Ok, binding.in_flight())
-            }
-        }) {
-            Some((status, in_flight)) => pack_reply(status, in_flight, self.heartbeat.get()),
-            None => pack_reply(ControlStatus::StaleBinding, 0, 0),
+        let current = self.binding.load();
+        let Some(binding) = current.as_ref() else {
+            return pack_reply(ControlStatus::StaleBinding, 0, 0);
+        };
+        if binding.handle() != handle {
+            return pack_reply(ControlStatus::StaleBinding, 0, 0);
         }
+        let status = if binding.is_poisoned() {
+            ControlStatus::Poisoned
+        } else {
+            ControlStatus::Ok
+        };
+        pack_reply(status, binding.in_flight(), self.heartbeat.get())
     }
 
     /// 句柄有效时返回编码路径当前阶段码（诊断冷路径）
     pub(crate) fn stall_stage(&self, handle: u64) -> Option<u64> {
-        self.bindings.with_current(handle, |_| self.stage.get())
+        let current = self.binding.load();
+        current
+            .as_ref()
+            .filter(|binding| binding.handle() == handle)
+            .map(|_| self.stage.get())
     }
 
     /// 关停编码线程：投递 Shutdown 后**有界**等待
     ///
     /// 代价：超时返回后**不再保证 Actor 已退出**，调用方不得再假定显存槽位等资源已释放。
     /// 进程退出与编码停滞自愈重启都会走到本路径；被弃置的线程携带自己的编码上下文
-    /// 与绑定引用继续存活，心跳、阶段与绑定注册表按引擎隔离（新引擎是新的 `Arc`），
+    /// 与绑定引用继续存活，心跳、阶段与当前绑定按引擎隔离（新引擎是新的 `Arc`），
     /// 其干扰不到后继引擎，泄漏资源随进程退出回收。
     pub fn shutdown(&self) {
         // 只投递不等回复：受理与否只说明命令是否入队，退出与否由下面的有界等待回答
@@ -389,7 +401,7 @@ mod tests {
             VideoPipeline::assemble(ControlSender::new(tx, doorbell), Arc::clone(&inbox));
 
         let binding = VramBinding::new_for_test(3);
-        pipeline.bindings().install(Arc::clone(&binding), || {});
+        pipeline.binding_slot().store(Some(Arc::clone(&binding)));
         let stale = binding.handle() + 1_000;
 
         let reply = pipeline.push_vram_slot(stale, 1, 0, 7);
@@ -402,6 +414,45 @@ mod tests {
         assert!(inbox.take().is_none(), "旧句柄的帧不得进入收件箱");
     }
 
+    /// 换代后旧句柄的快照与诊断必须失效，新句柄立即生效
+    #[test]
+    fn test_binding_generation_invalidates_old_snapshot_and_stage() {
+        let doorbell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&doorbell)));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let pipeline =
+            VideoPipeline::assemble(ControlSender::new(tx, doorbell), Arc::clone(&inbox));
+
+        let old = VramBinding::new_for_test(2);
+        pipeline.binding_slot().store(Some(Arc::clone(&old)));
+        assert_eq!(
+            ((pipeline.vram_slot_state(old.handle()) >> 56) as i32) - 1,
+            ControlStatus::Ok.code()
+        );
+        assert_eq!(
+            pipeline.stall_stage(old.handle()),
+            Some(crate::encode::EncodeStage::Idle as u64)
+        );
+
+        let new = VramBinding::new_for_test(2);
+        pipeline.binding_slot().store(Some(Arc::clone(&new)));
+
+        assert_eq!(
+            ((pipeline.vram_slot_state(old.handle()) >> 56) as i32) - 1,
+            ControlStatus::StaleBinding.code(),
+            "旧句柄快照必须失效"
+        );
+        assert!(
+            pipeline.stall_stage(old.handle()).is_none(),
+            "旧句柄诊断必须失效"
+        );
+        assert_eq!(
+            ((pipeline.vram_slot_state(new.handle()) >> 56) as i32) - 1,
+            ControlStatus::Ok.code(),
+            "新句柄快照必须立即生效"
+        );
+    }
+
     /// 当前句柄推送后槽位置位；载荷析构归还
     #[test]
     fn test_vram_push_marks_slot_and_drop_acks() {
@@ -412,7 +463,7 @@ mod tests {
             VideoPipeline::assemble(ControlSender::new(tx, doorbell), Arc::clone(&inbox));
 
         let binding = VramBinding::new_for_test(3);
-        pipeline.bindings().install(Arc::clone(&binding), || {});
+        pipeline.binding_slot().store(Some(Arc::clone(&binding)));
 
         let reply = pipeline.push_vram_slot(binding.handle(), 2, 0, 9);
         assert_eq!(reply, ControlStatus::Ok, "当前句柄必须受理");
@@ -434,7 +485,7 @@ mod tests {
             VideoPipeline::assemble(ControlSender::new(tx, doorbell), Arc::clone(&inbox));
 
         let binding = VramBinding::new_for_test(3);
-        pipeline.bindings().install(Arc::clone(&binding), || {});
+        pipeline.binding_slot().store(Some(Arc::clone(&binding)));
         let poisoned = binding.try_acquire(0).unwrap();
         poisoned.poison();
         drop(poisoned);

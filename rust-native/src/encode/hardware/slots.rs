@@ -1,14 +1,12 @@
 //! 显存直通槽位的跨平台公共类型：
 //! - 导入协议：7 元组描述符解析与句柄生命周期管理
 //! - `SlotTable<S>`：硬件编码后端共用的槽位事务容器
-//! - `VramBinding` / `OwnedSlot` / `VramBindings`：槽位所有权、帧载荷凭据与当前绑定注册表
+//! - `VramBinding` / `OwnedSlot`：槽位所有权与帧载荷凭据
 
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::ThreadId;
-
-use parking_lot::Mutex;
 
 // SAFETY: CloseHandle 要求传入有效内核句柄且不得重复关闭，
 // 本文件内的调用点均通过一次性 take 守卫保证句柄只关一次。
@@ -267,6 +265,8 @@ pub(crate) const MAX_VRAM_SLOTS: usize = 8;
 static NEXT_BINDING_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 /// 一次显存绑定的全部所有权状态：Native 持有事实，Java 只持有 `handle`。
+///
+/// 换代即新建、不复用：旧代可能仍被在途帧的 [`OwnedSlot`] 持有，直到载荷析构才归还。
 pub(crate) struct VramBinding {
     handle: u64,
     /// 已导入槽位的位掩码：Java 只能使用这些索引
@@ -377,6 +377,11 @@ impl OwnedSlot {
         self.slot
     }
 
+    /// 认领所属的绑定句柄：消费端据此判定帧是否仍属于当前代
+    pub(crate) fn binding_handle(&self) -> u64 {
+        self.binding.handle()
+    }
+
     /// 毒化路径：抑制归还并让整个绑定停止接收推送
     pub(crate) fn poison(&self) {
         self.suppress.set(true);
@@ -388,57 +393,6 @@ impl Drop for OwnedSlot {
     fn drop(&mut self) {
         if !self.suppress.get() {
             self.binding.ack(self.slot);
-        }
-    }
-}
-
-/// 当前生效的显存绑定：同一时刻至多一个，Java 只持有它的句柄。
-///
-/// 锁包住「取绑定 + 置在途位 + 入收件箱」与「换/摘绑定 + 清收件箱」两侧：
-/// 换代时在途帧要么落在换表之前被清掉，要么落进新表，绝不会带着旧槽位索引进入新表。
-pub(crate) struct VramBindings {
-    current: Mutex<Option<Arc<VramBinding>>>,
-}
-
-impl VramBindings {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            current: Mutex::new(None),
-        })
-    }
-
-    /// 在锁内对指定句柄执行一次操作；句柄不是当前绑定时返回 `None`
-    pub(crate) fn with_current<R>(
-        &self,
-        handle: u64,
-        f: impl FnOnce(&Arc<VramBinding>) -> R,
-    ) -> Option<R> {
-        let guard = self.current.lock();
-        guard
-            .as_ref()
-            .filter(|binding| binding.handle() == handle)
-            .map(f)
-    }
-
-    /// 安装新绑定，并在同一把锁内清空旧帧（调用方负责随后回收丢弃载荷）
-    pub(crate) fn install(&self, binding: Arc<VramBinding>, clear: impl FnOnce()) {
-        let mut guard = self.current.lock();
-        *guard = Some(binding);
-        clear();
-    }
-
-    /// 摘除指定绑定，并在同一把锁内清空旧帧；句柄不符时不动
-    pub(crate) fn take(&self, handle: u64, clear: impl FnOnce()) -> bool {
-        let mut guard = self.current.lock();
-        if guard
-            .as_ref()
-            .is_some_and(|binding| binding.handle() == handle)
-        {
-            *guard = None;
-            clear();
-            true
-        } else {
-            false
         }
     }
 }
@@ -614,31 +568,17 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_rejects_stale_handle_and_clears_on_take() {
-        let bindings = VramBindings::new();
-        let first = VramBinding::new_for_test(1);
-        bindings.install(Arc::clone(&first), || {});
-        assert!(bindings.with_current(first.handle(), |_| ()).is_some());
-
-        let mut cleared = 0;
-        assert!(bindings.take(first.handle(), || cleared += 1));
-        assert_eq!(cleared, 1, "摘除必须在锁内清空旧帧");
-        assert!(bindings.with_current(first.handle(), |_| ()).is_none());
-        assert!(!bindings.take(first.handle(), || {}), "重复摘除无效");
-    }
-
-    #[test]
-    fn test_registry_install_replaces_and_clears() {
-        let bindings = VramBindings::new();
+    fn test_owned_slot_keeps_its_generation_identity() {
         let old = VramBinding::new_for_test(1);
-        bindings.install(Arc::clone(&old), || {});
-
+        let slot = old.try_acquire(0).expect("旧代槽位空闲");
         let new = VramBinding::new_for_test(1);
-        let mut cleared = 0;
-        bindings.install(Arc::clone(&new), || cleared += 1);
-        assert_eq!(cleared, 1, "换表必须在锁内清空旧帧");
-        assert!(bindings.with_current(old.handle(), |_| ()).is_none());
-        assert!(bindings.with_current(new.handle(), |_| ()).is_some());
+
+        assert_eq!(slot.binding_handle(), old.handle());
+        assert_ne!(slot.binding_handle(), new.handle());
+
+        drop(slot);
+        assert!(!old.is_in_flight(0), "认领必须归还旧代");
+        assert!(!new.is_in_flight(0), "旧代归还不得触碰新代");
     }
 
     /// 合法槽位描述符策略：句柄与尺寸用全域随机值并声明已接管，

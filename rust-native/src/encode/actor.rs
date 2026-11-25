@@ -7,13 +7,14 @@
 use std::sync::{Arc, Weak};
 use std::thread::ThreadId;
 
+use arc_swap::ArcSwapOption;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Receiver;
 
 use crate::encode::control::{ControlCommand, ControlStatus};
 use crate::encode::frame::{FrameInbox, FrameOutbox, FrameOutcome, VideoFrame};
 use crate::encode::hardware::VramSlotDescriptor;
-use crate::encode::hardware::slots::{MAX_VRAM_SLOTS, VramBinding, VramBindings};
+use crate::encode::hardware::slots::{MAX_VRAM_SLOTS, VramBinding};
 use crate::encode::pool::{FramePool, HostBlock};
 use crate::encode::{
     EncodeStage, FramePayload, Heartbeat, StageCell, StampedVideoPacket, StreamingProfile,
@@ -60,10 +61,8 @@ pub struct EncoderActor {
     heartbeat: Arc<Heartbeat>,
     /// 编码路径的当前阶段：主循环与硬件后端写入
     stage: Arc<StageCell>,
-    /// 当前显存绑定注册表：导入时安装，注销/换档时摘除
-    bindings: Arc<VramBindings>,
-    /// 当前生效的绑定：与注册表同源，保留句柄以便换档时摘除
-    binding: Option<Arc<VramBinding>>,
+    /// 当前显存绑定：与管线共享的原子指针，导入时发布，注销/换档时置空
+    binding: Arc<ArcSwapOption<VramBinding>>,
     /// 硬编后端工厂：唯一依赖注入点
     hardware_builder: Arc<HardwareBuilder>,
     /// true＝拒收显存帧：档位已换等重导入、或槽位表已清空等重新导入。
@@ -82,7 +81,7 @@ impl EncoderActor {
         pool: Weak<FramePool>,
         heartbeat: Arc<Heartbeat>,
         stage: Arc<StageCell>,
-        bindings: Arc<VramBindings>,
+        binding: Arc<ArcSwapOption<VramBinding>>,
     ) -> Self {
         Self::new_with_hardware_builder(
             inbox,
@@ -90,7 +89,7 @@ impl EncoderActor {
             pool,
             heartbeat,
             stage,
-            bindings,
+            binding,
             Arc::new(|profile, codec, kind, stage| {
                 VideoEncoder::new_backend(profile, codec, kind, Some(stage))
             }),
@@ -104,7 +103,7 @@ impl EncoderActor {
         pool: Weak<FramePool>,
         heartbeat: Arc<Heartbeat>,
         stage: Arc<StageCell>,
-        bindings: Arc<VramBindings>,
+        binding: Arc<ArcSwapOption<VramBinding>>,
         hardware_builder: Arc<HardwareBuilder>,
     ) -> Self {
         Self {
@@ -118,8 +117,7 @@ impl EncoderActor {
             pool,
             heartbeat,
             stage,
-            bindings,
-            binding: None,
+            binding,
             hardware_builder,
             rejecting_frames: false,
         }
@@ -238,9 +236,7 @@ impl EncoderActor {
                 // 表空，交给既有索引查找与几何兜底
                 self.rejecting_frames = false;
                 let outcome = if code == ControlStatus::Ok {
-                    self.binding
-                        .as_ref()
-                        .map(|binding| binding.handle())
+                    self.current_binding_handle()
                         .ok_or(ControlStatus::ImportFailed)
                 } else {
                     Err(code)
@@ -248,7 +244,7 @@ impl EncoderActor {
                 let _ = reply.send(outcome);
             }
             ControlCommand::ClearVramSlots { handle, reply } => {
-                if self.binding.as_ref().map(|binding| binding.handle()) != Some(handle) {
+                if self.current_binding_handle() != Some(handle) {
                     // 旧句柄：旧导入已随实例销毁，注销是空操作，不动当前拒收状态
                     let _ = reply.send(ControlStatus::Ok);
                 } else {
@@ -314,21 +310,26 @@ impl EncoderActor {
         drop(self.inbox.take_discarded());
     }
 
-    /// 摘除当前绑定并在锁内清空在途帧：句柄从此失效，后续 push 一律 `StaleBinding`
+    /// 摘除当前绑定并清空在途帧：句柄从此失效，后续 push 一律 `StaleBinding`。
+    /// 指针替换前已载入旧绑定的 push 仍可能把旧代帧塞进收件箱，由入口代次校验丢弃。
     fn invalidate_binding(&mut self) {
-        let Some(binding) = self.binding.take() else {
+        if self.binding.load().is_none() {
             return;
-        };
-        let bindings = Arc::clone(&self.bindings);
-        let inbox = Arc::clone(&self.inbox);
-        bindings.take(binding.handle(), || inbox.clear());
+        }
+        self.binding.store(None);
+        self.inbox.clear();
         self.ack_discarded();
+    }
+
+    /// 当前绑定句柄：无绑定返回 None
+    fn current_binding_handle(&self) -> Option<u64> {
+        self.binding.load().as_ref().map(|binding| binding.handle())
     }
 
     /// 注销显存槽位；排空失败时保留导入引用并回 `ReleaseFailed`——`Ok` 才是游戏侧
     /// 销毁导出纹理/信号量的唯一依据。没有编码器则没有导入引用，无需排空。
     fn clear_vram_slots(&mut self, handle: u64) -> ControlStatus {
-        if self.binding.as_ref().map(|binding| binding.handle()) != Some(handle) {
+        if self.current_binding_handle() != Some(handle) {
             // 句柄已不是当前绑定：导入已随旧编码器销毁，注销是空操作。
             // 返回 Ok 让游戏侧可以立即复用/销毁导出资源
             return ControlStatus::Ok;
@@ -390,12 +391,10 @@ impl EncoderActor {
                     mask | (1u64 << descriptor.slot_idx)
                 });
                 let binding = Arc::new(VramBinding::new(slot_mask, owner));
-                // 换表与清空同锁：并发 push 要么落在换表前被清掉，要么落进新表
-                let bindings = Arc::clone(&self.bindings);
-                let inbox = Arc::clone(&self.inbox);
-                bindings.install(Arc::clone(&binding), || inbox.clear());
+                // 先清收件箱再发布新代：窗口内旧句柄晚到的帧由编码入口按代次丢弃
+                self.inbox.clear();
+                self.binding.store(Some(binding));
                 self.ack_discarded();
-                self.binding = Some(binding);
                 ControlStatus::Ok
             }
             Err(e) => {
@@ -748,12 +747,15 @@ impl EncoderActor {
         }
     }
 
-    /// 处理取出的最新帧：换档拒收先于编码
+    /// 处理取出的最新帧：换代拒收先于编码
     ///
-    /// 档位已换、槽位表待重导入期间到达的槽位帧引用的是重导入前的旧槽位表
-    /// （几何过期或索引悬空，旧 sync_value 还可能落到新导入的信号量上长期等待），
-    /// 在入口丢弃；主机帧自带像素、不引用表，照常编码。正常期两类帧都进编码。
-    /// 显存帧的槽位认领随载荷析构归还，各出口都不会泄漏或提前释放
+    /// 两种在入口丢弃的槽位帧同记 `FenceDropped`：
+    /// - 档位已换、槽位表待重导入期间到达的帧引用旧表（几何过期或索引悬空，
+    ///   旧 sync_value 还可能落到新导入的信号量上长期等待）；
+    /// - `push` 载入旧绑定后 Actor 完成换代的窄窗口内晚到的帧，代次已不是当前绑定。
+    ///
+    /// 主机帧自带像素、不引用表，照常编码。显存帧的槽位认领随载荷析构归还旧代，
+    /// 各出口都不会泄漏或提前释放。
     fn handle_frame(&mut self, mut frame: VideoFrame) {
         if self.rejecting_frames && matches!(frame.payload, FramePayload::VramSlot { .. }) {
             self.inbox.outcomes().record_with(
@@ -761,6 +763,18 @@ impl EncoderActor {
                 "槽位表重建中：显存帧暂不接收，等待重新导入",
             );
             return;
+        }
+        if let FramePayload::VramSlot { slot, .. } = &frame.payload {
+            let current = self.binding.load();
+            let stale = !current
+                .as_ref()
+                .is_some_and(|binding| binding.handle() == slot.binding_handle());
+            if stale {
+                self.inbox
+                    .outcomes()
+                    .record_with(FrameOutcome::FenceDropped, "绑定已换代：显存帧入口丢弃");
+                return;
+            }
         }
         self.encode_frame(&mut frame.payload, frame.birth_nanos);
     }
@@ -779,7 +793,7 @@ mod tests {
     use crate::encode::encoder::{EncodeBackendKind, VideoEncodeBackend};
     use crate::encode::frame::{Mailbox, VideoFrame};
     use crate::encode::hardware::VramSlotDescriptor;
-    use crate::encode::hardware::slots::{VramBinding, VramBindings};
+    use crate::encode::hardware::slots::VramBinding;
     use crate::encode::pool::test_support::host_payload;
     use crate::encode::pool::{FramePool, POOL_DEPTH, fake_device_blocks};
     use crate::encode::{Heartbeat, StageCell};
@@ -791,6 +805,11 @@ mod tests {
         let bell = Arc::new(Notify::new());
         let inbox = Arc::new(FrameInbox::new(bell));
         Arc::new(Mailbox::new(inbox.outcomes_arc()))
+    }
+
+    /// 空的当前绑定指针：与生产同一条共享路径
+    fn empty_binding() -> Arc<ArcSwapOption<VramBinding>> {
+        Arc::new(ArcSwapOption::from(None))
     }
 
     /// 假硬编后端：只上报硬件身份，不碰任何驱动
@@ -892,7 +911,7 @@ mod tests {
             Arc::downgrade(&pool),
             Arc::new(Heartbeat::new()),
             Arc::new(StageCell::new()),
-            VramBindings::new(),
+            empty_binding(),
             hardware_builder,
         );
         (actor, pool)
@@ -1070,14 +1089,54 @@ mod tests {
 
         // drain 成功：摘除绑定，旧句柄失效
         assert_eq!(actor.clear_vram_slots(binding.handle()), ControlStatus::Ok);
-        assert!(actor.binding.is_none(), "注销后不得残留绑定");
+        assert!(actor.binding.load().is_none(), "注销后不得残留绑定");
         assert!(
-            actor
-                .bindings
-                .with_current(binding.handle(), |_| ())
-                .is_none(),
+            actor.current_binding_handle().is_none(),
             "注销后旧句柄必须失效"
         );
+    }
+
+    /// Actor 入口按代次校验：换代窗口内晚到的旧绑定帧不得进入新表
+    #[test]
+    fn test_stale_binding_frame_is_dropped_at_actor_entry() {
+        let bell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
+        let output = test_outbox();
+        let (mut actor, _pool) = fence_actor(inbox.clone(), Arc::clone(&output), true, true);
+        let request = tier(1280, 720, 60);
+        assert_eq!(
+            prepare(
+                &mut actor,
+                request,
+                VideoCodec::H264,
+                Some(EncodeBackendKind::Nvenc)
+            ),
+            ControlStatus::Ok
+        );
+        assert_eq!(import_slots(&mut actor, 0), ControlStatus::Ok);
+        let old = current_binding(&actor);
+
+        // 新代发布后旧句柄失效；旧帧仍可能已在 push 的载入窗口里
+        assert_eq!(import_slots(&mut actor, 0), ControlStatus::Ok);
+        assert_ne!(current_binding(&actor).handle(), old.handle());
+
+        inbox.push(vram_frame(&old, 0, 5));
+        let frame = inbox.take().expect("帧在收件箱");
+        assert!(old.is_in_flight(0));
+        actor.handle_frame(frame);
+
+        assert!(!old.is_in_flight(0), "旧代帧析构必须归还旧代槽位");
+        assert_eq!(
+            actor.inbox.outcomes().count(FrameOutcome::FenceDropped),
+            1,
+            "旧代帧必须在入口丢弃"
+        );
+        assert_eq!(
+            actor.inbox.outcomes().count(FrameOutcome::Admitted),
+            0,
+            "旧代帧不得进入编码"
+        );
+        assert!(output.take().is_none(), "旧代帧不得产出码流");
     }
 
     /// 堆块路径必须真的产出码流
@@ -1309,7 +1368,7 @@ mod tests {
                     actor_pool,
                     Arc::new(Heartbeat::new()),
                     Arc::new(StageCell::new()),
-                    VramBindings::new(),
+                    empty_binding(),
                 );
                 actor.run(ctl_rx, actor_bell);
             })
@@ -1530,7 +1589,7 @@ mod tests {
             Arc::downgrade(&pool),
             Arc::new(Heartbeat::new()),
             Arc::new(StageCell::new()),
-            VramBindings::new(),
+            empty_binding(),
             fence_backend_builder(drain_ok, import_ok),
         );
         (actor, pool)
@@ -1538,7 +1597,7 @@ mod tests {
 
     /// 当前绑定（导入成功后取用）
     fn current_binding(actor: &EncoderActor) -> Arc<VramBinding> {
-        Arc::clone(actor.binding.as_ref().expect("导入成功后必须有绑定"))
+        actor.binding.load_full().expect("导入成功后必须有绑定")
     }
 
     /// 槽位帧构造：在给定绑定上占用 `slot_idx`，载荷 Drop 即归还
@@ -1882,7 +1941,7 @@ mod tests {
             ControlStatus::MalformedBatch,
             "越界槽位索引必须整批拒绝"
         );
-        assert!(actor.binding.is_none(), "拒绝的导入不得安装绑定");
+        assert!(actor.binding.load().is_none(), "拒绝的导入不得安装绑定");
     }
 
     /// 用例 5：拒收只开不关——窗口开着时来一条 fps-only 重配，不得提前放行
@@ -1911,7 +1970,7 @@ mod tests {
         let p1080_30fps = tier(1920, 1080, 30);
         let _ = switch_profile(&mut actor, p1080_30fps);
         assert!(!actor.rejecting_frames, "fps-only 重配不得开窗");
-        assert!(actor.binding.is_some(), "fps-only 重配不得摘除绑定");
+        assert!(actor.binding.load().is_some(), "fps-only 重配不得摘除绑定");
 
         // 同几何换 codec（协商落账路径）开窗：旧 sync_value 帧自此不得进编码
         let _ = prepare_kind(
@@ -1922,7 +1981,7 @@ mod tests {
         )
         .expect("同几何换 codec 必须重配成功");
         assert!(actor.rejecting_frames);
-        assert!(actor.binding.is_none(), "换 codec 必须摘除绑定");
+        assert!(actor.binding.load().is_none(), "换 codec 必须摘除绑定");
 
         // 窗口期间来一条 fps-only 重配：不得关闭拒收
         let _ = switch_profile(&mut actor, p1080_30fps);
