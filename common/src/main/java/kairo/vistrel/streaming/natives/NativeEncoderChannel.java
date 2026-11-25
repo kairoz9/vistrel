@@ -4,6 +4,7 @@ import kairo.vistrel.input.InputEventSource;
 import kairo.vistrel.streaming.ControlStatus;
 import kairo.vistrel.streaming.EncoderCaps;
 import kairo.vistrel.streaming.EncoderChannel;
+import kairo.vistrel.streaming.NativeResult;
 import kairo.vistrel.streaming.VramBinding;
 import java.nio.ByteBuffer;
 import java.util.List;
@@ -48,7 +49,11 @@ public final class NativeEncoderChannel implements EncoderChannel, InputEventSou
         if (!NativeBridge.isLoaded()) {
             return EncoderCaps.EMPTY;
         }
-        EncoderCaps parsed = EncoderCaps.parse(NativeBridge.queryEncoderCaps());
+        NativeResult result = NativeResult.parse(NativeBridge.queryEncoderCaps());
+        if (!result.ok() || result.data() == null) {
+            return EncoderCaps.EMPTY;
+        }
+        EncoderCaps parsed = EncoderCaps.parse(result.data().toString());
         if (parsed.probed()) {
             cachedCaps = parsed;
         }
@@ -104,7 +109,16 @@ public final class NativeEncoderChannel implements EncoderChannel, InputEventSou
             }
             SlotStateBlock blockView = new SlotStateBlock(stateBlock, slots.size());
             long bindingEpoch = blockView.bindingEpoch();
-            int code = NativeBridge.importVramSlots(bindingEpoch, flat);
+            NativeResult result = NativeResult.parse(NativeBridge.importVramSlots(bindingEpoch, flat));
+            if (!result.ok()) {
+                throw new EncoderChannel.ControlException(
+                        result.message() != null ? result.message() : "显存槽位导入失败",
+                        ControlStatus.PIPELINE_DEAD
+                );
+            }
+            int code = result.data() != null && result.data().isJsonPrimitive()
+                    ? result.data().getAsInt()
+                    : ControlStatus.PIPELINE_DEAD.code();
             if (code == ControlStatus.OK.code()) {
                 return new NativeVramBinding(blockView, bindingEpoch);
             }

@@ -9,7 +9,7 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * 本机编码能力快照，由 {@code NativeBridge.queryEncoderCaps()} 的 JSON 解析而来
+ * 本机编码能力快照，由 {@code NativeBridge.queryEncoderCaps()} 统一信封的 data 解析而来
  *
  * <p>
  * 会话实际在跑什么由 {@link SessionServer.EncoderGeneration#backend()} 承载。

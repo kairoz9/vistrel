@@ -317,6 +317,37 @@ describe("信令下行分流", () => {
         expect(ws.closeCalls).toBe(1);
     });
 
+    it("不可重试的信令 error 停止重连并转 REJECTED，手动重试才恢复", async () => {
+        const { session } = makeSession();
+        const statuses = [];
+        const errors = [];
+        session.on("status", (status) => statuses.push(status));
+        session.on("error", (message) => errors.push(message));
+        session.start("");
+        const ws = session.ws;
+        ws.readyState = FakeWebSocket.OPEN;
+        await session.handleSignalingMessage(
+            JSON.stringify({
+                type: "error",
+                message: "指定的 codec 不可行",
+                retryable: false,
+            }),
+        );
+        expect(errors).toEqual(["指定的 codec 不可行"]);
+        expect(statuses).toEqual([ConnectStatus.CONNECTING, ConnectStatus.REJECTED]);
+        expect(ws.closeCalls).toBe(1);
+        expect(session.isFatal).toBe(true);
+        // 通道随后关闭也不进入重连
+        ws.onclose({ code: 1006 });
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(FakeWebSocket.instances).toHaveLength(1);
+
+        // 用户改偏好后手动重连：fatal 标志复位
+        session.start("");
+        expect(session.isFatal).toBe(false);
+        expect(FakeWebSocket.instances).toHaveLength(2);
+    });
+
     it("控制通道三类动作转 action 事件", async () => {
         const { session } = makeSession();
         const actions = [];

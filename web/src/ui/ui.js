@@ -40,6 +40,7 @@ const STATUS_LABELS = {
     connecting: "连接中",
     connected: "已连接",
     disconnected: "重试中",
+    rejected: "已拒绝",
     closed: "已关闭",
 };
 
@@ -48,6 +49,7 @@ const STATUS_LEVELS = {
     connecting: "is-info",
     connected: "is-ok",
     disconnected: "is-warn",
+    rejected: "is-dead",
     closed: "is-dead",
 };
 

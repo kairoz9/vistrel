@@ -174,11 +174,11 @@ public class NativeBridge {
      * @param fps          目标帧率
      * @param bpp          客户端画质档位
      * @param codec        客户端 Codec 偏好（线上令牌 {@code h264}/{@code h265}/{@code av1}；
-     *                     {@code null} 表示无偏好；无法识别或浏览器未提供时协商被拒绝）
+     *                     {@code null} 表示无偏好，无法识别时协商被拒绝）
      * @param backend      客户端编码后端偏好（线上词汇 {@code nvenc}/{@code vulkan_video}/{@code software}；
-     *                     {@code null} 表示无偏好；无法识别或不在本机探测清单内时协商被拒绝）
-     * @return Answer JSON 字符串 (包含实际生效的分辨率、帧率、bpp、码率、codec、后端、
-     *         可选值清单 {@code backends} 与 Answer SDP)
+     *                     {@code null} 表示无偏好，无法识别或不在本机探测清单内时协商被拒绝）
+     * @return 统一信封；成功时 {@code data} 是 Answer（含实际生效的档位、能力清单与
+     *         Answer SDP），协商被拒时按 {@code retry} / {@code fatal} 返回原因
      */
     public static native String negotiateOffer(
             String offerSdpJson,
@@ -193,9 +193,9 @@ public class NativeBridge {
     /**
      * 阻塞应用新的画质档位
      *
-     * <p>这是档位的唯一运行期写路径, 成功应答返回**实际生效**的档位 JSON
-     * ({@code width/height/fps/bpp/bitrate})；请求被拒绝或无活跃会话返回空串，
-     * 调用方保持自己上次的生效基线。
+     * <p>这是档位的唯一运行期写路径，成功时 {@code data} 是**实际生效**的档位
+     * ({@code width/height/fps/bpp/bitrate})；请求被拒绝按 {@code fatal}、无活跃会话
+     * 按 {@code retry} 返回，调用方保持自己上次的生效基线。
      *
      * <p>0 几何 / 0 帧率 Native 按拒绝处理。
      *
@@ -203,7 +203,7 @@ public class NativeBridge {
      * @param height 目标高度
      * @param fps    目标帧率
      * @param bpp    客户端画质档位 (BPP)
-     * @return 实际生效档位 JSON；被拒绝或无活跃会话返回空串
+     * @return 统一信封；成功时 {@code data} 是实际生效档位
      */
     public static native String applyProfile(int width, int height, int fps, float bpp);
 
@@ -251,7 +251,8 @@ public class NativeBridge {
      * 会话实际在跑什么不在这里，那是协商建成的结果，落账在
      * {@link kairo.vistrel.streaming.SessionServer.EncoderGeneration#backend()}。
      *
-     * @return JSON：{@code {"state":"capabilities"|"noHardware"|"notProbed",
+     * @return 统一信封；成功时 {@code data} 是
+     *         {@code {"state":"capabilities"|"noHardware"|"notProbed",
      *         "backends":[{"kind":"nvenc","codecs":["H264","H265"],"gpu":"显卡名"}]}}。
      *         {@code state} 区分未探测与探测过无硬件，二者诊断意义相反，不得合并
      */
@@ -267,21 +268,22 @@ public class NativeBridge {
      * @param bindingEpoch 显存绑定轮次（共享块中的当前值）
      * @param slots 扁平 long[]：逐槽位依序排列的 7 元组，字段序见
      *              {@link NativeWireContract}
-     * @return 控制结果码：{@link kairo.vistrel.streaming.ControlStatus#OK} 为成功，非零为失败原因
-     *         (协议错位 / 无硬编 / 导入失败 / 管线已死 / ACK 超时 / 绑定轮次过期)
+     * @return 统一信封；成功时 {@code data} 是 {@link kairo.vistrel.streaming.ControlStatus}
+     *         判别值：0 为成功，非零为失败原因（协议错位 / 无硬编 / 导入失败 / 管线已死 /
+     *         ACK 超时 / 绑定轮次过期）
      */
-    public static native int importVramSlots(long bindingEpoch, long[] slots);
+    public static native String importVramSlots(long bindingEpoch, long[] slots);
 
     /**
      * 安全注销并释放 Native 引擎内部缓存的所有外部显存槽位与同步原语
      *
      * @param bindingEpoch 显存绑定轮次；旧轮次的注销按空操作成功（导入已随实例销毁）
-     * @return 控制结果码：仅 {@link kairo.vistrel.streaming.ControlStatus#OK} 表示
-     *         原生侧已确认注销完毕；未确认时调用方不得销毁导出资源——后果与处置在
-     *         {@link kairo.vistrel.streaming.VramBinding#close()} 与
+     * @return 统一信封；成功时 {@code data} 是 {@link kairo.vistrel.streaming.ControlStatus}
+     *         判别值，仅 0 表示原生侧已确认注销完毕；未确认时调用方不得销毁导出资源——
+     *         后果与处置在 {@link kairo.vistrel.streaming.VramBinding#close()} 与
      *         {@link kairo.vistrel.streaming.VramBinding.ReleaseStatus} 定义一次
      */
-    public static native int clearVramSlots(long bindingEpoch);
+    public static native String clearVramSlots(long bindingEpoch);
 
     /**
      * 向 Native 引擎直通投递显存槽位（单向投递，不等待编码结果）

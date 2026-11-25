@@ -1,6 +1,8 @@
 package kairo.vistrel.streaming.signaling;
 
+import com.google.gson.JsonParser;
 import kairo.vistrel.streaming.ProfileCoordinator;
+import kairo.vistrel.streaming.NativeResult;
 import kairo.vistrel.streaming.SessionServer;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -71,9 +73,13 @@ class SignalingServerTest {
          * 置位后下一次 onOffer 返回 null（协商失败但认证已通过）
          */
         volatile boolean failNextOffer;
+        /**
+         * 置位后下一次 onOffer 返回不可重试的结构化拒绝
+         */
+        volatile boolean rejectNextOffer;
 
         @Override
-        public String onOffer(
+        public NativeResult onOffer(
                 String offerSdpJson,
                 int width,
                 int height,
@@ -93,9 +99,15 @@ class SignalingServerTest {
                 failNextOffer = false;
                 return null;
             }
+            if (rejectNextOffer) {
+                rejectNextOffer = false;
+                return NativeResult.error(false, "指定的 codec 不可行");
+            }
             // 合法 JSON：信令层会把它交给协调器落账（预拆分拼接防格式化器拆坏转义）
-            return "{\"width\":1920,\"height\":1080,\"fps\":60,\"bpp\":0.1,"
-                    + "\"bitrate\":4000000,\"codec\":\"H264\",\"backend\":\"nvenc\"}";
+            return NativeResult.ok(JsonParser.parseString(
+                    "{\"width\":1920,\"height\":1080,\"fps\":60,\"bpp\":0.1,"
+                    + "\"bitrate\":4000000,\"codec\":\"H264\",\"backend\":\"nvenc\"}"
+            ));
         }
 
         @Override
@@ -566,6 +578,31 @@ class SignalingServerTest {
         } finally {
             server.stop();
         }
+    }
+
+    /**
+     * 协商拒绝必须保留 retryable 语义：不可重试的拒绝不得被当成可恢复错误，且不得落账档位
+     */
+    @Test
+    void testOfferErrorIsForwardedVerbatim() {
+        RecordingDelegate rec = new RecordingDelegate();
+        SignalingServer server = new SignalingServer(rec);
+        server.setPassword("pass123");
+        RecordingWorkerListener listener = new RecordingWorkerListener();
+        ProfileCoordinator.ContentSnapshot snapshot = new ProfileCoordinator.ContentSnapshot(1920, 1080, 60, true, 60);
+        server.setProfileCoordinator(newWorker(snapshot, listener, SignalingServerTest::nullApplier));
+        rec.rejectNextOffer = true;
+
+        EmbeddedChannel ch = openWebSocket(server);
+        sendOffer(ch, "pass123");
+        ByteBuf frame = ch.readOutbound();
+        Assertions.assertNotNull(frame, "拒绝必须回结构化错误帧");
+        String json = frame.toString(StandardCharsets.UTF_8);
+        frame.release();
+        Assertions.assertTrue(json.contains("\"type\":\"error\""), "必须是 error 帧，实际 " + json);
+        Assertions.assertTrue(json.contains("\"retryable\":false"), "可重试语义必须透传，实际 " + json);
+        Assertions.assertTrue(listener.applied.isEmpty(), "拒绝不得落账档位");
+        ch.finishAndReleaseAll();
     }
 
     /**
