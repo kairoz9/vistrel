@@ -523,31 +523,36 @@ fn import_vram_slots_reply<'caller>(
 ) -> Reply {
     // 0. 硬编能力预检：读启动期建立的快照，本机无硬编时直接拒绝
     if encode::hardware_backends().is_none() {
-        return Reply::ok(serde_json::json!({ "code": ControlStatus::NoHardwareEncoder as i32 }));
+        return Reply::ok(serde_json::json!({ "code": ControlStatus::EncoderUnavailable as i32 }));
     }
 
     // 整批处理：Java 决定槽位数量，Native 只按协议切分收到的数组
     let Ok(len) = flat.len(env) else {
-        return Reply::ok(serde_json::json!({ "code": ControlStatus::MalformedBatch as i32 }));
+        log::error!("显存槽位批量注册失败: 无法读取数组长度");
+        return Reply::ok(serde_json::json!({ "code": ControlStatus::VramFault as i32 }));
     };
     if len == 0 || !len.is_multiple_of(FLAT_STRIDE) {
-        return Reply::ok(serde_json::json!({ "code": ControlStatus::MalformedBatch as i32 }));
+        log::error!("显存槽位批量注册失败: 数组长度 {len} 不是 {FLAT_STRIDE} 的正整数倍");
+        return Reply::ok(serde_json::json!({ "code": ControlStatus::VramFault as i32 }));
     }
 
     let mut buf = vec![0i64; len];
     if flat.get_region(env, 0, &mut buf).is_err() {
-        return Reply::ok(serde_json::json!({ "code": ControlStatus::MalformedBatch as i32 }));
+        log::error!("显存槽位批量注册失败: 读取数组元素失败");
+        return Reply::ok(serde_json::json!({ "code": ControlStatus::VramFault as i32 }));
     }
 
     let Some(slots) = VramSlotDescriptor::parse_batch(&buf) else {
-        return Reply::ok(serde_json::json!({ "code": ControlStatus::MalformedBatch as i32 }));
+        log::error!("显存槽位批量注册失败: 描述符解析失败");
+        return Reply::ok(serde_json::json!({ "code": ControlStatus::VramFault as i32 }));
     };
-    if slots
+    if let Some(bad) = slots
         .iter()
-        .any(|descriptor| descriptor.slot_idx as usize >= MAX_VRAM_SLOTS)
+        .find(|descriptor| descriptor.slot_idx as usize >= MAX_VRAM_SLOTS)
     {
+        log::error!("显存槽位批量注册失败: 槽位索引 {} 越界", bad.slot_idx);
         // 未进入导入：描述符在此析构并关闭原始句柄
-        return Reply::ok(serde_json::json!({ "code": ControlStatus::MalformedBatch as i32 }));
+        return Reply::ok(serde_json::json!({ "code": ControlStatus::VramFault as i32 }));
     }
 
     // 派发控制命令给 Actor；绑定句柄由 Native 在导入成功时分配并回送

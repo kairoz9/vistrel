@@ -25,7 +25,7 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// 控制队列容量
 ///
 /// 命令都是罕见操作（会话建立、档位变更、显存槽位注册、关停），16 格足够；满即说明编码
-/// 线程已经不消费了，此时丢弃并返回 `QueueFull` 比阻塞发送方更诚实。
+/// 线程已经不消费了，此时丢弃并返回 `ControlBusy` 比阻塞发送方更诚实。
 pub(crate) const CONTROL_QUEUE_DEPTH: usize = 16;
 
 /// 控制命令结果码：0 为成功，非零为失败原因。
@@ -33,33 +33,32 @@ pub(crate) const CONTROL_QUEUE_DEPTH: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlStatus {
     Ok = 0,
-    /// 批量注册的数组长度不是每槽位 `long` 数的整数倍,协议错位
-    MalformedBatch = 1,
-    /// 本机无可用硬件编码器
-    NoHardwareEncoder = 2,
-    /// 外部显存或时间线信号量导入失败（fd 非法、DMA-BUF 不支持等）
-    ImportFailed = 3,
-    /// Actor 已死
-    ActorDead = 4,
-    /// Actor ACK 超时（5s）
-    AckTimeout = 5,
-    /// Actor 拒绝 Profile 变更（编码器重配失败），档位保持不变
-    ReconfigureFailed = 6,
-    /// 控制队列已满，命令未被受理
-    QueueFull = 7,
-    /// 注销槽位前排空失败：编码器可能仍在导入的资源上等待，引用与槽位表均未释放
-    ReleaseFailed = 8,
-    /// 硬编建成失败：探测认证过的候选后端全部建不起来。与 `NoHardwareEncoder`
-    /// 的区别是后者表示「本机探测不到硬编」，本码表示「探测说有，实际建不出来」
-    EncoderBuildFailed = 9,
-    /// 显存绑定句柄已失效：句柄不属于当前引擎，或绑定已被换档/注销摘除
-    StaleBinding = 10,
-    /// 槽位已在途或索引未导入：重复推送同一槽位是协议违例
-    SlotNotFree = 11,
-    /// 推送线程不是导入时的渲染线程：绑定的线程约束被破坏
-    WrongThread = 12,
-    /// 提交等待超时毒化：在途 GPU 工作可能仍在读槽位纹理，本绑定不再接受推送
-    Poisoned = 13,
+    /// 本机没有可用硬件编码器：未探测到硬编，或候选后端全部建成失败
+    EncoderUnavailable = 1,
+    /// 编码管线不可用：Actor 控制通道已关闭，或应答通道随 Actor 线程消失
+    ActorDead = 2,
+    /// 控制面未受理或未应答：队列已满或 ACK 超时，命令可能已经执行
+    ControlBusy = 3,
+    /// 显存直通故障：导入整批回滚、注销保留导入引用，或槽位协议违例
+    VramFault = 4,
+    /// 显存绑定已失效：句柄不属于当前引擎，或绑定已被换档/注销摘除
+    StaleBinding = 5,
+    /// 显存绑定已毒化：提交等待超时，在途 GPU 工作可能仍在读槽位纹理，拒绝后续推送
+    Poisoned = 6,
+}
+
+/// 重定档失败：拒绝是 Actor 的业务回答，其余是控制面投递故障。
+///
+/// `Rejected` 只存在于这条 ask 上，不进入跨 JNI 的 [`ControlStatus`]——线协议表
+/// 里出现一个 Java 永远收不到的码，等于给两端同步再加一处必须维护的死值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetierError {
+    /// Actor 拒绝这次重定档，旧档位继续生效
+    Rejected,
+    /// 控制通道已关闭：Actor 线程不在
+    ActorDead,
+    /// 命令未送达或 ACK 超时；命令可能已经执行
+    ControlBusy,
 }
 
 /// 控制命令
@@ -79,7 +78,7 @@ pub(crate) enum ControlCommand {
     /// 按定档请求重定档位，回送实际生效的档位或拒绝原因
     Retier {
         request: TierRequest,
-        reply: tokio::sync::oneshot::Sender<Result<StreamingProfile, ControlStatus>>,
+        reply: tokio::sync::oneshot::Sender<Result<StreamingProfile, RetierError>>,
     },
     /// 协商落账：按定档请求与协商定死的 codec/后端偏好配好编码器，回送实际生效的
     /// 档位、codec 与后端身份（硬编建败回退软编如实上报）
@@ -158,20 +157,22 @@ impl ControlSender {
     /// 请求重定档位（ask）
     ///
     /// `Ok` 是 Actor **实际生效**的档位：调用方提交 Actor 说的准，而不是
-    /// 「成功就假定请求生效、失败就回读旧值」这套两阶段推断。`Err(ReconfigureFailed)`
-    /// 表示 Actor 拒绝了这次重定档、维持原档位；其余错误码表示命令没送达或应答超时，
-    /// 调用方同样维持已知档位。
+    /// 「成功就假定请求生效、失败就回读旧值」这套两阶段推断。任何 `Err` 都表示
+    /// 本次请求未生效、调用方维持已知档位；拒绝与控制面故障的区分见 [`RetierError`]。
     pub(crate) async fn retier(
         &self,
         request: TierRequest,
-    ) -> Result<StreamingProfile, ControlStatus> {
+    ) -> Result<StreamingProfile, RetierError> {
         let (reply, wait) = tokio::sync::oneshot::channel();
         self.send(ControlCommand::Retier { request, reply })
-            .map_err(Self::send_error)?;
+            .map_err(|e| match e {
+                TrySendError::Full(_) => RetierError::ControlBusy,
+                TrySendError::Closed(_) => RetierError::ActorDead,
+            })?;
         match tokio::time::timeout(self.ack_timeout, wait).await {
             Ok(Ok(outcome)) => outcome,
-            Ok(Err(_)) => Err(ControlStatus::ActorDead),
-            Err(_) => Err(ControlStatus::AckTimeout),
+            Ok(Err(_)) => Err(RetierError::ActorDead),
+            Err(_) => Err(RetierError::ControlBusy),
         }
     }
 
@@ -197,7 +198,7 @@ impl ControlSender {
             Ok(Ok(outcome)) => outcome,
             // 应答通道随 Actor 线程一起消失
             Ok(Err(_)) => Err(ControlStatus::ActorDead),
-            Err(_) => Err(ControlStatus::AckTimeout),
+            Err(_) => Err(ControlStatus::ControlBusy),
         }
     }
 
@@ -206,7 +207,7 @@ impl ControlSender {
     /// 由 Actor 在专用线程完成驱动导入并激活硬件直通。同步等待：调用方在渲染线程上，不能 `.await`，而应答必须能按时放弃 —— 所以走
     /// `std::sync::mpsc`（`oneshot::blocking_recv` 没有超时版本）。
     /// 投递同样非阻塞：队列满说明 Actor 已卡住不消费，此刻阻塞投递会连渲染线程
-    /// 一起拖死，直接回 [`ControlStatus::QueueFull`] 让调用方走各自的降级分支。
+    /// 一起拖死，直接回 [`ControlStatus::ControlBusy`] 让调用方走各自的降级分支。
     ///
     /// 成功返回绑定句柄：句柄是后续 push / poll / clear 的唯一准入凭证。
     pub(crate) fn import_vram_slots(
@@ -238,7 +239,7 @@ impl ControlSender {
 
     fn send_error(e: TrySendError<ControlCommand>) -> ControlStatus {
         match e {
-            TrySendError::Full(_) => ControlStatus::QueueFull,
+            TrySendError::Full(_) => ControlStatus::ControlBusy,
             TrySendError::Closed(_) => ControlStatus::ActorDead,
         }
     }
@@ -253,7 +254,7 @@ impl ControlSender {
         match wait.recv_timeout(self.ack_timeout) {
             Ok(value) => Ok(value),
             Err(RecvTimeoutError::Disconnected) => Err(ControlStatus::ActorDead),
-            Err(RecvTimeoutError::Timeout) => Err(ControlStatus::AckTimeout),
+            Err(RecvTimeoutError::Timeout) => Err(ControlStatus::ControlBusy),
         }
     }
 
@@ -384,7 +385,7 @@ mod tests {
         let bell = Arc::new(Notify::new());
         let sender = ControlSender::new(tx, bell);
         let start = Instant::now();
-        assert_eq!(sender.clear_vram_slots(1), Err(ControlStatus::QueueFull));
+        assert_eq!(sender.clear_vram_slots(1), Err(ControlStatus::ControlBusy));
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "队列满必须立即返回，不得阻塞调用方"
@@ -418,7 +419,7 @@ mod tests {
         })
         .with_ack_timeout(Duration::from_millis(50));
         let start = Instant::now();
-        assert_eq!(sender.clear_vram_slots(1), Err(ControlStatus::AckTimeout));
+        assert_eq!(sender.clear_vram_slots(1), Err(ControlStatus::ControlBusy));
         assert!(start.elapsed() < Duration::from_secs(1), "超时必须按时返回");
         drop(held);
     }
@@ -507,7 +508,7 @@ mod tests {
         std::thread::spawn(move || {
             while let Some(cmd) = rx.blocking_recv() {
                 if let ControlCommand::Retier { reply, .. } = cmd {
-                    let _ = reply.send(Err(ControlStatus::ReconfigureFailed));
+                    let _ = reply.send(Err(RetierError::Rejected));
                 }
             }
         });
@@ -521,6 +522,6 @@ mod tests {
             })
             .await
             .expect_err("拒绝必须原样上报，不得折成「维持原档位」让调用方自己推断");
-        assert_eq!(err, ControlStatus::ReconfigureFailed);
+        assert_eq!(err, RetierError::Rejected);
     }
 }

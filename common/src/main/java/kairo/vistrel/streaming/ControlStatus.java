@@ -5,22 +5,40 @@ package kairo.vistrel.streaming;
  *
  * <p>数值与 Rust {@code encode::control::ControlStatus} 一一对应；JNI 边界只传 {@code int}。
  * 契约变更必须两端同步，版本见 {@code kairo.vistrel.streaming.natives.NativeWireContract}。
+ *
+ * <p>每个码只表达一种调用方需要区分的恢复类别。{@link #description()} 是给日志与异常
+ * 消息的简短原因，不参与判断；同一类别内的具体成因（哪条槽位协议被违例、导入为何回滚）
+ * 由 Native 在产生点记录，不占用独立码位。
  */
 public enum ControlStatus {
+    /**
+     * 命令已执行
+     */
     OK(0, "成功"),
-    MALFORMED_BATCH(1, "槽位批量协议错位 (数组长度不是每槽位 long 数的整数倍)"),
-    NO_HARDWARE_ENCODER(2, "本机无可用硬件编码器"),
-    IMPORT_FAILED(3, "外部显存或时间线信号量导入失败 (整批已回滚)"),
-    PIPELINE_DEAD(4, "编码管线已死 (fail-closed)"),
-    ACK_TIMEOUT(5, "Actor ACK 超时"),
-    RECONFIGURE_FAILED(6, "档位重配被编码线程拒绝 (编码器重配失败，档位保持不变)"),
-    QUEUE_FULL(7, "控制队列已满 (编码线程已卡住不消费)"),
-    RELEASE_FAILED(8, "注销前排空失败 (导入引用与槽位表已保留)"),
-    ENCODER_BUILD_FAILED(9, "编码器建成失败 (候选后端全部创建失败，详见日志)"),
-    STALE_BINDING(10, "显存绑定句柄已失效 (不属于当前引擎或已被换档/注销摘除)"),
-    SLOT_NOT_FREE(11, "槽位已在途或未导入 (重复推送同一槽位)"),
-    WRONG_THREAD(12, "推送线程不是导入时的渲染线程"),
-    POISONED(13, "编码器等待超时毒化 (在途提交可能仍在读槽位纹理，绑定不再接受推送)");
+    /**
+     * 本机没有可用硬件编码器：未探测到硬编，或候选后端全部建成失败
+     */
+    ENCODER_UNAVAILABLE(1, "无可用硬件编码器"),
+    /**
+     * 编码管线不可用：Actor 控制通道已关闭，或应答无法解析
+     */
+    PIPELINE_DEAD(2, "编码管线不可用"),
+    /**
+     * 控制面未受理或未应答：队列已满或 ACK 超时，命令可能已经执行
+     */
+    CONTROL_BUSY(3, "控制面未受理或未应答"),
+    /**
+     * 显存直通故障：导入整批回滚、注销保留导入引用，或槽位协议违例
+     */
+    VRAM_FAULT(4, "显存直通故障"),
+    /**
+     * 显存绑定已失效：句柄不属于当前引擎，或绑定已被换档/注销摘除
+     */
+    STALE_BINDING(5, "显存绑定已失效"),
+    /**
+     * 显存绑定已毒化：提交等待超时，在途 GPU 工作可能仍在读槽位纹理，拒绝后续推送
+     */
+    POISONED(6, "显存绑定已毒化");
     private final int code;
     private final String description;
 
@@ -39,9 +57,9 @@ public enum ControlStatus {
     }
 
     /**
-     * 可读原因
+     * 简短原因
      *
-     * @return 面向日志 / 异常消息的中文描述
+     * @return 面向日志与异常消息的描述
      */
     public String description() {
         return description;
@@ -63,7 +81,7 @@ public enum ControlStatus {
     }
 
     /**
-     * 数值转可读原因，表外数值原样展示
+     * 数值转简短原因，表外数值原样展示
      *
      * @param code Native 返回的判别值
      * @return 枚举描述或 {@code 未知错误码 <n>}

@@ -11,7 +11,7 @@ use arc_swap::ArcSwapOption;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Receiver;
 
-use crate::encode::control::{ControlCommand, ControlStatus};
+use crate::encode::control::{ControlCommand, ControlStatus, RetierError};
 use crate::encode::frame::{FrameInbox, FrameOutbox, FrameOutcome, VideoFrame};
 use crate::encode::hardware::VramSlotDescriptor;
 use crate::encode::hardware::slots::{MAX_VRAM_SLOTS, VramBinding};
@@ -237,7 +237,7 @@ impl EncoderActor {
                 self.rejecting_frames = false;
                 let outcome = if code == ControlStatus::Ok {
                     self.current_binding_handle()
-                        .ok_or(ControlStatus::ImportFailed)
+                        .ok_or(ControlStatus::VramFault)
                 } else {
                     Err(code)
                 };
@@ -326,7 +326,7 @@ impl EncoderActor {
         self.binding.load().as_ref().map(|binding| binding.handle())
     }
 
-    /// 注销显存槽位；排空失败时保留导入引用并回 `ReleaseFailed`——`Ok` 才是游戏侧
+    /// 注销显存槽位；排空失败时保留导入引用并回 `VramFault`——`Ok` 才是游戏侧
     /// 销毁导出纹理/信号量的唯一依据。没有编码器则没有导入引用，无需排空。
     fn clear_vram_slots(&mut self, handle: u64) -> ControlStatus {
         if self.current_binding_handle() != Some(handle) {
@@ -344,7 +344,7 @@ impl EncoderActor {
             // 排空失败即上下文不可信：后端整体弃置（mem::forget 永不析构）
             std::mem::forget(encoder);
             log::error!("槽位注销前排空失败，后端弃置，保留导入引用: {e}");
-            return ControlStatus::ReleaseFailed;
+            return ControlStatus::VramFault;
         }
         self.stage.set(EncodeStage::ClearSlots);
         // 排空成功：先摘绑定并清空在途帧，再释放导入
@@ -361,19 +361,20 @@ impl EncoderActor {
         owner: ThreadId,
         mut slots: Vec<VramSlotDescriptor>,
     ) -> ControlStatus {
-        if slots
+        if let Some(bad) = slots
             .iter()
-            .any(|descriptor| descriptor.slot_idx as usize >= MAX_VRAM_SLOTS)
+            .find(|descriptor| descriptor.slot_idx as usize >= MAX_VRAM_SLOTS)
         {
+            log::error!("显存槽位索引越界: {} >= {}", bad.slot_idx, MAX_VRAM_SLOTS);
             // 未进入导入：描述符 Drop 关闭原始句柄
-            return ControlStatus::MalformedBatch;
+            return ControlStatus::VramFault;
         }
         if !self.encoder.as_ref().is_some_and(|e| e.is_hardware()) {
             log::error!("硬件编码不可用");
-            return ControlStatus::NoHardwareEncoder;
+            return ControlStatus::EncoderUnavailable;
         }
         let Some(mut encoder) = self.encoder.take() else {
-            return ControlStatus::NoHardwareEncoder;
+            return ControlStatus::EncoderUnavailable;
         };
         // 换表全清前置 drain
         self.stage.set(EncodeStage::Drain);
@@ -381,7 +382,7 @@ impl EncoderActor {
             // 排空失败即上下文不可信：后端整体弃置（mem::forget 永不析构）
             std::mem::forget(encoder);
             log::error!("槽位导入前排空失败，后端弃置，整批拒绝: {e}");
-            return ControlStatus::NoHardwareEncoder;
+            return ControlStatus::EncoderUnavailable;
         }
         self.stage.set(EncodeStage::ImportSlots);
         match encoder.import_vram_slots(&mut slots) {
@@ -401,7 +402,7 @@ impl EncoderActor {
                 // 后端整批回滚，旧表与旧绑定保持有效
                 log::error!("显存直通槽位注册失败: {}", e);
                 self.encoder = Some(encoder);
-                ControlStatus::ImportFailed
+                ControlStatus::VramFault
             }
         }
     }
@@ -463,7 +464,7 @@ impl EncoderActor {
 
         // 候选依次尝试：探测清单本来就是「这台机器认证可用」的集合，跳过其中可用项
         // 直接报错等于浪费探测结果；全部失败才是真正的建成失败
-        let mut last_error = ControlStatus::EncoderBuildFailed;
+        let mut last_error = ControlStatus::EncoderUnavailable;
         for candidate in candidates {
             let (candidate_request, candidate_codec) = Self::clamp_for(candidate, request, codec);
             let code = self.rebuild_encoder(candidate_request, candidate_codec, candidate);
@@ -570,10 +571,9 @@ impl EncoderActor {
         };
 
         if !built {
-            // 建成失败与「重配被拒」是两回事：后者档位没变、编码器仍在，前者意味着
-            // 此刻没有可用的编码器。分开上报才能让调用方区分「继续用旧档」与「真正故障」
+            // 建成失败意味着此刻没有可用编码器；重配被拒由 retier 的局部错误表达，旧档位仍在
             log::error!("编码器建立失败，档位维持 {:?}", self.profile);
-            return ControlStatus::EncoderBuildFailed;
+            return ControlStatus::EncoderUnavailable;
         }
 
         self.profile = profile;
@@ -617,7 +617,7 @@ impl EncoderActor {
     }
 
     /// 应用定档请求，返回**实际生效**的档位或拒绝原因（codec 是会话常量，本命令不改写）
-    fn retier(&mut self, request: TierRequest) -> Result<StreamingProfile, ControlStatus> {
+    fn retier(&mut self, request: TierRequest) -> Result<StreamingProfile, RetierError> {
         // 软编在跑：请求几何先顶格 min(Content, 1080p)@60，生效值如实反映钳制
         let request = if self.encoder.as_ref().is_some_and(|e| !e.is_hardware()) {
             Self::software_ceiling_request(request)
@@ -648,7 +648,7 @@ impl EncoderActor {
             Ok(blocks) => blocks,
             Err(e) => {
                 log::error!("档位变更失败，维持原档位 {:?}: {}", self.profile, e);
-                return Err(ControlStatus::ReconfigureFailed);
+                return Err(RetierError::Rejected);
             }
         };
         self.attach(fresh_blocks);
@@ -991,7 +991,7 @@ mod tests {
                 VideoCodec::H264,
                 Some(EncodeBackendKind::Nvenc)
             ),
-            Err(ControlStatus::EncoderBuildFailed),
+            Err(ControlStatus::EncoderUnavailable),
             "指定硬编建不起来时必须显式失败"
         );
         assert!(
@@ -1329,7 +1329,7 @@ mod tests {
     fn switch_profile(
         actor: &mut EncoderActor,
         request: TierRequest,
-    ) -> Result<StreamingProfile, ControlStatus> {
+    ) -> Result<StreamingProfile, RetierError> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         assert!(actor.apply(ControlCommand::Retier { request, reply }));
         wait_reply(rx)
@@ -1791,7 +1791,7 @@ mod tests {
 
         assert_eq!(
             import_slots(&mut actor, 0),
-            ControlStatus::NoHardwareEncoder,
+            ControlStatus::EncoderUnavailable,
             "排空失败弃置后端：整批拒绝且如实上报无编码器可跑"
         );
         assert!(!actor.rejecting_frames);
@@ -1812,7 +1812,7 @@ mod tests {
         // 此后的导入一律失败：硬件前置检查在没有编码器时必然不过
         assert_eq!(
             import_slots(&mut actor, 0),
-            ControlStatus::NoHardwareEncoder
+            ControlStatus::EncoderUnavailable
         );
     }
 
@@ -1933,7 +1933,7 @@ mod tests {
         }));
         assert_eq!(
             wait_import_reply(rx),
-            ControlStatus::MalformedBatch,
+            ControlStatus::VramFault,
             "越界槽位索引必须整批拒绝"
         );
         assert!(actor.binding.load().is_none(), "拒绝的导入不得安装绑定");

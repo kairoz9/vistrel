@@ -62,13 +62,11 @@ pub struct EncodePreferences {
     pub codec: Option<VideoCodec>,
 }
 
-/// 控制面失败到失败信封的映射：无硬编 / 建成失败 / 重配拒绝是永久拒绝，其余按瞬时处理
+/// 控制面失败到失败信封的映射：编码器不可用与显存直通故障是永久拒绝，其余按瞬时处理
 fn reply_from_control(status: ControlStatus) -> Reply {
     match status {
-        ControlStatus::NoHardwareEncoder => Reply::fatal("本机无可用硬件编码器"),
-        ControlStatus::EncoderBuildFailed => Reply::fatal("硬件编码器建成失败"),
-        ControlStatus::ReconfigureFailed => Reply::fatal("编码器拒绝重配"),
-        ControlStatus::MalformedBatch => Reply::fatal("控制命令协议错位"),
+        ControlStatus::EncoderUnavailable => Reply::fatal("本机无可用硬件编码器"),
+        ControlStatus::VramFault => Reply::fatal("显存直通故障"),
         other => Reply::retry(format!("编码器未能在会话建立前就绪: {other:?}")),
     }
 }
@@ -443,6 +441,7 @@ fn resolve_codec(
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use crate::encode::control::RetierError;
     use crate::encode::control::{ControlCommand, ControlSender, ControlStatus};
     use crate::encode::encoder::EncodeBackendKind;
     use crate::encode::frame::FrameInbox;
@@ -464,7 +463,7 @@ pub(crate) mod test_support {
     /// `handle_offer` 要等 `PrepareEncoder` 的 ACK，没有应答者就会走满 5s 超时，
     /// 所有会话用例都会退化成超时失败。假线程只回 `Ok`、不碰编码器，同时把收到的命令
     /// 转发出来供断言——真正的编码行为由 `encode/actor.rs` 的用例覆盖。
-    /// `reject_change` 让档位重配一律被拒（回传 `ReconfigureFailed`），供拒绝路径用例。
+    /// `reject_change` 让档位重配一律被拒（回传 `RetierError::Rejected`），供拒绝路径用例。
     pub(crate) fn make_test_engine(
         reject_change: bool,
     ) -> (Arc<StreamingEngine>, std::sync::mpsc::Receiver<Rec>) {
@@ -477,7 +476,7 @@ pub(crate) mod test_support {
                     // 数据型应答要回生效值，结果码回答不了「现在跑的是什么」
                     ControlCommand::Retier { request, reply } => {
                         let _ = if reject_change {
-                            reply.send(Err(ControlStatus::ReconfigureFailed))
+                            reply.send(Err(RetierError::Rejected))
                         } else {
                             // 假 Actor 无会话常量可依：派生 codec 占位取 H264，
                             // 断言只看几何；真实行为由 encode/actor.rs 的用例覆盖

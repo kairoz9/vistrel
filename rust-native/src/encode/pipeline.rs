@@ -250,14 +250,20 @@ impl VideoPipeline {
             return ControlStatus::StaleBinding;
         }
         if binding.owner() != std::thread::current().id() {
-            return ControlStatus::WrongThread;
+            log::error!(
+                "显存槽位推送线程不是导入线程: owner={:?}, current={:?}",
+                binding.owner(),
+                std::thread::current().id()
+            );
+            return ControlStatus::VramFault;
         }
         if binding.is_poisoned() {
             return ControlStatus::Poisoned;
         }
         // 先置位再入箱：编码极快时 ack 不能清掉尚未置的位
         let Some(owned) = binding.try_acquire(slot) else {
-            return ControlStatus::SlotNotFree;
+            log::error!("显存槽位 {slot} 仍在途或未导入，拒绝重复推送");
+            return ControlStatus::VramFault;
         };
         self.inbox.push(VideoFrame {
             birth_nanos,

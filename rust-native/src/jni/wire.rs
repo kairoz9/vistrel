@@ -36,7 +36,7 @@ mod tests {
     #[test]
     fn test_push_status_is_code_plus_one() {
         assert_eq!(pack_status(ControlStatus::Ok), 1);
-        assert_eq!(pack_status(ControlStatus::Poisoned), 14);
+        assert_eq!(pack_status(ControlStatus::Poisoned), 7);
     }
 
     /// 固定金标准锁住位布局：状态高字节、心跳 32 位、在途掩码低 8 位
@@ -55,7 +55,7 @@ mod tests {
     /// 各字段按宽度截断，保留区保持为零
     #[test]
     fn test_packed_slot_state_masks_fields() {
-        let packed = pack_slot_state(ControlStatus::SlotNotFree, u64::MAX, u64::MAX);
+        let packed = pack_slot_state(ControlStatus::VramFault, u64::MAX, u64::MAX);
         assert_eq!(packed & IN_FLIGHT_MASK, IN_FLIGHT_MASK);
         assert_eq!((packed >> HEARTBEAT_SHIFT) & HEARTBEAT_MASK, HEARTBEAT_MASK);
         assert_eq!((packed >> 40) & 0xFFFF, 0, "保留区必须为零");

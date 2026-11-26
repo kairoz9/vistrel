@@ -25,7 +25,7 @@ final class NativeWireContract {
     /**
      * 数据面协议版本。当前不做运行时握手；该值仅用于日志/诊断与后续演进占位。
      */
-    public static final int PROTOCOL_VERSION = 4;
+    public static final int PROTOCOL_VERSION = 5;
     /**
      * 显存槽位扁平协议每槽位的 long 数。
      */

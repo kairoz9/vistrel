@@ -37,8 +37,8 @@ class NativeVramBindingTest {
         Assertions.assertEquals(0b101L, NativeVramBinding.inFlightOf(packed));
         Assertions.assertEquals(42L, NativeVramBinding.heartbeatOf(packed));
 
-        long error = reply(ControlStatus.SLOT_NOT_FREE, 0, 0);
-        Assertions.assertEquals(ControlStatus.SLOT_NOT_FREE, NativeVramBinding.statusOf(error));
+        long error = reply(ControlStatus.VRAM_FAULT, 0, 0);
+        Assertions.assertEquals(ControlStatus.VRAM_FAULT, NativeVramBinding.statusOf(error));
 
         long poisoned = reply(ControlStatus.POISONED, 0, 0);
         Assertions.assertEquals(ControlStatus.POISONED, NativeVramBinding.statusOf(poisoned));

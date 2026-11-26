@@ -13,37 +13,30 @@ public class ControlCodeTableTest {
     @Test
     void testCodesMatchRustControlErrorDiscriminants() {
         Assertions.assertEquals(0, ControlStatus.OK.code());
-        Assertions.assertEquals(1, ControlStatus.MALFORMED_BATCH.code());
-        Assertions.assertEquals(2, ControlStatus.NO_HARDWARE_ENCODER.code());
-        Assertions.assertEquals(3, ControlStatus.IMPORT_FAILED.code());
-        Assertions.assertEquals(4, ControlStatus.PIPELINE_DEAD.code());
-        Assertions.assertEquals(5, ControlStatus.ACK_TIMEOUT.code());
-        Assertions.assertEquals(6, ControlStatus.RECONFIGURE_FAILED.code());
-        Assertions.assertEquals(7, ControlStatus.QUEUE_FULL.code());
-        Assertions.assertEquals(8, ControlStatus.RELEASE_FAILED.code());
-        Assertions.assertEquals(9, ControlStatus.ENCODER_BUILD_FAILED.code());
-        Assertions.assertEquals(10, ControlStatus.STALE_BINDING.code());
-        Assertions.assertEquals(11, ControlStatus.SLOT_NOT_FREE.code());
-        Assertions.assertEquals(12, ControlStatus.WRONG_THREAD.code());
-        Assertions.assertEquals(13, ControlStatus.POISONED.code());
+        Assertions.assertEquals(1, ControlStatus.ENCODER_UNAVAILABLE.code());
+        Assertions.assertEquals(2, ControlStatus.PIPELINE_DEAD.code());
+        Assertions.assertEquals(3, ControlStatus.CONTROL_BUSY.code());
+        Assertions.assertEquals(4, ControlStatus.VRAM_FAULT.code());
+        Assertions.assertEquals(5, ControlStatus.STALE_BINDING.code());
+        Assertions.assertEquals(6, ControlStatus.POISONED.code());
     }
 
     /**
-     * 0..13 每个码都要有人话，不能落进 default 的「未知错误码」
+     * 0..6 每个码都要有人话，不能落进 default 的「未知错误码」
      */
     @Test
     void testEveryKnownCodeHasAReason() {
-        for (int code = 0; code <= 13; code++) {
+        for (int code = 0; code <= 6; code++) {
             Assertions.assertNotNull(ControlStatus.fromCode(code), "码 " + code + " 缺少枚举");
             Assertions.assertFalse(ControlStatus.describe(code).startsWith("未知错误码"), "码 " + code + " 缺少可读原因");
         }
         Assertions.assertNotEquals(
-                ControlStatus.describe(ControlStatus.ACK_TIMEOUT.code()),
-                ControlStatus.describe(ControlStatus.RECONFIGURE_FAILED.code()),
-                "档位重配失败必须与 ACK 超时区分开"
+                ControlStatus.describe(ControlStatus.ENCODER_UNAVAILABLE.code()),
+                ControlStatus.describe(ControlStatus.PIPELINE_DEAD.code()),
+                "编码器不可用与管线已死必须区分：前者是永久拒绝，后者可重连协商"
         );
-        Assertions.assertTrue(ControlStatus.describe(14).startsWith("未知错误码"), "表外的码才允许落进未知");
-        Assertions.assertNull(ControlStatus.fromCode(14), "表外的码不映射到枚举");
+        Assertions.assertTrue(ControlStatus.describe(7).startsWith("未知错误码"), "表外的码才允许落进未知");
+        Assertions.assertNull(ControlStatus.fromCode(7), "表外的码不映射到枚举");
     }
 
     /**
@@ -54,13 +47,13 @@ public class ControlCodeTableTest {
         Assertions.assertTrue(new EncoderChannel.ControlException("dead", ControlStatus.PIPELINE_DEAD)
             .encoderUnavailable()
         );
-        Assertions.assertTrue(new EncoderChannel.ControlException("no hw", ControlStatus.NO_HARDWARE_ENCODER)
+        Assertions.assertTrue(new EncoderChannel.ControlException("unavailable", ControlStatus.ENCODER_UNAVAILABLE)
             .encoderUnavailable()
         );
-        Assertions.assertTrue(new EncoderChannel.ControlException("build", ControlStatus.ENCODER_BUILD_FAILED)
+        Assertions.assertFalse(new EncoderChannel.ControlException("busy", ControlStatus.CONTROL_BUSY)
             .encoderUnavailable()
         );
-        Assertions.assertFalse(new EncoderChannel.ControlException("ack", ControlStatus.ACK_TIMEOUT)
+        Assertions.assertFalse(new EncoderChannel.ControlException("vram", ControlStatus.VRAM_FAULT)
             .encoderUnavailable()
         );
     }
