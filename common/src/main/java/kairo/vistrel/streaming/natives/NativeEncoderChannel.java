@@ -6,6 +6,7 @@ import kairo.vistrel.streaming.EncoderCaps;
 import kairo.vistrel.streaming.EncoderChannel;
 import kairo.vistrel.streaming.NativeResult;
 import kairo.vistrel.streaming.VramBinding;
+import com.google.gson.JsonObject;
 import java.nio.ByteBuffer;
 import java.util.List;
 
@@ -92,41 +93,36 @@ public final class NativeEncoderChannel implements EncoderChannel, InputEventSou
         if (slots == null || slots.isEmpty()) {
             throw new IllegalArgumentException("显存槽位描述不能为空");
         }
-        if (slots.size() > NativeWireContract.SLOT_STATE_SLOTS) {
+        if (slots.size() > NativeWireContract.MAX_VRAM_SLOTS) {
             throw new IllegalArgumentException(
-                    "显存槽位数量超过共享块容量: " + slots.size() + " > " + NativeWireContract.SLOT_STATE_SLOTS
+                    "显存槽位数量超过掩码容量: " + slots.size() + " > " + NativeWireContract.MAX_VRAM_SLOTS
             );
         }
-        // 先取块再导入：块无效时在导入前失败，不会留下需要回滚的 Native 槽位表。
-        // 绑定轮次也取自同一块；导入期间编码器重建时 Native 回 StaleBinding，重读一次再试
+        // 导入与句柄由 Native 一次给出；失败即整条显存管线失败，原始句柄已被 Native 消费。
         long[] flat = encodeSlots(slots);
-        for (int attempt = 0; ; attempt++) {
-            ByteBuffer stateBlock = NativeBridge.slotStateBlock();
-            if (stateBlock == null
-                    || !stateBlock.isDirect()
-                    || stateBlock.capacity() < NativeWireContract.SLOT_STATE_BLOCK_BYTES) {
-                throw new IllegalStateException("Native 未提供有效的槽位所有权块，显存直通不可用");
-            }
-            SlotStateBlock blockView = new SlotStateBlock(stateBlock, slots.size());
-            long bindingEpoch = blockView.bindingEpoch();
-            NativeResult result = NativeResult.parse(NativeBridge.importVramSlots(bindingEpoch, flat));
-            if (!result.ok()) {
-                throw new EncoderChannel.ControlException(
-                        result.message() != null ? result.message() : "显存槽位导入失败",
-                        ControlStatus.PIPELINE_DEAD
-                );
-            }
-            int code = result.data() != null && result.data().isJsonPrimitive()
-                    ? result.data().getAsInt()
-                    : ControlStatus.PIPELINE_DEAD.code();
-            if (code == ControlStatus.OK.code()) {
-                return new NativeVramBinding(blockView, bindingEpoch);
-            }
-            if (code == ControlStatus.STALE_BINDING.code() && attempt == 0) {
-                // 读取绑定轮次与导入之间编码器重建：重读当前轮次再导入一次
-                continue;
-            }
+        NativeResult result = NativeResult.parse(NativeBridge.importVramSlots(flat));
+        if (!result.ok() || result.data() == null || !result.data().isJsonObject()) {
+            throw new EncoderChannel.ControlException(
+                    result.message() != null ? result.message() : "显存槽位导入失败",
+                    ControlStatus.PIPELINE_DEAD
+            );
+        }
+        JsonObject data = result.data().getAsJsonObject();
+        if (!data.has("code") || !data.get("code").isJsonPrimitive()) {
+            throw new EncoderChannel.ControlException("显存槽位导入结果缺少结果码", ControlStatus.PIPELINE_DEAD);
+        }
+        int code = data.get("code").getAsInt();
+        if (code != ControlStatus.OK.code()) {
             throw new EncoderChannel.ControlException("NativeBridge.importVramSlots 失败", code);
         }
+        if (!data.has("handle") || !data.get("handle").isJsonPrimitive()) {
+            throw new EncoderChannel.ControlException("显存槽位导入结果缺少句柄", ControlStatus.PIPELINE_DEAD);
+        }
+        long handle = data.get("handle").getAsLong();
+        long importedMask = 0L;
+        for (VramSlotDescriptor slot : slots) {
+            importedMask |= 1L << slot.slotIdx();
+        }
+        return new NativeVramBinding(handle, importedMask);
     }
 }

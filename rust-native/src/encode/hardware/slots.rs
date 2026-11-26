@@ -1,9 +1,12 @@
 //! 显存直通槽位的跨平台公共类型：
 //! - 导入协议：7 元组描述符解析与句柄生命周期管理
 //! - `SlotTable<S>`：硬件编码后端共用的槽位事务容器
-//! - `SlotStateBlock`：游戏侧与编码 Actor 之间的槽位所有权共享块
+//! - `VramBinding` / `OwnedSlot`：槽位所有权与帧载荷凭据
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::cell::Cell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::ThreadId;
 
 // SAFETY: CloseHandle 要求传入有效内核句柄且不得重复关闭，
 // 本文件内的调用点均通过一次性 take 守卫保证句柄只关一次。
@@ -253,139 +256,144 @@ impl<S> SlotTable<S> {
     }
 }
 
-/// 共享块容纳的槽位上限：与游戏侧掩码容量同一条约定，改动必须两端同步
-pub(crate) const SLOT_STATE_SLOTS: usize = 8;
+/// 槽位掩码容量：与游戏侧 `NativeWireContract.MAX_VRAM_SLOTS` 同一条约定，
+/// 只限制掩码宽度，不代表实际导入的槽位数
+pub(crate) const MAX_VRAM_SLOTS: usize = 8;
 
-/// 编码 Actor 当前阻塞的阶段码，心跳冻结时由游戏侧读回定位卡点
-#[repr(u64)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ActorStage {
-    /// 主循环等待输入
-    Idle = 0,
-    /// 重配或重建编码器
-    Reconfigure = 1,
-    /// 排空编码器与 CUDA 上下文
-    Drain = 2,
-    /// 导入显存槽位
-    ImportSlots = 3,
-    /// 注销显存槽位
-    ClearSlots = 4,
-    /// 关停编码线程
-    Shutdown = 5,
-    /// 等待外部时间线信号量
-    WaitTimeline = 6,
-    /// 映射输入资源
-    MapInput = 7,
-    /// 提交编码
-    EncodeSubmit = 8,
-    /// 锁定码流
-    LockBitstream = 9,
-    /// 帧编码（软编与未细分阶段的后端）
-    EncodeFrame = 10,
+/// 进程级绑定句柄分配。句柄必须全局单调：每个引擎从 1 重新开始会让旧引擎的
+/// 句柄在新引擎上重新有效，旧绑定的帧就能推进新引擎的槽位表。
+static NEXT_BINDING_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+/// 一次显存绑定的全部所有权状态：Native 持有事实，Java 只持有 `handle`。
+///
+/// 换代即新建、不复用：旧代可能仍被在途帧的 [`OwnedSlot`] 持有，直到载荷析构才归还。
+pub(crate) struct VramBinding {
+    handle: u64,
+    /// 已导入槽位的位掩码：Java 只能使用这些索引
+    slot_mask: u64,
+    /// 在途位：push 置位、ack 清位
+    in_flight: AtomicU64,
+    /// 导入调用线程（渲染线程）；push 校验，clear 不校验（停机可能在其它线程）
+    owner: ThreadId,
+    /// 提交等待超时后置位：在途 GPU 工作可能仍在读槽位纹理，绑定不再接受推送
+    poisoned: AtomicBool,
 }
 
-/// 共享块字节数：游戏侧按此尺寸包装直接内存缓冲区，两端必须一致
-pub(crate) const SLOT_STATE_BLOCK_BYTES: usize = 64;
-
-/// 游戏侧渲染线程与编码 Actor 之间共享的槽位所有权块：
-/// 游戏侧认领槽位写 1，Actor 归还写 0（均为 CAS），心跳供游戏侧做停滞判定。
-/// 64 字节单缓存行（按 64 字节对齐），经直接内存缓冲区暴露给游戏侧，访问全部走 acquire/release。
-///
-/// 布局是跨语言约定（游戏侧按原生端序按偏移访问）：
-/// `[0..32) = busy[8]`、`[32..40) = heartbeat`、`[40..48) = stage`、
-/// `[48..56) = binding_epoch`、`[56..64) = 保留`。
-///
-/// 块随引擎实例创建并故意泄漏：卡死弃用的旧 Actor 只能写到自己那一代的块上，
-/// 碰不到新一代——跨代复用同一块的话，旧线程复活的心跳会让新一代的超时判定失效。
-#[repr(C, align(64))]
-pub(crate) struct SlotStateBlock {
-    /// 1 = 渲染线程已认领且尚未归还；0 = Actor 手中无该槽的帧
-    busy: [AtomicU32; SLOT_STATE_SLOTS],
-    /// Actor 每轮循环 +1；游戏侧在 push 时快照，判定挂 capture tick 侧
-    heartbeat: AtomicU64,
-    /// Actor 当前阻塞的阶段码：心跳冻结时游戏侧读回写进停滞日志
-    stage: AtomicU64,
-    /// 显存绑定轮次：重建编码器或槽位失效的重配时 +1。游戏侧导入/推送/注销
-    /// 都带上它，Native 据此拒绝旧绑定轮次的槽位操作
-    binding_epoch: AtomicU64,
-    /// 布局保留段：凑满单缓存行，游戏侧不得访问
-    _reserved: [u8; 8],
-}
-
-const _: () = assert!(std::mem::size_of::<SlotStateBlock>() == SLOT_STATE_BLOCK_BYTES);
-const _: () = assert!(std::mem::align_of::<SlotStateBlock>() == SLOT_STATE_BLOCK_BYTES);
-
-impl SlotStateBlock {
-    /// 分配并泄漏一块：泄漏是有界的（64 字节/引擎重建，30s 自愈冷却封顶），
-    /// 换来的是被弃线程的写永远与活代隔离
-    pub(crate) fn new_leaked() -> &'static Self {
-        let block = Box::new(Self {
-            busy: std::array::from_fn(|_| AtomicU32::new(0)),
-            heartbeat: AtomicU64::new(0),
-            stage: AtomicU64::new(ActorStage::Idle as u64),
-            binding_epoch: AtomicU64::new(0),
-            _reserved: [0; 8],
-        });
-        Box::leak(block)
+impl VramBinding {
+    /// 新建绑定并分配进程级唯一句柄
+    pub(crate) fn new(slot_mask: u64, owner: ThreadId) -> Self {
+        Self {
+            handle: NEXT_BINDING_HANDLE.fetch_add(1, Ordering::Relaxed),
+            slot_mask,
+            in_flight: AtomicU64::new(0),
+            owner,
+            poisoned: AtomicBool::new(false),
+        }
     }
 
-    /// 标记 Actor 进入某阶段：只在可能长时间阻塞的调用前后写
-    pub(crate) fn set_stage(&self, stage: ActorStage) {
-        self.stage.store(stage as u64, Ordering::Release);
+    /// 绑定句柄（导入时回送 Java）
+    pub(crate) fn handle(&self) -> u64 {
+        self.handle
     }
 
-    /// 归还槽位（编码完成或帧被丢弃）；越界与重复归还均无害
+    /// 导入时的渲染线程
+    pub(crate) fn owner(&self) -> ThreadId {
+        self.owner
+    }
+
+    /// 当前在途掩码（快照）
+    pub(crate) fn in_flight(&self) -> u64 {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// 是否因提交等待超时毒化
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// 毒化本绑定：在途提交可能仍在读槽位纹理，后续推送一律拒绝
+    pub(crate) fn mark_poisoned(&self) {
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    /// 置位一个空闲槽位并交出所有权；越界、未导入、已在途都返回 `None`
     ///
-    /// CAS 1→0：位是 1 才清零，过期或重复的归还自动无效。
-    /// 位属于共享块而非编码器：没有编码器（软编/未就绪）时也必须归还
-    pub(crate) fn mark_free(&self, slot_idx: u32) {
-        if let Some(cell) = self.busy.get(slot_idx as usize) {
-            let _ = cell.compare_exchange(1, 0, Ordering::Release, Ordering::Relaxed);
+    /// 先置位再入收件箱是硬性次序：反过来的话，编码极快时 ack 可能清掉尚未置的位。
+    pub(crate) fn try_acquire(self: &Arc<Self>, slot: u32) -> Option<OwnedSlot> {
+        let bit = 1u64.checked_shl(slot)?;
+        if self.slot_mask & bit == 0 {
+            return None;
         }
-    }
-
-    /// 换表全清。只允许在编码器 drain 成功之后调用：位承载「GPU 正在读这张纹理」，
-    /// 排空前的清零会让渲染线程复写仍被在途提交读取的显存
-    pub(crate) fn mark_all_free(&self) {
-        for cell in &self.busy {
-            cell.store(0, Ordering::Release);
+        if self.in_flight.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+            return None;
         }
+        Some(OwnedSlot {
+            binding: Arc::clone(self),
+            slot,
+            suppress: Cell::new(false),
+        })
     }
 
-    /// Actor 每轮循环开始时 +1：心跳冻结即编码线程停止迭代
-    pub(crate) fn heartbeat_bump(&self) {
-        self.heartbeat.fetch_add(1, Ordering::Release);
+    /// 归还在途位；重复或越界 ack 静默无效
+    pub(crate) fn ack(&self, slot: u32) {
+        let Some(bit) = 1u64.checked_shl(slot) else {
+            return;
+        };
+        self.in_flight.fetch_and(!bit, Ordering::AcqRel);
     }
 
-    /// 当前显存绑定轮次：导入、推送与注销的准入令牌
-    pub(crate) fn binding_epoch(&self) -> u64 {
-        self.binding_epoch.load(Ordering::Acquire)
-    }
-
-    /// 显存绑定轮次前移：旧轮次的槽位导入/推送/注销从此失效
-    pub(crate) fn bump_binding_epoch(&self) -> u64 {
-        self.binding_epoch.fetch_add(1, Ordering::AcqRel) + 1
-    }
-
-    /// 暴露给游戏侧的原始指针（由互操作层包装为直接内存缓冲区）
-    pub(crate) fn as_ptr(&self) -> *const u8 {
-        self as *const Self as *const u8
+    /// 测试专用：按槽位数构造独立绑定
+    #[cfg(test)]
+    pub(crate) fn new_for_test(slot_count: u32) -> Arc<Self> {
+        let mask = (1u64 << slot_count) - 1;
+        Arc::new(Self::new(mask, std::thread::current().id()))
     }
 
     #[cfg(test)]
-    pub(crate) fn is_busy(&self, slot_idx: usize) -> bool {
-        self.busy[slot_idx].load(Ordering::Acquire) != 0
+    pub(crate) fn is_in_flight(&self, slot: u32) -> bool {
+        (self.in_flight() >> slot) & 1 == 1
+    }
+}
+
+/// 一次已移交槽位的所有权：Drop 即归还（ack）。命名沿用 `OwnedFd` 的约定——持有即
+/// 承担归还义务；毒化路径置位 `suppress` 后 Drop 不再归还。
+pub(crate) struct OwnedSlot {
+    binding: Arc<VramBinding>,
+    slot: u32,
+    suppress: Cell<bool>,
+}
+
+impl std::fmt::Debug for OwnedSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedSlot")
+            .field("slot", &self.slot)
+            .finish()
+    }
+}
+
+impl OwnedSlot {
+    /// 槽位索引
+    pub(crate) fn slot(&self) -> u32 {
+        self.slot
     }
 
-    /// 测试用：模拟渲染线程的在途认领（生产中位只由游戏侧 CAS 置 1）
-    #[cfg(test)]
-    pub(crate) fn set_busy(&self, slot_idx: usize) {
-        self.busy[slot_idx].store(1, Ordering::Release);
+    /// 认领所属的绑定句柄：消费端据此判定帧是否仍属于当前代
+    pub(crate) fn binding_handle(&self) -> u64 {
+        self.binding.handle()
     }
 
-    #[cfg(test)]
-    fn heartbeat(&self) -> u64 {
-        self.heartbeat.load(Ordering::Acquire)
+    /// 毒化路径：抑制归还并让整个绑定停止接收推送
+    pub(crate) fn poison(&self) {
+        self.suppress.set(true);
+        self.binding.mark_poisoned();
+    }
+}
+
+impl Drop for OwnedSlot {
+    fn drop(&mut self) {
+        if !self.suppress.get() {
+            self.binding.ack(self.slot);
+        }
     }
 }
 
@@ -499,72 +507,78 @@ mod tests {
     }
 
     #[test]
-    fn test_block_layout_is_cross_language_contract() {
-        assert_eq!(
-            std::mem::size_of::<SlotStateBlock>(),
-            SLOT_STATE_BLOCK_BYTES
-        );
-        assert_eq!(std::mem::size_of::<SlotStateBlock>(), 64);
-        assert_eq!(std::mem::offset_of!(SlotStateBlock, heartbeat), 32);
-        assert_eq!(std::mem::offset_of!(SlotStateBlock, stage), 40);
+    fn test_acquire_and_ack_round_trip() {
+        let binding = VramBinding::new_for_test(3);
+        let slot = binding.try_acquire(1).expect("首选槽位空闲");
+        assert_eq!(slot.slot(), 1);
+        assert!(binding.is_in_flight(1));
+        drop(slot);
+        assert!(!binding.is_in_flight(1), "Drop 必须归还");
+
+        let again = binding.try_acquire(1).expect("归还后可再取");
+        assert_eq!(again.slot(), 1);
     }
 
-    /// 阶段码是跨语言约定：判别值被 Java 侧按下标取名，改动必须两端同步
     #[test]
-    fn test_stage_codes_are_cross_language_contract() {
-        let block = SlotStateBlock::new_leaked();
-        block.set_stage(ActorStage::LockBitstream);
-        assert_eq!(
-            block.stage.load(Ordering::Acquire),
-            ActorStage::LockBitstream as u64
-        );
-        assert_eq!(ActorStage::Idle as u64, 0);
-        assert_eq!(ActorStage::Reconfigure as u64, 1);
-        assert_eq!(ActorStage::Drain as u64, 2);
-        assert_eq!(ActorStage::ImportSlots as u64, 3);
-        assert_eq!(ActorStage::ClearSlots as u64, 4);
-        assert_eq!(ActorStage::Shutdown as u64, 5);
-        assert_eq!(ActorStage::WaitTimeline as u64, 6);
-        assert_eq!(ActorStage::MapInput as u64, 7);
-        assert_eq!(ActorStage::EncodeSubmit as u64, 8);
-        assert_eq!(ActorStage::LockBitstream as u64, 9);
-        assert_eq!(ActorStage::EncodeFrame as u64, 10);
+    fn test_double_acquire_is_rejected_without_touching_owner() {
+        let binding = VramBinding::new_for_test(3);
+        let first = binding.try_acquire(0).expect("首次认领");
+        assert!(binding.try_acquire(0).is_none(), "同槽重复认领必须拒绝");
+        assert_eq!(binding.in_flight(), 1, "拒绝不得改变在途位");
+        drop(first);
     }
 
-    /// 归还/全清/越界：位状态的全部变化
     #[test]
-    fn test_busy_lifecycle() {
-        let block = SlotStateBlock::new_leaked();
-        assert!(!block.is_busy(0), "新块必须全空闲");
+    fn test_ack_is_idempotent_and_bounded() {
+        let binding = VramBinding::new_for_test(2);
+        binding.ack(0);
+        binding.ack(9);
+        assert_eq!(binding.in_flight(), 0);
 
-        block.busy[0].store(1, Ordering::Release);
-        assert!(block.is_busy(0));
-        // 越界归还：不 panic、不影响其余位
-        block.mark_free(SLOT_STATE_SLOTS as u32 + 1);
-        assert!(block.is_busy(0), "越界归还不得波及有效位");
-
-        block.mark_free(0);
-        assert!(!block.is_busy(0), "归还即清零");
-        block.mark_free(0);
-        assert!(!block.is_busy(0), "重复归还无效（CAS 失败路径）");
-
-        block.busy[2].store(1, Ordering::Release);
-        block.busy[SLOT_STATE_SLOTS - 1].store(1, Ordering::Release);
-        block.mark_all_free();
-        assert!(
-            (0..SLOT_STATE_SLOTS).all(|i| !block.is_busy(i)),
-            "换代全清后所有位归零"
-        );
+        let slot = binding.try_acquire(0).unwrap();
+        drop(slot);
+        binding.ack(0);
+        assert!(!binding.is_in_flight(0));
     }
 
-    /// 心跳只增不减；游戏侧超时判定按相等比较，这里验证递增
     #[test]
-    fn test_heartbeat_monotonic() {
-        let block = SlotStateBlock::new_leaked();
-        assert_eq!(block.heartbeat(), 0);
-        block.heartbeat_bump();
-        block.heartbeat_bump();
-        assert_eq!(block.heartbeat(), 2);
+    fn test_out_of_mask_slot_is_rejected() {
+        let binding = VramBinding::new_for_test(3);
+        assert!(binding.try_acquire(3).is_none());
+        assert!(binding.try_acquire(u32::MAX).is_none());
+        assert_eq!(binding.in_flight(), 0, "越界索引不得触碰高位");
+    }
+
+    #[test]
+    fn test_poison_marks_binding_and_suppresses_drop() {
+        let binding = VramBinding::new_for_test(2);
+        let slot = binding.try_acquire(0).unwrap();
+        slot.poison();
+        assert!(binding.is_poisoned(), "毒化必须落在绑定上");
+        drop(slot);
+        assert!(binding.is_in_flight(0), "毒化后 Drop 不得归还");
+    }
+
+    #[test]
+    fn test_handles_are_process_globally_unique() {
+        let a = VramBinding::new_for_test(1);
+        let b = VramBinding::new_for_test(1);
+        assert_ne!(a.handle(), b.handle());
+        assert!(a.handle() >= 1 && b.handle() >= 1);
+    }
+
+    #[test]
+    fn test_owned_slot_keeps_its_generation_identity() {
+        let old = VramBinding::new_for_test(1);
+        let slot = old.try_acquire(0).expect("旧代槽位空闲");
+        let new = VramBinding::new_for_test(1);
+
+        assert_eq!(slot.binding_handle(), old.handle());
+        assert_ne!(slot.binding_handle(), new.handle());
+
+        drop(slot);
+        assert!(!old.is_in_flight(0), "认领必须归还旧代");
+        assert!(!new.is_in_flight(0), "旧代归还不得触碰新代");
     }
 
     /// 合法槽位描述符策略：句柄与尺寸用全域随机值并声明已接管，
@@ -645,53 +659,6 @@ mod tests {
                 let list = parsed.expect("整步长形状必须解析成功");
                 prop_assert_eq!(list.len(), flat.len() / FLAT_STRIDE);
             }
-        }
-
-        // 任意忙位预置与任意归还序列（含越界与重复归还）下：
-        // mark_free 只清自己的位、幂等、绝不把 0 变成别的值
-        #[test]
-        fn mark_free_only_clears_its_own_bit(
-            busy_mask in 0u32..(1 << SLOT_STATE_SLOTS),
-            frees in prop::collection::vec(0u32..SLOT_STATE_SLOTS as u32 + 3, 0..12),
-        ) {
-            let block = SlotStateBlock::new_leaked();
-            // 直接预置忙位模拟游戏侧认领，claim 路径只存在于游戏侧
-            for (i, slot) in block.busy.iter().enumerate() {
-                if busy_mask >> i & 1 == 1 {
-                    slot.store(1, Ordering::Release);
-                }
-            }
-            let before: Vec<u32> = (0..SLOT_STATE_SLOTS)
-                .map(|i| block.busy[i].load(Ordering::Acquire))
-                .collect();
-            // 每个索引归还两次：第二次 CAS 必然失败，覆盖幂等路径
-            for idx in &frees {
-                block.mark_free(*idx);
-                block.mark_free(*idx);
-            }
-            for (i, &b) in before.iter().enumerate() {
-                let expected = if frees.contains(&(i as u32)) && b == 1 {
-                    0
-                } else {
-                    b
-                };
-                prop_assert_eq!(
-                    block.busy[i].load(Ordering::Acquire),
-                    expected,
-                    "槽位 {} 的位被误动",
-                    i
-                );
-            }
-        }
-
-        // 心跳计数与 bump 次数严格一致
-        #[test]
-        fn heartbeat_counts_exactly_one_per_bump(bumps in 0u64..2048) {
-            let block = SlotStateBlock::new_leaked();
-            for _ in 0..bumps {
-                block.heartbeat_bump();
-            }
-            prop_assert_eq!(block.heartbeat(), bumps);
         }
     }
 }

@@ -41,8 +41,11 @@ public interface EncoderChannel {
     /**
      * 把当前导出资源整批绑定到 Native 编码器。
      *
-     * <p>整批处理：要么全成要么全败。绑定只对导入时的绑定轮次有效；编码器重建后
-     * 旧绑定的推送在 Native 入口丢弃，调用方应在新绑定轮次上重新导入。
+     * <p>整批处理：要么全成要么全败。绑定只对导入时取得的绑定句柄有效；编码器重建后
+     * 旧绑定的推送在 Native 入口丢弃，调用方应重新导入。
+     *
+     * <p>一旦提交给 Native，这批槽位的原始系统句柄就由 Native 一次性接管：导入失败后
+     * 句柄也不可再次提交，调用方必须弃用整个导出集。
      *
      * @param slots 槽位描述，索引与几何由调用方与 Native 双重校验
      * @return 已导入的显存绑定
@@ -123,7 +126,10 @@ public interface EncoderChannel {
          * @return true 表示应触发引擎自愈而不是降级到 RAM
          */
         public boolean encoderUnavailable() {
-            return status == ControlStatus.NO_HARDWARE_ENCODER || status == ControlStatus.ENCODER_BUILD_FAILED;
+            return status == ControlStatus.NO_HARDWARE_ENCODER
+                    || status == ControlStatus.ENCODER_BUILD_FAILED
+                    // Actor 已死：降级 RAM 救不了没有编码器的流，只能整引擎自愈
+            || status == ControlStatus.PIPELINE_DEAD;
         }
     }
 }

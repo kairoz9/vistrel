@@ -4,7 +4,8 @@ use super::encoder::{EncodeBackendKind, VideoEncoder};
 use super::frame::FramePayload;
 use super::pool::FramePool;
 use super::{StreamingProfile, VideoCodec};
-use crate::encode::hardware::slots::SlotStateBlock;
+use crate::encode::StageCell;
+use crate::encode::hardware::slots::VramBinding;
 use crate::encode::hardware::vulkan::vram_export::VramSlotProducer;
 use crate::encode::nv12_len;
 use std::collections::BTreeSet;
@@ -236,6 +237,22 @@ fn pool_payload(pool: &std::sync::Arc<FramePool>, source: &[u8]) -> Result<Frame
     Ok(FramePayload::Host { frame })
 }
 
+/// perf 矩阵共用的绑定：槽位所有权随载荷析构归还
+fn perf_binding() -> std::sync::Arc<VramBinding> {
+    static BINDING: std::sync::OnceLock<std::sync::Arc<VramBinding>> = std::sync::OnceLock::new();
+    BINDING
+        .get_or_init(|| VramBinding::new_for_test(VramSlotProducer::SLOT_COUNT as u32))
+        .clone()
+}
+
+/// perf 矩阵共用的阶段出口：后端只写阶段码
+fn perf_stage() -> std::sync::Arc<StageCell> {
+    static STAGE: std::sync::OnceLock<std::sync::Arc<StageCell>> = std::sync::OnceLock::new();
+    STAGE
+        .get_or_init(|| std::sync::Arc::new(StageCell::new()))
+        .clone()
+}
+
 /// 逐帧输入：Pool 路径取块整写；VRAM 路径按 3 槽轮转推进对应槽位的时间线
 ///
 /// 信号值取全局帧号 +1（对齐生产 `RenderpearlVramPipeline`），回执落在 +1。
@@ -256,8 +273,9 @@ fn frame_input(
                 producer.wait_ack(slot, signal - 2)?;
             }
             producer.signal_frame(slot, signal)?;
+            let binding = perf_binding();
             Ok(FramePayload::VramSlot {
-                slot_idx: slot as u32,
+                slot: binding.try_acquire(slot as u32).expect("perf 槽位必须空闲"),
                 sync_value: signal,
             })
         }
@@ -276,7 +294,7 @@ fn run_cell(
         StreamingProfile::new(resolution.width, resolution.height, FPS, MATRIX_BITRATE_BPS);
     // 池由采集侧持有；后端构造时交回自己的块（软编是堆块，硬编是设备块）
     let (mut encoder, blocks) =
-        VideoEncoder::new_backend(profile, codec, backend, Some(SlotStateBlock::new_leaked()))?;
+        VideoEncoder::new_backend(profile, codec, backend, Some(perf_stage()))?;
     let pool = FramePool::new();
     pool.attach(blocks);
     let (coded_width, coded_height) = encoder.coded_extent();
@@ -583,7 +601,7 @@ fn nvenc_host_input_produces_real_bitstream() {
         profile,
         VideoCodec::Av1,
         EncodeBackendKind::Nvenc,
-        Some(SlotStateBlock::new_leaked()),
+        Some(perf_stage()),
     )
     .expect("NVENC 后端应能构建");
     let pool = FramePool::new();

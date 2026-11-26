@@ -23,11 +23,11 @@ mod vram_slot;
 #[cfg(test)]
 use crate::encode::encoder::BackendStageTimings;
 use crate::encode::encoder::{EncodeBackendKind, VideoEncodeBackend};
-use crate::encode::hardware::slots::{
-    SlotStateBlock, SlotTable, VramSlotDescriptor, ensure_batch_geometry,
-};
+use crate::encode::hardware::slots::{SlotTable, VramSlotDescriptor, ensure_batch_geometry};
 use crate::encode::pool::{HOST_SLOT_BYTES, HostBlock, POOL_DEPTH};
-use crate::encode::{FramePayload, StreamingProfile, VideoCodec, nv12_len};
+use crate::encode::{FramePayload, StageCell, StreamingProfile, VideoCodec, nv12_len};
+
+use std::sync::Arc;
 
 use ash::vk;
 use bytes::Bytes;
@@ -168,8 +168,8 @@ pub(crate) struct VulkanVideoBackend {
     /// 当前 codec
     codec: VideoCodec,
     slots: SlotTable<VramSlot>,
-    /// 槽位所有权共享块：编码出口归还位（毒化时粘滞），与 Actor 同代
-    slot_state: &'static SlotStateBlock,
+    /// 编码阻塞阶段出口：本后端只写阶段码，心跳由编码循环推进
+    stage: Arc<StageCell>,
     /// 本设备为该 codec 声明的 `pictureAccessGranularity`
     ///
     /// 采集侧必须按它出帧（`StreamingProfile::coded_extent`）。存成字段而不是每次回查
@@ -190,7 +190,7 @@ impl VulkanVideoBackend {
     pub(crate) fn new(
         profile: StreamingProfile,
         codec: VideoCodec,
-        slot_state: &'static SlotStateBlock,
+        stage: Arc<StageCell>,
     ) -> Result<(Self, Vec<HostBlock>), String> {
         let width = profile.width();
         let height = profile.height();
@@ -247,7 +247,7 @@ impl VulkanVideoBackend {
                 profile,
                 codec,
                 slots: SlotTable::new(),
-                slot_state,
+                stage,
                 coded_align: (
                     caps.picture_access_granularity.width.max(1),
                     caps.picture_access_granularity.height.max(1),
@@ -370,7 +370,7 @@ impl VideoEncodeBackend for VulkanVideoBackend {
 
         // 先建新后端再替换：新建失败时旧后端仍然可用。新后端带在自己的新设备上分配的帧块，
         // 由调用方装进帧池——池里旧域的块会落进 `stale`，等下次 `attach` 时释放
-        let (new_backend, blocks) = Self::new(new_profile, new_codec, self.slot_state)?;
+        let (new_backend, blocks) = Self::new(new_profile, new_codec, Arc::clone(&self.stage))?;
         *self = new_backend;
         Ok(blocks)
     }
@@ -418,17 +418,14 @@ impl VideoEncodeBackend for VulkanVideoBackend {
                 }
                 result.map(|(out, is_key)| (Bytes::from(out), is_key))
             }
-            FramePayload::VramSlot {
-                slot_idx,
-                sync_value,
-            } => {
-                // 编码无论成败都在出口归还所有权——但等待超时毒化例外：提交仍在途、
-                // 纹理仍被 GPU 读取，此刻归还等于让渲染线程复写在读显存。粘滞 BUSY
-                // 由断路器降级 RAM / 换代全清 / 心跳超时自愈三层兜底
+            FramePayload::VramSlot { slot, sync_value } => {
+                // 编码无论成败都由载荷 Drop 归还——但等待超时毒化例外：提交仍在途、
+                // 纹理仍被 GPU 读取，此刻归还等于让渲染线程复写在读显存。arm 后
+                // Drop 不再释放，粘滞 BUSY 由断路器 / 换代全清 / 心跳超时三层兜底
                 let result =
-                    self.encode_vram_slot(*slot_idx, *sync_value, force_keyframe, frame_idx);
-                if !self.encoder.is_poisoned() {
-                    self.slot_state.mark_free(*slot_idx);
+                    self.encode_vram_slot(slot.slot(), *sync_value, force_keyframe, frame_idx);
+                if self.encoder.is_poisoned() {
+                    slot.poison();
                 }
                 result
             }

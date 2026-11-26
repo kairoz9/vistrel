@@ -1,76 +1,74 @@
 package kairo.vistrel.streaming;
 
 /**
- * 一段导出显存绑定到某个编码器代次的 Java 侧句柄：槽位认领、帧投递、心跳判定与注销结算。
+ * 一段导出显存绑定到某个编码器代次的 Java 侧句柄：槽位取用、帧投递、心跳判定与注销结算。
  *
- * <p>生命周期由采集侧持有；构造即整批导入（全成全败），{@link #close()} 是唯一注销入口。
- * 绑定只对导入时的绑定轮次有效：编码器重建/失效重配后 Native 递增轮次，旧推送在入口丢弃。
+ * <p>构造即整批导入（全成全败），{@link #close()} 是唯一注销入口。绑定只对导入时取得的
+ * 句柄有效：编码器重建或失效重配后 Native 摘除绑定，旧句柄的推送在入口丢弃。槽位表、
+ * 在途位与心跳全在 Native，Java 不持有共享内存视图。
  *
- * <p>线程约定：{@link #claim} / {@link #release} / {@link #push} / {@link #markPushed} /
- * {@link #heartbeatTimedOut} 在渲染线程调用；{@link #stageName} 只读共享块；
- * {@link #close()} 在渲染线程的管线拆除路径调用。
+ * <p>线程约定：{@link #acquire} / {@link #push} / {@link #heartbeatTimedOut} 在渲染线程
+ * 调用；{@link #stallDiagnostics()} 只在超时后调用；{@link #close()} 在管线拆除路径调用。
  */
 public interface VramBinding {
     /**
      * 心跳冻结判定阈值：持续推流下心跳停在基准值超过此时长，判定编码线程卡死。
      *
-     * <p>编码端每轮推进心跳，不推进只有卡死一种解释；判定必须在每个 tick 执行
-     * （含全忙丢帧的 tick）——卡死后 push 会停，判定不能跟着停。
+     * <p>判定必须在每个 tick 执行（含全忙丢帧）——卡死后 push 会停，判定不能跟着停。
      */
     long STALL_HEARTBEAT_TIMEOUT_NS = 1_000_000_000L;
+    /**
+     * 本 tick 没有空闲槽位：主动丢帧，不是故障
+     */
+    int NO_FREE_SLOT = -1;
+    /**
+     * 绑定已失效或引擎已不在：本帧无法投递，等停滞判定触发自愈
+     */
+    int BINDING_UNAVAILABLE = -2;
 
     /**
-     * 投递一帧已注册槽位（单向，不等待编码结果）。
+     * 取一个空闲槽位：向 Native 拉一次权威快照（在途掩码 + 心跳），本地选位。
      *
-     * @param slotIdx   槽位索引
-     * @param signalVal 与 GPU 提交流绑定的时间线信号值；OpenGL 后端为 0
+     * <p>本调用同时刷新停滞判定基准，因此每个采集 tick 必须调用一次（包括全忙的 tick）。
+     * 未投递的槽位在 Native 侧从未置位，异常路径无须归还。
+     *
+     * @param preferredIdx 首选槽位索引；非法或忙时按索引序降级
+     * @return 槽位索引；全忙返回 {@link #NO_FREE_SLOT}，绑定/引擎失效返回
+     *         {@link #BINDING_UNAVAILABLE}——两者都按主动丢帧处理，不升级为 Failed
      * @throws IllegalStateException 绑定已关闭
+     * @throws EncoderChannel.ControlException Native 返回未知/致命状态
      */
-    void push(int slotIdx, long signalVal);
+    int acquire(int preferredIdx);
 
     /**
-     * 认领一个空闲槽位：CAS 0→1，轮转优先、索引序降级。
+     * 投递一帧已取用的槽位（单向，不等待编码结果）。
      *
-     * @param preferredIdx 首选槽位索引；非法值退化为索引序扫描
-     * @return 认领到的槽位索引；全忙返回 -1（对应主动丢帧，不是故障）
-     */
-    int claim(int preferredIdx);
-
-    /**
-     * 归还一个槽位认领位（异常路径；正常归还由编码线程完成，幂等）。
+     * <p>成功后槽位所有权移交 Native，由帧载荷析构归还；同一槽位在归还前不得再次投递。
      *
-     * @param slotIdx 槽位索引
+     * @param slot       {@link #acquire(int)} 返回的槽位索引
+     * @param signalVal  与 GPU 提交流绑定的时间线信号值
+     * @return true 表示已入队；false 表示绑定已失效、帧被入口丢弃
+     * @throws IllegalStateException 绑定已关闭
+     * @throws EncoderChannel.ControlException 槽位未取用、重复投递或线程不符
      */
-    void release(int slotIdx);
-
-    /**
-     * 记录一次 push 成功后的心跳基准。
-     *
-     * @param nowNanos 本帧开始时刻（{@code System.nanoTime()} 域）
-     */
-    void markPushed(long nowNanos);
+    boolean push(int slot, long signalVal);
 
     /**
      * 心跳是否冻结超过停滞阈值。
      *
-     * @param nowNanos 当前时刻（{@code System.nanoTime()} 域）
+     * <p>基准由 {@link #acquire(int)} 每次成功拉取快照时刷新；绑定失效时快照
+     * 不再推进，超过阈值即判定停滞并触发引擎自愈。
+     *
      * @return true 表示编码线程超过 1 秒没有推进心跳
      */
-    boolean heartbeatTimedOut(long nowNanos);
+    boolean heartbeatTimedOut();
 
     /**
-     * 编码线程最后进入的阶段名，用于停滞日志。
+     * 编码线程最后进入的阶段名，用于停滞日志；只在超时后调用。
      *
-     * @return 阶段中文名；未知码原样展示
+     * @return 阶段中文名
      */
-    String stageName();
-
-    /**
-     * 本绑定导入时共享块中的绑定轮次。
-     *
-     * @return 导入令牌；与共享块的当前绑定轮次不同即说明编码器已重建
-     */
-    long bindingEpoch();
+    String stallDiagnostics();
 
     /**
      * 注销槽位并结算。

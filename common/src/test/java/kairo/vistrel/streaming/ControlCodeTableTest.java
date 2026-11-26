@@ -23,14 +23,17 @@ public class ControlCodeTableTest {
         Assertions.assertEquals(8, ControlStatus.RELEASE_FAILED.code());
         Assertions.assertEquals(9, ControlStatus.ENCODER_BUILD_FAILED.code());
         Assertions.assertEquals(10, ControlStatus.STALE_BINDING.code());
+        Assertions.assertEquals(11, ControlStatus.SLOT_NOT_FREE.code());
+        Assertions.assertEquals(12, ControlStatus.WRONG_THREAD.code());
+        Assertions.assertEquals(13, ControlStatus.POISONED.code());
     }
 
     /**
-     * 0..10 每个码都要有人话，不能落进 default 的「未知错误码」
+     * 0..13 每个码都要有人话，不能落进 default 的「未知错误码」
      */
     @Test
     void testEveryKnownCodeHasAReason() {
-        for (int code = 0; code <= 10; code++) {
+        for (int code = 0; code <= 13; code++) {
             Assertions.assertNotNull(ControlStatus.fromCode(code), "码 " + code + " 缺少枚举");
             Assertions.assertFalse(ControlStatus.describe(code).startsWith("未知错误码"), "码 " + code + " 缺少可读原因");
         }
@@ -39,7 +42,26 @@ public class ControlCodeTableTest {
                 ControlStatus.describe(ControlStatus.RECONFIGURE_FAILED.code()),
                 "档位重配失败必须与 ACK 超时区分开"
         );
-        Assertions.assertTrue(ControlStatus.describe(11).startsWith("未知错误码"), "表外的码才允许落进未知");
-        Assertions.assertNull(ControlStatus.fromCode(11), "表外的码不映射到枚举");
+        Assertions.assertTrue(ControlStatus.describe(14).startsWith("未知错误码"), "表外的码才允许落进未知");
+        Assertions.assertNull(ControlStatus.fromCode(14), "表外的码不映射到枚举");
+    }
+
+    /**
+     * 编码器不可用的判定必须包含「Actor 已死」：降级 RAM 无法恢复一条没有编码器的流。
+     */
+    @Test
+    void testPipelineDeadCountsAsEncoderUnavailable() {
+        Assertions.assertTrue(new EncoderChannel.ControlException("dead", ControlStatus.PIPELINE_DEAD)
+            .encoderUnavailable()
+        );
+        Assertions.assertTrue(new EncoderChannel.ControlException("no hw", ControlStatus.NO_HARDWARE_ENCODER)
+            .encoderUnavailable()
+        );
+        Assertions.assertTrue(new EncoderChannel.ControlException("build", ControlStatus.ENCODER_BUILD_FAILED)
+            .encoderUnavailable()
+        );
+        Assertions.assertFalse(new EncoderChannel.ControlException("ack", ControlStatus.ACK_TIMEOUT)
+            .encoderUnavailable()
+        );
     }
 }

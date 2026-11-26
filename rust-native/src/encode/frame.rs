@@ -8,13 +8,14 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::encode::StampedVideoPacket;
+use crate::encode::hardware::slots::OwnedSlot;
 use crate::encode::pool::FrameBuf;
 
 /// 帧载荷
 #[derive(Debug)]
 pub(crate) enum FramePayload {
-    /// 显存直通帧：持有槽位索引与时间线同步信号量值（由硬件编码器内部槽位表直接解析）
-    VramSlot { slot_idx: u32, sync_value: u64 },
+    /// 显存直通帧：持有槽位所有权与时间线同步信号量值（由硬件编码器内部槽位表直接解析）
+    VramSlot { slot: OwnedSlot, sync_value: u64 },
     /// 主机内存帧：生产者已把整帧写进池里的块（CUDA 锁页 / Vulkan 持久映射 / 堆），
     /// 后端按自己的设备决定走零拷贝还是 CPU 暂存
     Host { frame: FrameBuf },
@@ -344,7 +345,7 @@ pub(crate) type FrameOutbox = Mailbox<StampedVideoPacket>;
 #[derive(Debug)]
 pub(crate) struct FrameInbox {
     latest: Mailbox<VideoFrame>,
-    /// 被丢弃帧的载荷待归还队列，Actor 每轮循环取走：显存载荷清所有权位，主机载荷析构回池
+    /// 被丢弃帧的载荷待归还队列，Actor 每轮循环取走：显存载荷析构即归还认领，主机载荷析构回池
     discarded: Mutex<Vec<FramePayload>>,
 }
 
@@ -418,6 +419,7 @@ impl FrameInbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encode::hardware::slots::VramBinding;
     use crate::encode::pool::{FramePool, POOL_DEPTH, heap_blocks};
 
     /// 从待归还队列里筛出显存槽位索引（主机载荷就地析构）
@@ -425,7 +427,7 @@ mod tests {
         queue
             .into_iter()
             .filter_map(|payload| match payload {
-                FramePayload::VramSlot { slot_idx, .. } => Some(slot_idx),
+                FramePayload::VramSlot { slot, .. } => Some(slot.slot()),
                 FramePayload::Host { .. } => None,
             })
             .collect()
@@ -437,12 +439,15 @@ mod tests {
         let doorbell = Arc::new(Notify::new());
         let inbox = FrameInbox::new(Arc::clone(&doorbell));
 
-        let vram = |sync_value: u64| VideoFrame {
-            birth_nanos: sync_value,
-            payload: FramePayload::VramSlot {
-                slot_idx: 2,
-                sync_value,
-            },
+        let vram = |sync_value: u64| {
+            let binding = VramBinding::new_for_test(3);
+            VideoFrame {
+                birth_nanos: sync_value,
+                payload: FramePayload::VramSlot {
+                    slot: binding.try_acquire(2).expect("槽位必须空闲"),
+                    sync_value,
+                },
+            }
         };
 
         inbox.push(vram(10));

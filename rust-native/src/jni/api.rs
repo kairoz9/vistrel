@@ -2,10 +2,13 @@
 // 告警落在每个导出项的宏调用点上（本文件自身代码不产生弃用告警）；依赖侧修复前在此豁免。
 #![allow(deprecated)]
 
+use crate::encode::EncodeStage;
 use crate::encode::control::ControlStatus;
+use crate::encode::hardware::slots::MAX_VRAM_SLOTS;
 use crate::encode::hardware::{FLAT_STRIDE, VramSlotDescriptor};
 use crate::encode::{self, VideoPipeline};
 use crate::jni::callback;
+use crate::jni::wire::{pack_slot_state, pack_status};
 use crate::jni::{Reply, elapsed_birth_nanos, get_global};
 use crate::streaming::StreamingEngine;
 use crate::streaming::audio_loopback::AudioLoopback;
@@ -498,63 +501,68 @@ const _: jni::NativeMethod = native_method! {
     java_type = "kairo.vistrel.streaming.natives.NativeBridge",
     export = "Java_kairo_vistrel_streaming_natives_NativeBridge_importVramSlots",
     error_policy = LogErrorAndDefault,
-    static fn import_vram_slots(binding_epoch: jlong, flat: jlong[]) -> JString,
+    static fn import_vram_slots(flat: jlong[]) -> JString,
 };
 
 fn import_vram_slots<'caller>(
     env: &mut Env<'caller>,
     _class: JClass<'caller>,
-    binding_epoch: jlong,
     flat: JPrimitiveArray<'caller, jlong>,
 ) -> jni::errors::Result<JString<'caller>> {
-    let code = import_vram_slots_code(env, binding_epoch, flat);
-    let json = Reply::ok(serde_json::json!(code)).encode();
+    let json = import_vram_slots_reply(env, flat).encode();
     match env.new_string(json) {
         Ok(s) => Ok(s),
         Err(_) => Ok(JString::default()),
     }
 }
 
-/// 槽位整批导入的领域结局：返回 `ControlStatus` 判别值，由外层统一装进 data。
-fn import_vram_slots_code<'caller>(
+/// 槽位整批导入：Actor 完成驱动导入后，由 Native 分配并回送绑定句柄。
+fn import_vram_slots_reply<'caller>(
     env: &mut Env<'caller>,
-    binding_epoch: jlong,
     flat: JPrimitiveArray<'caller, jlong>,
-) -> i32 {
+) -> Reply {
     // 0. 硬编能力预检：读启动期建立的快照，本机无硬编时直接拒绝
     if encode::hardware_backends().is_none() {
-        return ControlStatus::NoHardwareEncoder as i32;
+        return Reply::ok(serde_json::json!({ "code": ControlStatus::NoHardwareEncoder as i32 }));
     }
 
-    // 整批处理：Java 决定槽位数量，Native 只按协议切分收到的
-    // 数组。长度不是每槽位 long 数的整数倍即整批拒绝，绝不按错位布局解析。
+    // 整批处理：Java 决定槽位数量，Native 只按协议切分收到的数组
     let Ok(len) = flat.len(env) else {
-        return ControlStatus::MalformedBatch as i32;
+        return Reply::ok(serde_json::json!({ "code": ControlStatus::MalformedBatch as i32 }));
     };
     if len == 0 || !len.is_multiple_of(FLAT_STRIDE) {
-        return ControlStatus::MalformedBatch as i32;
+        return Reply::ok(serde_json::json!({ "code": ControlStatus::MalformedBatch as i32 }));
     }
 
     let mut buf = vec![0i64; len];
     if flat.get_region(env, 0, &mut buf).is_err() {
-        return ControlStatus::MalformedBatch as i32;
+        return Reply::ok(serde_json::json!({ "code": ControlStatus::MalformedBatch as i32 }));
     }
 
     let Some(slots) = VramSlotDescriptor::parse_batch(&buf) else {
-        return ControlStatus::MalformedBatch as i32;
+        return Reply::ok(serde_json::json!({ "code": ControlStatus::MalformedBatch as i32 }));
     };
+    if slots
+        .iter()
+        .any(|descriptor| descriptor.slot_idx as usize >= MAX_VRAM_SLOTS)
+    {
+        // 未进入导入：描述符在此析构并关闭原始句柄
+        return Reply::ok(serde_json::json!({ "code": ControlStatus::MalformedBatch as i32 }));
+    }
 
-    // 派发控制命令给 Actor 进行槽位导入与激活硬编
-    if let Some(engine) = get_global().streaming_engine.load().as_ref() {
-        match engine
-            .video()
-            .import_vram_slots(binding_epoch as u64, slots)
-        {
-            Ok(()) => ControlStatus::Ok.code(),
-            Err(e) => e.code(),
-        }
-    } else {
-        ControlStatus::ActorDead as i32
+    // 派发控制命令给 Actor；绑定句柄由 Native 在导入成功时分配并回送
+    let engine = get_global().streaming_engine.load();
+    let Some(engine) = engine.as_ref() else {
+        return Reply::ok(serde_json::json!({ "code": ControlStatus::ActorDead as i32 }));
+    };
+    let pipeline = engine.video();
+    let owner = std::thread::current().id();
+    match pipeline.import_vram_slots(owner, slots) {
+        Ok(handle) => Reply::ok(serde_json::json!({
+            "code": ControlStatus::Ok as i32,
+            "handle": handle,
+        })),
+        Err(status) => Reply::ok(serde_json::json!({ "code": status as i32 })),
     }
 }
 
@@ -562,73 +570,65 @@ const _: jni::NativeMethod = native_method! {
     java_type = "kairo.vistrel.streaming.natives.NativeBridge",
     export = "Java_kairo_vistrel_streaming_natives_NativeBridge_pushVramSlot",
     error_policy = LogErrorAndDefault,
-    static fn push_vram_slot(binding_epoch: jlong, slot_idx: jint, sync_value: jlong) -> void,
+    static fn push_vram_slot(handle: jlong, slot: jint, sync_value: jlong) -> jint,
 };
 
 fn push_vram_slot<'caller>(
     _env: &mut Env<'caller>,
     _class: JClass<'caller>,
-    binding_epoch: jlong,
-    slot_idx: jint,
+    handle: jlong,
+    slot: jint,
     sync_value: jlong,
-) -> jni::errors::Result<()> {
+) -> jni::errors::Result<jint> {
     let birth_nanos = elapsed_birth_nanos();
 
-    // 零锁极速投递：直接构建 VramSlot payload 投递到帧收件箱，由编码 Actor 处理槽位映射。
-    // 轮次检查在共享块上完成：旧实例的帧在入口丢弃，不进入收件箱
-    if let Some(engine) = get_global().streaming_engine.load().as_ref() {
-        engine.video().push_vram_slot(
-            binding_epoch as u64,
-            birth_nanos,
-            slot_idx as u32,
-            sync_value as u64,
-        );
-    }
-    Ok(())
+    // 句柄、线程与槽位校验全在 Native 侧：旧绑定帧由推送入口或编码入口按代次丢弃
+    let engine = get_global().streaming_engine.load();
+    let Some(engine) = engine.as_ref() else {
+        return Ok(pack_status(ControlStatus::ActorDead));
+    };
+    Ok(pack_status(engine.video().push_vram_slot(
+        handle as u64,
+        slot as u32,
+        birth_nanos,
+        sync_value as u64,
+    )))
 }
 
 const _: jni::NativeMethod = native_method! {
     java_type = "kairo.vistrel.streaming.natives.NativeBridge",
-    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_slotStateBlock",
-    static fn slot_state_block() -> JByteBuffer,
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_vramSlotState",
+    error_policy = LogErrorAndDefault,
+    static fn vram_slot_state(handle: jlong) -> jlong,
 };
 
-fn slot_state_block<'caller>(
-    env: &mut Env<'caller>,
+fn vram_slot_state<'caller>(
+    _env: &mut Env<'caller>,
     _class: JClass<'caller>,
-) -> jni::errors::Result<JByteBuffer<'caller>> {
-    // 槽位所有权块随当前活跃引擎走：块指针在引擎重建时换代（Box::leak 新块），
-    // Java 每次构建显存管线时经本出口取一次，旧的缓冲视图随旧管线一并废弃。
-    // 引擎未运行返回 null，调用方按「无所有权块」走构造期降级
-    let engine = get_global().streaming_engine.load_full();
+    handle: jlong,
+) -> jni::errors::Result<jlong> {
+    // 每 tick 一次：权威在途快照 + 心跳。游戏侧据此选槽并判定停滞
+    let engine = get_global().streaming_engine.load();
     let Some(engine) = engine.as_ref() else {
-        return Ok(JByteBuffer::default());
+        return Ok(pack_slot_state(ControlStatus::ActorDead, 0, 0) as jlong);
     };
-    let block = engine.video().slot_state();
-    unsafe {
-        // SAFETY: new_direct_byte_buffer 要求指针有效且容量范围内可读——
-        // 块由 Box::leak 持有，进程内地址恒定；DirectBuffer 不拥有该内存，
-        // 生命周期由泄漏语义保证长于任何 Java 侧视图
-        env.new_direct_byte_buffer(
-            block.as_ptr() as *mut u8,
-            crate::encode::hardware::slots::SLOT_STATE_BLOCK_BYTES,
-        )
-    }
+    let state = engine.video().vram_slot_state(handle as u64);
+    Ok(pack_slot_state(state.status, state.in_flight, state.heartbeat) as jlong)
 }
 
 const _: jni::NativeMethod = native_method! {
     java_type = "kairo.vistrel.streaming.natives.NativeBridge",
     export = "Java_kairo_vistrel_streaming_natives_NativeBridge_clearVramSlots",
     error_policy = LogErrorAndDefault,
-    static fn clear_vram_slots(binding_epoch: jlong) -> JString,
+    static fn clear_vram_slots(handle: jlong) -> JString,
 };
 
 fn clear_vram_slots<'caller>(
     env: &mut Env<'caller>,
     _class: JClass<'caller>,
-    binding_epoch: jlong,
+    handle: jlong,
 ) -> jni::errors::Result<JString<'caller>> {
-    let code = clear_vram_slots_code(binding_epoch);
+    let code = clear_vram_slots_code(handle);
     let json = Reply::ok(serde_json::json!(code)).encode();
     match env.new_string(json) {
         Ok(s) => Ok(s),
@@ -637,7 +637,7 @@ fn clear_vram_slots<'caller>(
 }
 
 /// 槽位注销的领域结局：返回 `ControlStatus` 判别值，由外层统一装进 data。
-fn clear_vram_slots_code(binding_epoch: jlong) -> i32 {
+fn clear_vram_slots_code(handle: jlong) -> i32 {
     // 引擎未运行即无导入方：注销实际是空操作，Vacuous ACK 同样成立。
     // 这里返回非 OK 会让 Java 按「未获确认」保留导出资源，而编码器早已随引擎析构，
     // 保留只会白白丢掉三张导出纹理。
@@ -650,7 +650,7 @@ fn clear_vram_slots_code(binding_epoch: jlong) -> i32 {
     // 清空待编帧、排空 GPU 在途任务并注销显存槽位：ClearVramSlots 单命令完成
     // 「停写者 → 排空异步尾巴 → 释放导入」的固定次序，一次控制往返
     // 注意：不回退软编！硬件编码器仍保持就绪，可无缝接收随后的主机帧池块 (RAM DMA 双缓冲) 并用 StagingBuffer 进行硬编
-    let code = match pipeline.clear_vram_slots(binding_epoch as u64) {
+    let code = match pipeline.clear_vram_slots(handle as u64) {
         Ok(()) => ControlStatus::Ok.code(),
         Err(e) => e.code(),
     };
@@ -660,6 +660,32 @@ fn clear_vram_slots_code(binding_epoch: jlong) -> i32 {
         log::warn!("显存槽位注销未获 Actor 确认 (code={code})，游戏侧导出资源暂缓销毁");
     }
     code
+}
+
+const _: jni::NativeMethod = native_method! {
+    java_type = "kairo.vistrel.streaming.natives.NativeBridge",
+    export = "Java_kairo_vistrel_streaming_natives_NativeBridge_stallDiagnostics",
+    error_policy = LogErrorAndDefault,
+    static fn stall_diagnostics(handle: jlong) -> JString,
+};
+
+fn stall_diagnostics<'caller>(
+    env: &mut Env<'caller>,
+    _class: JClass<'caller>,
+    handle: jlong,
+) -> jni::errors::Result<JString<'caller>> {
+    // 冷路径：只在心跳超时后调用一次。阶段码表与标签只在 Native 维护，Java 直接使用返回的标签
+    let label = get_global()
+        .streaming_engine
+        .load()
+        .as_ref()
+        .and_then(|engine| engine.video().stall_stage(handle as u64))
+        .map(EncodeStage::describe)
+        .unwrap_or_else(|| "引擎未运行".to_string());
+    match env.new_string(label) {
+        Ok(s) => Ok(s),
+        Err(_) => Ok(JString::default()),
+    }
 }
 
 const _: jni::NativeMethod = native_method! {

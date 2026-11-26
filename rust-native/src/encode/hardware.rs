@@ -379,16 +379,16 @@ pub fn bootstrap_hardware_caps() -> Option<Arc<[BackendCapability]>> {
 mod tests {
     use crate::encode::encoder::VideoEncoder;
     use crate::encode::hardware::nvenc::new_cuda_context;
-    use crate::encode::hardware::slots::SlotStateBlock;
+    use crate::encode::hardware::slots::VramBinding;
     use crate::encode::pool::test_support::{host_payload, pool_with};
     use crate::encode::pool::{POOL_DEPTH, heap_blocks};
-    use crate::encode::{FramePayload, StreamingProfile};
+    use crate::encode::{FramePayload, StageCell, StreamingProfile};
 
     use super::*;
 
     /// 硬编后端用例的槽位所有权块：随用例泄漏 64B，测试进程内可忽略
-    fn test_slot_state() -> &'static SlotStateBlock {
-        SlotStateBlock::new_leaked()
+    fn test_stage() -> std::sync::Arc<StageCell> {
+        std::sync::Arc::new(StageCell::new())
     }
 
     /// 线上形状的契约：字段名、codec 拼写（大写，与前端 parseCodecToken 一致）、
@@ -509,7 +509,7 @@ mod tests {
                     profile,
                     codec,
                     EncodeBackendKind::VulkanVideo,
-                    Some(test_slot_state()),
+                    Some(test_stage()),
                 ) {
                     Ok(pair) => pair,
                     Err(e) => {
@@ -541,7 +541,7 @@ mod tests {
             profile,
             VideoCodec::H264,
             EncodeBackendKind::Nvenc,
-            Some(test_slot_state()),
+            Some(test_stage()),
         ) {
             Ok(pair) => pair,
             Err(e) => {
@@ -564,7 +564,7 @@ mod tests {
             StreamingProfile::default(),
             VideoCodec::H264,
             EncodeBackendKind::Nvenc,
-            Some(test_slot_state()),
+            Some(test_stage()),
         ) {
             Ok(pair) => pair,
             Err(e) => {
@@ -604,7 +604,7 @@ mod tests {
             profile,
             VideoCodec::H264,
             EncodeBackendKind::VulkanVideo,
-            Some(test_slot_state()),
+            Some(test_stage()),
         ) {
             Ok((_hw, blocks)) => {
                 assert_eq!(blocks.len(), POOL_DEPTH, "硬编必须交回一整批块");
@@ -633,7 +633,7 @@ mod tests {
             StreamingProfile::new(1920, 1080, 60, 12_400_000),
             H264,
             EncodeBackendKind::VulkanVideo,
-            Some(test_slot_state()),
+            Some(test_stage()),
         ) {
             Ok(pair) => pair,
             Err(e) => {
@@ -670,7 +670,7 @@ mod tests {
                 profile,
                 VideoCodec::H264,
                 encoder_type,
-                Some(test_slot_state()),
+                Some(test_stage()),
             ) {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -713,7 +713,7 @@ mod tests {
             profile,
             VideoCodec::H264,
             EncodeBackendKind::Nvenc,
-            Some(test_slot_state()),
+            Some(test_stage()),
         ) {
             Ok(pair) => pair,
             Err(e) => {
@@ -746,7 +746,7 @@ mod tests {
             profile,
             VideoCodec::H264,
             EncodeBackendKind::VulkanVideo,
-            Some(test_slot_state()),
+            Some(test_stage()),
         ) {
             Ok(pair) => pair,
             Err(e) => {
@@ -777,7 +777,7 @@ mod tests {
             profile,
             VideoCodec::H264,
             EncodeBackendKind::VulkanVideo,
-            Some(test_slot_state()),
+            Some(test_stage()),
         ) {
             Ok(pair) => pair,
             Err(e) => {
@@ -811,11 +811,12 @@ mod tests {
     #[ignore = "requires GPU"]
     fn test_vulkan_video_vram_slot_not_found_returns_err() {
         let profile = StreamingProfile::new(1280, 720, 60, 4_000_000);
+        let stage = test_stage();
         let (mut encoder, _blocks) = match VideoEncoder::new_backend(
             profile,
             VideoCodec::H264,
             EncodeBackendKind::VulkanVideo,
-            Some(test_slot_state()),
+            Some(stage),
         ) {
             Ok(pair) => pair,
             Err(e) => {
@@ -824,12 +825,14 @@ mod tests {
             }
         };
 
+        // 槽位 7 在绑定里合法，但后端槽位表未导入它
+        let binding = VramBinding::new_for_test(8);
         let payload = FramePayload::VramSlot {
-            slot_idx: 99,
+            slot: binding.try_acquire(7).expect("测试槽位必须空闲"),
             sync_value: 0,
         };
         let res = encoder.encode(&payload, false);
         assert!(res.is_err(), "未导入槽位编码必须返回 Err");
-        assert!(res.unwrap_err().contains("VRAM slot 99 not found"));
+        assert!(res.unwrap_err().contains("VRAM slot 7 not found"));
     }
 }

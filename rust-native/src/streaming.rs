@@ -498,7 +498,7 @@ pub(crate) mod test_support {
                         Rec::Prepare(request, preferred_backend)
                     }
                     ControlCommand::ImportVramSlots { reply, .. } => {
-                        let _ = reply.send(ControlStatus::Ok);
+                        let _ = reply.send(Ok(0));
                         Rec::Other
                     }
                     ControlCommand::ClearVramSlots { reply, .. } => {
