@@ -112,7 +112,8 @@ pub(crate) struct StreamingSession {
     state: Arc<AtomicU8>,
     rate: Arc<RateControl>,
     cancel: CancellationToken,
-    input_ring: InputRingBuffer,
+    /// 输入环独立持有：输入任务只捕获它 + 取消令牌，不拖住整个会话
+    input_ring: Arc<InputRingBuffer>,
     /// 收尾执行体句柄：close() 取走并等待其完成；close 缺席时由 Drop 的
     /// cancel 唤醒，端口释放与写者收编不随会话丢弃而失联
     janitor: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -235,7 +236,7 @@ impl StreamingSession {
                 cancel.clone(),
                 vec![("video", video_writer), ("audio", audio_writer)],
             ))),
-            input_ring: InputRingBuffer::new(),
+            input_ring: Arc::new(InputRingBuffer::new()),
         });
 
         // 6. 将 StreamingSession 实例弱引用反向绑定至 SessionHandler，打破强引用循环 (避免会话泄漏)
@@ -522,8 +523,11 @@ impl StreamingSession {
 
     /// 统一状态流转：单次 CAS 保证 Connected 和 Closed 只记录一次
     ///
-    /// 会话对 Java 的启停通知已删除：Java 信令层用「offer 成功 / WS 关闭」自持状态，
-    /// 这里只维护写者节奏依赖的 PC 状态位。
+    /// Failed/Closed 是终态：记录状态的同时触发取消令牌，writer 与 janitor 不必
+    /// 等待外部 `closeSession`；`close()` 幂等，后续显式关闭不会重复收尾。
+    ///
+    /// 启停状态归 Java 信令层（offer 成功 / WS 关闭），这里只维护写者节奏依赖的
+    /// PC 状态位。
     pub(crate) fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         log::info!("WebRTC connection state: {:?}", state);
         if state == RTCPeerConnectionState::Connected {
@@ -539,29 +543,38 @@ impl StreamingSession {
             let _ = self
                 .state
                 .swap(RTCPeerConnectionState::Closed as u8, Ordering::AcqRel);
+            self.cancel.cancel();
         }
     }
 
     /// 统一入口：根据 label 分发 DataChannel 并托管异步循环
-    pub fn handle_data_channel(self: &Arc<Self>, dc: Arc<dyn DataChannel>) {
-        let this = Arc::clone(self);
+    ///
+    /// 输入任务只捕获 `Arc<InputRingBuffer>` 与取消令牌，不持有 `Arc<StreamingSession>`，
+    /// 通道循环不会延长会话生命周期。
+    pub fn handle_data_channel(&self, dc: Arc<dyn DataChannel>) {
+        let input_ring = Arc::clone(&self.input_ring);
+        let cancel = self.cancel.clone();
         tokio::spawn(async move {
             let label = dc.label().await.unwrap_or_default();
             match label.as_str() {
-                "input" => this.input_event_loop(dc).await,
+                "input" => Self::input_event_loop(dc, input_ring, cancel).await,
                 other => log::warn!("忽略未知 DataChannel 标签: {}", other),
             }
         });
     }
 
     /// 从 input DataChannel 读二进制按键，投递给本地输入缓冲
-    async fn input_event_loop(&self, dc: Arc<dyn DataChannel>) {
+    async fn input_event_loop(
+        dc: Arc<dyn DataChannel>,
+        input_ring: Arc<InputRingBuffer>,
+        cancel: CancellationToken,
+    ) {
         loop {
             tokio::select! {
-                _ = self.cancel.cancelled() => break,
+                _ = cancel.cancelled() => break,
                 event = dc.poll() => match event {
                     Some(DataChannelEvent::OnMessage(msg)) => {
-                        self.input_ring.parse_and_push(&msg.data);
+                        input_ring.parse_and_push(&msg.data);
                     }
                     Some(_) => {}
                     None => break,
@@ -658,7 +671,7 @@ impl StreamingSession {
                 rate: Arc::new(RateControl::new(20_000_000, |_| {})),
                 cancel,
                 janitor: Mutex::new(Some(janitor)),
-                input_ring: InputRingBuffer::new(),
+                input_ring: Arc::new(InputRingBuffer::new()),
             }),
             writer,
         )
