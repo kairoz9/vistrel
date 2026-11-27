@@ -225,7 +225,8 @@ impl ControlSender {
     /// 释放槽位表但保持硬件编码器存活（ask）
     ///
     /// 次序是「先尝试排空设备队列、再丢弃导入」：最后一帧的跨 API 回执还在队列上，先丢弃导入
-    /// 会让它写到已弃掉的信号量上。排空失败只记日志、不进结果码——`Ok` 只表示槽位已释放。
+    /// 会让它写到已释放的信号量上。排空失败返回 [`ControlStatus::VramFault`]，绑定与导入保持
+    /// 原样；只有 `Ok` 才表示槽位已释放。
     pub(crate) fn clear_vram_slots(&self, handle: u64) -> Result<(), ControlStatus> {
         self.ask_status_blocking(|reply| ControlCommand::ClearVramSlots { handle, reply })
     }

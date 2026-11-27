@@ -265,19 +265,21 @@ impl VulkanInstance {
             .enabled_extension_names(&ext_ptrs);
 
         // SAFETY: create_info 及其引用的 app_info / 层名 / 扩展名数组在调用期间均存活且已完整初始化；
-        // 出参 instance 交由本结构持有并在 Drop 中销毁一次
-        let instance = unsafe { entry.create_instance(&create_info, None) }
-            .map_err(|e| format!("创建 Vulkan 实例失败: {e:?}"))?;
+        // 出参 instance 由 `InstanceGuard` 持有，成功时移交给本结构并在 Drop 中销毁一次
+        let instance = InstanceGuard::new(
+            unsafe { entry.create_instance(&create_info, None) }
+                .map_err(|e| format!("创建 Vulkan 实例失败: {e:?}"))?,
+        );
 
         // 消息通道必须在 instance 之后建：它派生自 instance
         let validation = if want_validation {
-            Some(ValidationMessenger::new(&entry, &instance)?)
+            Some(ValidationMessenger::new(&entry, instance.instance())?)
         } else {
             None
         };
 
         // SAFETY: 仅枚举，不创建对象
-        let devices = unsafe { instance.enumerate_physical_devices() }
+        let devices = unsafe { instance.instance().enumerate_physical_devices() }
             .map_err(|e| format!("枚举物理设备失败: {e:?}"))?;
         if devices.is_empty() {
             return Err("未找到任何 Vulkan 物理设备".to_string());
@@ -288,7 +290,7 @@ impl VulkanInstance {
         let mut rejected: Vec<String> = Vec::new();
         for pd in devices {
             // SAFETY: pd 来自同一 instance 的枚举结果，在其销毁前始终有效
-            let properties = unsafe { instance.get_physical_device_properties(pd) };
+            let properties = unsafe { instance.instance().get_physical_device_properties(pd) };
             if properties.api_version < MIN_API_VERSION {
                 rejected.push(format!(
                     "{}（Vulkan {}）",
@@ -298,7 +300,7 @@ impl VulkanInstance {
                 continue;
             }
             // SAFETY: 队列族属性查询只读取驱动常量，不创建对象
-            let families = unsafe { snapshot_queue_families(&instance, pd) };
+            let families = unsafe { snapshot_queue_families(instance.instance(), pd) };
 
             // 有视频编码队列优先（+10），同级再按设备类型排
             let video_bonus = if families.iter().any(|f| f.supports_video_encode()) {
@@ -331,9 +333,12 @@ impl VulkanInstance {
         })?;
 
         // SAFETY: 仅枚举，不创建对象
-        let raw_exts =
-            unsafe { instance.enumerate_device_extension_properties(selected.physical_device) }
-                .map_err(|e| format!("枚举设备扩展失败: {e:?}"))?;
+        let raw_exts = unsafe {
+            instance
+                .instance()
+                .enumerate_device_extension_properties(selected.physical_device)
+        }
+        .map_err(|e| format!("枚举设备扩展失败: {e:?}"))?;
         let device_extensions = raw_exts
             .iter()
             // `extension_name_as_c_str` 是 ash 提供的安全 getter：驱动漏写 NUL 时返回 Err，
@@ -345,7 +350,7 @@ impl VulkanInstance {
         Ok(Self {
             inner: Arc::new(InstanceInner {
                 entry,
-                instance,
+                instance: instance.into_inner(),
                 physical_device: selected.physical_device,
                 properties: selected.properties,
                 queue_families: selected.queue_families,
@@ -451,6 +456,38 @@ impl Drop for InstanceInner {
         // 必然都已销毁，`vkDestroyInstance` 的「无存活子对象」前提成立
         unsafe {
             self.instance.destroy_instance(None);
+        }
+    }
+}
+
+/// 构造期实例守卫：`ash::Instance` 没有 `Drop`，成功交给 [`InstanceInner`] 之前
+/// 的任何错误路径都必须显式销毁实例。
+struct InstanceGuard(Option<ash::Instance>);
+
+impl InstanceGuard {
+    fn new(instance: ash::Instance) -> Self {
+        Self(Some(instance))
+    }
+
+    fn instance(&self) -> &ash::Instance {
+        self.0
+            .as_ref()
+            .expect("InstanceGuard 在 into_inner 前恒持有实例")
+    }
+
+    fn into_inner(mut self) -> ash::Instance {
+        self.0.take().expect("InstanceGuard 的实例已被取走")
+    }
+}
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        if let Some(instance) = self.0.take() {
+            // SAFETY: 守卫是实例的唯一所有者；`validation` 声明在它之后、先于它
+            // 析构，且此时尚未创建 VkDevice
+            unsafe {
+                instance.destroy_instance(None);
+            }
         }
     }
 }

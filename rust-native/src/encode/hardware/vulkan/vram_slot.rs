@@ -1,10 +1,9 @@
 //! 显存直通槽位 (VRAM Slot Interop)
 //!
 //! 把渲染侧产出的图像以外部内存句柄（Linux `OPAQUE_FD` / Windows `OPAQUE_WIN32`）
-//! 导入到本设备——像素全程留在显存里，不经过主机内存。支持两种生产格式：
-//! 单平面 ABGR8（交给色彩转换）与两平面 NV12（Vulkan Video 直接编码）。
-//!
-//! 格式取自槽位描述符，不由后端推断：猜错的表现是静默错色而不是报错。
+//! 导入到本设备——像素全程留在显存里，不经过主机内存。当前只接受单平面
+//! `R8G8B8A8_UNORM`；NV12 由导入后的 CSC 生成。格式写死在导入路径、描述符不携带，
+//! 生产侧（Java `VramExportSet`）必须导出同一格式，否则会静默错色。
 //!
 //! 这里只需要 [`VideoDevice`]：设备级命令一律走 `VideoDevice::resolve`
 //! （`vkGetDeviceProcAddr`），不需要 instance，也不赌 ash 扩展包装层的形态。
@@ -122,8 +121,18 @@ impl SlotImportGuard {
         let view = self.view.take().expect("视图已创建");
         // 信号量是可选的：生产侧可能没给，或导入失败后降级为无同步直通
         let semaphore = self.semaphore.take().unwrap_or(vk::Semaphore::null());
-        self.mem_handle = None;
-        self.sem_handle = None;
+        // 走到 finish 说明导入已成功；仍留在守卫里的句柄表示驱动未接管
+        // （信号量降级），必须在移交前关闭。
+        //
+        // SAFETY: 这些句柄从未交给驱动，由本结构唯一持有。
+        unsafe {
+            if let Some(h) = self.mem_handle.take() {
+                close_raw_handle(h);
+            }
+            if let Some(h) = self.sem_handle.take() {
+                close_raw_handle(h);
+            }
+        }
 
         VramSlot {
             slot_idx,
@@ -175,11 +184,15 @@ pub fn import(device: &VideoDevice, desc: &mut VramSlotDescriptor) -> Result<Vra
     let width = desc.width;
     let height = desc.height;
 
-    // 1. 原子接管句柄所有权，杜绝与调用方之间的 double-close
-    let (mem_handle, sem_handle) = desc.take_handles();
-    if mem_handle <= 0 {
-        return Err(format!("槽位 {slot_idx} 的内存句柄非法: {mem_handle}"));
+    // 1. 先校验再接管：校验失败时描述符仍是句柄所有者，由其 Drop 统一关闭
+    if desc.mem_handle <= 0 {
+        return Err(format!(
+            "槽位 {} 的内存句柄非法: {}",
+            desc.slot_idx, desc.mem_handle
+        ));
     }
+    // 2. 原子接管句柄所有权，杜绝与调用方之间的 double-close
+    let (mem_handle, sem_handle) = desc.take_handles();
 
     #[cfg(target_os = "linux")]
     if !device.has_extension("VK_KHR_external_memory_fd") {
@@ -193,7 +206,7 @@ pub fn import(device: &VideoDevice, desc: &mut VramSlotDescriptor) -> Result<Vra
     let mut guard = SlotImportGuard::new(device, mem_handle, sem_handle);
     let raw = device.device();
 
-    // 2. 外部图像
+    // 3. 外部图像
     #[cfg(target_os = "linux")]
     let handle_type = vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD;
     #[cfg(target_os = "windows")]
@@ -224,7 +237,7 @@ pub fn import(device: &VideoDevice, desc: &mut VramSlotDescriptor) -> Result<Vra
         .map_err(|e| format!("槽位 {slot_idx} 创建外部图像失败: {e:?}"))?;
     guard.image = Some(image);
 
-    // 3. 导入外部显存
+    // 4. 导入外部显存
     #[cfg(target_os = "linux")]
     {
         // SAFETY: image 为上方刚创建成功的本设备图像句柄，已被守卫接管、尚未销毁
@@ -309,13 +322,13 @@ pub fn import(device: &VideoDevice, desc: &mut VramSlotDescriptor) -> Result<Vra
         guard.mem_handle = None;
     }
 
-    // 4. 绑定
+    // 5. 绑定
     let memory = guard.memory.expect("外部显存已导入");
     // SAFETY: image 与 memory 均已创建/导入成功，offset 由生产侧给出（专用分配应为 0）
     unsafe { raw.bind_image_memory(image, memory, desc.offset) }
         .map_err(|e| format!("槽位 {slot_idx} 绑定外部显存失败: {e:?}"))?;
 
-    // 5. 视图
+    // 6. 视图
     let view_info = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
@@ -332,7 +345,7 @@ pub fn import(device: &VideoDevice, desc: &mut VramSlotDescriptor) -> Result<Vra
         .map_err(|e| format!("槽位 {slot_idx} 创建视图失败: {e:?}"))?;
     guard.view = Some(view);
 
-    // 6. 时间线信号量（可选）：成功时登记进守卫，失败时降级为无同步直通
+    // 7. 时间线信号量（可选）：成功时登记进守卫，失败时降级为无同步直通
     import_semaphore(device, &mut guard, slot_idx, sem_handle);
 
     Ok(guard.finish(slot_idx, width, height))
@@ -343,9 +356,8 @@ pub fn import(device: &VideoDevice, desc: &mut VramSlotDescriptor) -> Result<Vra
 /// 降级是**有意**的：生产侧可能来自不支持信号量导出的 API（例如部分 GL 路径），
 /// 此时只能靠帧间顺序保证，画面可能撕裂但不会崩。调用方通过 `semaphore()` 判断。
 ///
-/// 成功时把句柄登记进 `guard`，由 `finish` 取走；失败时**不留下任何句柄** ——
-/// 创建成功但导入失败的那个信号量在这里就地销毁，否则它会跟着守卫活到 `Drop`，
-/// 而 `finish` 又会把它当成有效信号量交给 `VramSlot`。
+/// 成功时把句柄登记进 `guard`；失败时不登记 Vulkan 信号量，创建成功的信号量就地
+/// 销毁，原始系统句柄留给 `finish` 或守卫 `Drop` 关闭。
 fn import_semaphore(
     device: &VideoDevice,
     guard: &mut SlotImportGuard,
