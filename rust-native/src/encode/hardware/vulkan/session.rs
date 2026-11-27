@@ -310,8 +310,8 @@ impl VideoSessionParameters {
 
     /// 公共收尾：取驱动序列化的参数集字节并组装 `Self`
     ///
-    /// `feedback` 传 null 时不取反馈；非 null 时必须指向该 codec 的
-    /// `VideoEncode*SessionParametersFeedbackInfoKHR`，由调用方在返回后读取并告警。
+    /// `feedback` 传 null 时不取反馈；非 null 时必须指向顶层的
+    /// `VideoEncodeSessionParametersFeedbackInfoKHR`，codec 专属反馈挂在它的 pNext 链上。
     ///
     /// 各 codec 的参数集构造在 `frame_encoder/{h264,hevc,av1}.rs`，经本方法与
     /// [`Self::fetch_encoded`] 收尾——字段不外泄，调用方拿不到「半组装」的对象。
@@ -346,8 +346,8 @@ impl VideoSessionParameters {
     /// `info` 的 `pNext` 链决定取哪些参数集：H.264 / H.265 必须挂 codec 专属的
     /// `VideoEncode*SessionParametersGetInfoKHR`（VUID 08262 / 08265），AV1 留空。
     ///
-    /// `feedback` 为 null 时不取反馈；非 null 时必须指向该 codec 的
-    /// `VideoEncode*SessionParametersFeedbackInfoKHR`，用于判断驱动是否覆盖了 std 参数。
+    /// `feedback` 为 null 时不取反馈；非 null 时必须指向顶层的
+    /// `VideoEncodeSessionParametersFeedbackInfoKHR`，codec 专属反馈挂在它的 pNext 链上。
     pub(super) fn fetch_encoded(
         device: &VideoDevice,
         info: &vk::VideoEncodeSessionParametersGetInfoKHR<'_>,

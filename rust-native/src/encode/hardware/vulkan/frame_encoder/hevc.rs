@@ -7,14 +7,17 @@
 //!
 //! VPS / SPS / PPS 的最小集合，字段对着 `vk_video/vulkan_video_codec_h265std.h` 逐项核对。
 //!
+//! **VUI 声明 BT.709 + Limited**：与 CSC 输出一致；缺了它解码器只能按默认色域猜，
+//! 多数实现默认 BT.601，表现为整片偏色。H.264 / AV1 用的是同一组色彩参数。
+//!
 //! **码流字节由驱动生成**（`vkGetEncodedVideoSessionParametersKHR`），std 结构体只负责
 //! 填字段。驱动可以按 encode quality level 对参数施加覆盖，只有它自己序列化出来的那份
 //! 才与它写出的 slice NAL 同源 —— 所以这里不再手写任何语法。
 //!
-//! **参数集的生命周期约束（很重要）**：`StdVideoH265VideoParameterSet::pDecPicBufMgr` /
-//! `pProfileTierLevel` 是裸指针。`parameter_sets` 只把调用方给的引用存进去，**不拥有**它们；
-//! 调用方必须保证这两个结构体活到参数集用完为止。这样做是为了避免自引用结构——
-//! 若把 `dpb` / `ptl` 放进返回值再取地址，返回时指针就悬垂了。
+//! **参数集的生命周期约束**：`pDecPicBufMgr` / `pProfileTierLevel` /
+//! `pSequenceParameterSetVui` 是裸指针。`parameter_sets` 只把调用方给的引用存进去，
+//! **不拥有**它们；调用方必须保证这三个结构体活到参数集用完为止。这样做是为了避免
+//! 自引用结构——若把它们放进返回值再取地址，返回时指针就悬垂了。
 //!
 //! 每帧部分构造 std 结构体并装进 Vulkan 编码命令。字段来自
 //! `vk_video/vulkan_video_codec_h265std_encode.h`。
@@ -34,14 +37,13 @@ use ash::vk::native::{
     StdVideoEncodeH265SliceSegmentHeader, StdVideoEncodeH265SliceSegmentHeaderFlags,
     StdVideoH265DecPicBufMgr, StdVideoH265PictureParameterSet, StdVideoH265PpsFlags,
     StdVideoH265ProfileTierLevel, StdVideoH265ProfileTierLevelFlags,
-    StdVideoH265SequenceParameterSet, StdVideoH265ShortTermRefPicSet, StdVideoH265SpsFlags,
+    StdVideoH265SequenceParameterSet, StdVideoH265SequenceParameterSetVui,
+    StdVideoH265ShortTermRefPicSet, StdVideoH265SpsFlags, StdVideoH265SpsVuiFlags,
     StdVideoH265VideoParameterSet, StdVideoH265VpsFlags,
 };
 use ash::vk::{self, TaggedStructure};
 
-use super::{
-    CONSTANT_QP, CodecRateControl, FrameEncoder, begin_scope, intra_refresh_info, picture_resource,
-};
+use super::{CodecRateControl, FrameEncoder, begin_scope, intra_refresh_info, picture_resource};
 use crate::encode::VideoCodec;
 use crate::encode::hardware::vulkan::caps::CodecCaps;
 use crate::encode::hardware::vulkan::device::VideoDevice;
@@ -74,7 +76,7 @@ const TILE_ROWS_LIST_SIZE: usize = 21;
 
 /// 一组参数集
 ///
-/// 内含指向 `dpb` / `ptl` 的裸指针，见模块文档的生命周期约束。
+/// 内含指向 `dpb` / `ptl` / `vui` 的裸指针，见模块文档的生命周期约束。
 pub struct HevcParameterSets {
     pub vps: StdVideoH265VideoParameterSet,
     pub sps: StdVideoH265SequenceParameterSet,
@@ -91,11 +93,79 @@ pub fn dpb() -> StdVideoH265DecPicBufMgr {
     dpb
 }
 
+/// 序列参数集 VUI：BT.709 + Limited Range
+///
+/// 与 CSC 输出一致；不声明时序、HRD、宽高比与默认显示窗口（对应 present flag 保持 0）。
+pub fn vui() -> StdVideoH265SequenceParameterSetVui {
+    // SAFETY: 纯位域 POD，全零位模式合法（所有 present_flag 为 0）
+    let mut flags = unsafe { std::mem::zeroed::<StdVideoH265SpsVuiFlags>() };
+    // 打开后解码器才会读 video_format / video_full_range_flag / 三个色彩字段
+    flags.set_video_signal_type_present_flag(1);
+    flags.set_colour_description_present_flag(1);
+    // video_full_range_flag 保持 0：CSC 输出 Limited Range（Y 16..235 / UV 16..240）
+
+    StdVideoH265SequenceParameterSetVui {
+        flags,
+        // aspect_ratio_info_present_flag = 0，以下三个字段被忽略
+        aspect_ratio_idc: 0,
+        sar_width: 0,
+        sar_height: 0,
+        video_format: 5,
+        colour_primaries: 1,
+        transfer_characteristics: 1,
+        matrix_coeffs: 1,
+        // chroma_loc_info_present_flag = 0，以下两个字段被忽略
+        chroma_sample_loc_type_top_field: 0,
+        chroma_sample_loc_type_bottom_field: 0,
+        reserved1: 0,
+        reserved2: 0,
+        // default_display_window_flag = 0，以下四个字段被忽略
+        def_disp_win_left_offset: 0,
+        def_disp_win_right_offset: 0,
+        def_disp_win_top_offset: 0,
+        def_disp_win_bottom_offset: 0,
+        // timing_info_present_flag = 0，以下三个字段被忽略
+        vui_num_units_in_tick: 0,
+        vui_time_scale: 0,
+        vui_num_ticks_poc_diff_one_minus1: 0,
+        // bitstream_restriction_flag = 0，以下字段被忽略
+        min_spatial_segmentation_idc: 0,
+        reserved3: 0,
+        max_bytes_per_pic_denom: 0,
+        max_bits_per_min_cu_denom: 0,
+        log2_max_mv_length_horizontal: 0,
+        log2_max_mv_length_vertical: 0,
+        pHrdParameters: std::ptr::null(),
+    }
+}
+
+/// 码流 `general_level_idc`（level 数值 × 30）→ `StdVideoH265LevelIdc` 枚举值
+///
+/// `StdVideoH265ProfileTierLevel::general_level_idc` 的类型是枚举（0 = 1.0 … 12 = 6.2），
+/// 不是码流语法元素；把 123 这类语法值直接填进去会被驱动当成越界枚举，序列化出 255。
+fn level_enum(general_level_idc: u32) -> u32 {
+    match general_level_idc {
+        30 => 0,   // 1.0
+        60 => 1,   // 2.0
+        63 => 2,   // 2.1
+        90 => 3,   // 3.0
+        93 => 4,   // 3.1
+        120 => 5,  // 4.0
+        123 => 6,  // 4.1
+        150 => 7,  // 5.0
+        153 => 8,  // 5.1
+        156 => 9,  // 5.2
+        180 => 10, // 6.0
+        183 => 11, // 6.1
+        _ => 12,   // 6.2；`hevc_level_idc` 只会返回上表的值
+    }
+}
+
 /// profile / tier / level
 ///
-/// `level_idc` 是 `StdVideoH265LevelIdc` **枚举值**，不是码流里的 `general_level_idc`
-/// 语法元素（后者 = level 数值 × 30）。换算由驱动做 —— 本模块不产出码流字节。
-pub fn profile_tier_level(level_idc: u32) -> StdVideoH265ProfileTierLevel {
+/// `general_level_idc` 是码流里的 level 数值 × 30（如 4.1 → 123）；这里换算成
+/// `StdVideoH265LevelIdc` 枚举值——std 结构存的是枚举，不是语法元素。
+pub fn profile_tier_level(general_level_idc: u32) -> StdVideoH265ProfileTierLevel {
     // SAFETY: 位域 POD，全零位模式合法
     let mut flags = unsafe { std::mem::zeroed::<StdVideoH265ProfileTierLevelFlags>() };
     // 逐行扫描、仅帧编码
@@ -104,7 +174,7 @@ pub fn profile_tier_level(level_idc: u32) -> StdVideoH265ProfileTierLevel {
     StdVideoH265ProfileTierLevel {
         flags,
         general_profile_idc: PROFILE_MAIN,
-        general_level_idc: level_idc,
+        general_level_idc: level_enum(general_level_idc),
     }
 }
 
@@ -113,12 +183,15 @@ pub fn profile_tier_level(level_idc: u32) -> StdVideoH265ProfileTierLevel {
 /// `frame_num_bits` 是 `log2(MaxPocLsb)`，由 GOP 长度决定（HEVC 的 SPS 里不再有 frame_num，
 /// 只有 POC LSB 的位宽）。上限 12 与 H.264 一致：`log2_max_pic_order_cnt_lsb_minus4`
 /// 语法元素本身允许 0..=12，但 16 位 POC LSB 在解码器侧兼容性无保证。
+///
+/// `dpb` / `ptl` / `vui` 由调用方持有：参数集只存它们的地址，不拥有它们。
 pub fn parameter_sets(
     extent: ash::vk::Extent2D,
     display: ash::vk::Extent2D,
     frame_num_bits: u32,
     dpb: &StdVideoH265DecPicBufMgr,
     ptl: &StdVideoH265ProfileTierLevel,
+    vui: &StdVideoH265SequenceParameterSetVui,
 ) -> HevcParameterSets {
     let bits = frame_num_bits.clamp(4, 12) as u8;
 
@@ -147,6 +220,8 @@ pub fn parameter_sets(
     // SAFETY: 同上
     let mut sps_flags = unsafe { std::mem::zeroed::<StdVideoH265SpsFlags>() };
     sps_flags.set_sps_temporal_id_nesting_flag(1);
+    // VUI 声明 BT.709 + Limited；没有它解码器只能按默认色域猜
+    sps_flags.set_vui_parameters_present_flag(1);
     // 裁剪窗口：编码尺寸按 16 对齐后可能大于显示尺寸（1080 → 1088）。HEVC 的 conf_win
     // 偏移以 4:2:0 的色度样本为单位（SubWidthC / SubHeightC = 2），所以是差值的一半；
     // 只裁右侧与底部，左上角保持原点
@@ -166,15 +241,16 @@ pub fn parameter_sets(
         bit_depth_luma_minus8: 0,
         bit_depth_chroma_minus8: 0,
         log2_max_pic_order_cnt_lsb_minus4: bits - 4,
-        // CTB：最小 8x8（minus3 = 0）、最大 32x32（diff = 2）——
-        // 驱动声明的 `ctb_sizes` 只有 TYPE_32，写大一级会被判非法
+        // CTB：最小 8x8（minus3 = 0）、最大 32x32（diff = 2）
         log2_min_luma_coding_block_size_minus3: 0,
         log2_diff_max_min_luma_coding_block_size: 2,
-        // 变换块：最小 4x4（minus2 = 0）、最大 32x32（diff = 3）
+        // 变换块：最小 4x4（minus2 = 0）、最大 32x32（diff = 3）。
+        // 层级必须给满 3（32 → 16 → 8 → 4）：层级 0 时 NVIDIA 的 H.265 编码器
+        // 只写画面顶部的少量 CTB 行，其余解码为黑；这是驱动行为，不是码流约束。
         log2_min_luma_transform_block_size_minus2: 0,
         log2_diff_max_min_luma_transform_block_size: 3,
-        max_transform_hierarchy_depth_inter: 0,
-        max_transform_hierarchy_depth_intra: 0,
+        max_transform_hierarchy_depth_inter: 3,
+        max_transform_hierarchy_depth_intra: 3,
         // 不预设短/长期参考集：参考列表由每帧的 std 结构给出
         num_short_term_ref_pic_sets: 0,
         num_long_term_ref_pics_sps: 0,
@@ -198,7 +274,7 @@ pub fn parameter_sets(
         pScalingLists: std::ptr::null(),
         pShortTermRefPicSet: std::ptr::null(),
         pLongTermRefPicsSps: std::ptr::null(),
-        pSequenceParameterSetVui: std::ptr::null(),
+        pSequenceParameterSetVui: vui,
         pPredictorPaletteEntries: std::ptr::null(),
     };
 
@@ -444,8 +520,8 @@ pub fn reference_info(poc: i32, is_idr: bool) -> StdVideoEncodeH265ReferenceInfo
 impl VideoSessionParameters {
     /// 建 H.265 的会话参数对象（VPS + SPS + PPS）
     ///
-    /// `dpb` / `ptl` 必须是本函数的局部变量：`parameter_sets` 只把它们的地址存进参数集，
-    /// 不拥有它们。挪到返回值里就会悬垂。
+    /// `dpb` / `ptl` / `vui` 必须是本函数的局部变量：`parameter_sets` 只把它们的地址
+    /// 存进参数集，不拥有它们。挪到返回值里就会悬垂。
     pub(super) fn new_h265(
         device: &VideoDevice,
         session: &VideoSession,
@@ -459,7 +535,15 @@ impl VideoSessionParameters {
         let extent = session.coded_extent();
         let dpb = dpb();
         let ptl = profile_tier_level(level_idc);
-        let sets = parameter_sets(extent, session.display_extent(), frame_num_bits, &dpb, &ptl);
+        let vui = vui();
+        let sets = parameter_sets(
+            extent,
+            session.display_extent(),
+            frame_num_bits,
+            &dpb,
+            &ptl,
+            &vui,
+        );
 
         let add_info = vk::VideoEncodeH265SessionParametersAddInfoKHR::default()
             .std_vp_ss(std::slice::from_ref(&sets.vps))
@@ -496,9 +580,13 @@ impl VideoSessionParameters {
         let info = vk::VideoEncodeSessionParametersGetInfoKHR::default()
             .video_session_parameters(params)
             .push(&mut get_info);
-        // H.265 是本机唯一没法解码验证的 codec，「驱动有没有覆盖我们给的参数」比
-        // H.264 更值得看——与 H.264 同一套反馈通道
-        let mut feedback = vk::VideoEncodeH265SessionParametersFeedbackInfoKHR::default();
+        // H.265 的 SPS/PPS 字段更多，驱动是否覆盖我们给的参数更值得关注——
+        // 与 H.264 同一套反馈通道
+        let mut h265_feedback = vk::VideoEncodeH265SessionParametersFeedbackInfoKHR::default();
+        // `pFeedbackInfo` 的顶层类型固定是 `VideoEncodeSessionParametersFeedbackInfoKHR`，
+        // codec 专属反馈挂在它的 pNext 链上；直接传 codec 专属结构会违反 VUID
+        let mut feedback =
+            vk::VideoEncodeSessionParametersFeedbackInfoKHR::default().push(&mut h265_feedback);
         let this = Self::assemble(
             device,
             params,
@@ -528,8 +616,10 @@ impl FrameEncoder {
         let parts = HevcFrameParts::new(if is_idr { None } else { Some(ref_idx as u8) });
         let frame = build(&parts, is_idr, poc);
 
+        // CBR 下 constantQp 必须为 0（VUID-vkCmdEncodeVideoKHR-constantQp-08272），
+        // QP 由码控计算；填固定值会让驱动行为未定义
         let slice = vk::VideoEncodeH265NaluSliceSegmentInfoKHR::default()
-            .constant_qp(CONSTANT_QP)
+            .constant_qp(0)
             .std_slice_segment_header(&frame.slice_header);
         let mut picture_info = vk::VideoEncodeH265PictureInfoKHR::default()
             .nalu_slice_segment_entries(std::slice::from_ref(&slice))
@@ -615,6 +705,85 @@ impl FrameEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VUI：BT.709 + Limited Range
+    #[test]
+    fn test_vui_bt709_limited() {
+        let v = vui();
+        assert_eq!(v.flags.video_signal_type_present_flag(), 1);
+        assert_eq!(v.flags.colour_description_present_flag(), 1);
+        assert_eq!(v.flags.video_full_range_flag(), 0, "0 = limited range");
+        assert_eq!(
+            v.video_format, 5,
+            "未指定视频格式，色彩由 color description 表达"
+        );
+        assert_eq!(v.colour_primaries, 1, "BT.709");
+        assert_eq!(v.transfer_characteristics, 1);
+        assert_eq!(v.matrix_coeffs, 1);
+        assert!(v.pHrdParameters.is_null());
+    }
+
+    /// SPS：VUI 标志置位，指针指向调用方持有的那一份
+    #[test]
+    fn test_sps_declares_vui() {
+        let dpb = dpb();
+        let ptl = profile_tier_level(93);
+        let vui = vui();
+        let sets = parameter_sets(
+            vk::Extent2D {
+                width: 1920,
+                height: 1088,
+            },
+            vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            9,
+            &dpb,
+            &ptl,
+            &vui,
+        );
+
+        assert_eq!(sets.sps.flags.vui_parameters_present_flag(), 1);
+        assert_eq!(
+            sets.sps.pSequenceParameterSetVui, &vui as *const StdVideoH265SequenceParameterSetVui,
+            "VUI 指针必须指向调用方持有的那一份"
+        );
+        assert_eq!(sets.sps.conf_win_bottom_offset, 4, "(1088-1080)/2 = 4");
+    }
+
+    /// std 的 `general_level_idc` 是枚举而非码流语法值：123 必须落到 4.1（枚举 6）
+    #[test]
+    fn test_profile_tier_level_converts_codec_level_to_enum() {
+        assert_eq!(profile_tier_level(93).general_level_idc, 4, "3.1");
+        assert_eq!(profile_tier_level(123).general_level_idc, 6, "4.1");
+        assert_eq!(profile_tier_level(186).general_level_idc, 12, "6.2");
+    }
+
+    /// 变换层级给满 32 → 4 的四层；层级 0 会让 NVIDIA H.265 只编码顶部少量 CTB
+    #[test]
+    fn test_sps_transform_hierarchy_is_full_depth() {
+        let dpb = dpb();
+        let ptl = profile_tier_level(93);
+        let vui = vui();
+        let sets = parameter_sets(
+            vk::Extent2D {
+                width: 1920,
+                height: 1088,
+            },
+            vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            9,
+            &dpb,
+            &ptl,
+            &vui,
+        );
+
+        assert_eq!(sets.sps.max_transform_hierarchy_depth_inter, 3);
+        assert_eq!(sets.sps.max_transform_hierarchy_depth_intra, 3);
+    }
 
     /// IDR：IRAP 标志置位、I slice、无参考列表
     #[test]
@@ -755,7 +924,10 @@ mod tests {
                 let info = vk::VideoEncodeSessionParametersGetInfoKHR::default()
                     .video_session_parameters(params.params())
                     .push(&mut get_info);
-                let mut feedback = vk::VideoEncodeH265SessionParametersFeedbackInfoKHR::default();
+                let mut h265_feedback =
+                    vk::VideoEncodeH265SessionParametersFeedbackInfoKHR::default();
+                let mut feedback = vk::VideoEncodeSessionParametersFeedbackInfoKHR::default()
+                    .push(&mut h265_feedback);
                 let bytes = VideoSessionParameters::fetch_encoded(
                     &device,
                     &info,
@@ -764,9 +936,9 @@ mod tests {
                 .expect("带反馈地再取一次参数集");
                 println!(
                     "驱动覆盖情况: VPS={} SPS={} PPS={} / 字节数 {}",
-                    feedback.has_std_vps_overrides != 0,
-                    feedback.has_std_sps_overrides != 0,
-                    feedback.has_std_pps_overrides != 0,
+                    h265_feedback.has_std_vps_overrides != 0,
+                    h265_feedback.has_std_sps_overrides != 0,
+                    h265_feedback.has_std_pps_overrides != 0,
                     bytes.len()
                 );
             }

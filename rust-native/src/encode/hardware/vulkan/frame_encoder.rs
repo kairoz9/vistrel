@@ -44,9 +44,6 @@ fn picture_resource(
         .image_view_binding(view)
 }
 
-/// 无码控时的固定 QP
-const CONSTANT_QP: i32 = 26;
-
 /// 让一个 GOP 内的 `frame_num` 不重复所需的最小位宽（`log2(MaxFrameNum)`）
 fn frame_num_bits(gop_length: u32) -> u32 {
     let needed = gop_length.saturating_add(1).max(16);

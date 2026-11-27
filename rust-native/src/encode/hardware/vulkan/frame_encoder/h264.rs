@@ -25,9 +25,7 @@ use ash::vk::native::{
 };
 use ash::vk::{self, TaggedStructure};
 
-use super::{
-    CONSTANT_QP, CodecRateControl, FrameEncoder, begin_scope, intra_refresh_info, picture_resource,
-};
+use super::{CodecRateControl, FrameEncoder, begin_scope, intra_refresh_info, picture_resource};
 use crate::encode::VideoCodec;
 use crate::encode::hardware::vulkan::caps::CodecCaps;
 use crate::encode::hardware::vulkan::device::VideoDevice;
@@ -228,10 +226,13 @@ impl H264FrameParts {
     pub fn new(ref_slot: Option<u8>) -> Self {
         // SAFETY: 纯位域 POD，bindgen 不派生 Default；全零位模式合法
         let mut ref_lists = unsafe { std::mem::zeroed::<StdVideoEncodeH264ReferenceListsInfo>() };
+        // 未使用的表项必须是 NO_REFERENCE：0 是合法槽号，留成 0 会让驱动把不存在
+        // 的参考当成有效槽（VUID-vkCmdEncodeVideoKHR-pNext-08339）
+        ref_lists.RefPicList0 = [NO_REFERENCE_PICTURE; 32];
+        ref_lists.RefPicList1 = [NO_REFERENCE_PICTURE; 32];
         // P 帧：参考列表只含一个条目，指向上一帧所在的 DPB 槽
         if let Some(slot) = ref_slot {
             ref_lists.num_ref_idx_l0_active_minus1 = 0;
-            ref_lists.RefPicList0 = [NO_REFERENCE_PICTURE; 32];
             ref_lists.RefPicList0[0] = slot;
         }
         Self { ref_lists }
@@ -416,13 +417,15 @@ impl VideoSessionParameters {
         // 这是唯一能知道「我们填的 std 参数与实现期望是否一致」的通道，传 null 就永远
         // 不知道。覆盖为真意味着码流里那份参数集不是我们写的那份——排查码流问题时
         // 必须先排除这一项，否则所有「按代码推断字段值」的结论都不成立。
-        let mut feedback = vk::VideoEncodeH264SessionParametersFeedbackInfoKHR::default();
+        let mut h264_feedback = vk::VideoEncodeH264SessionParametersFeedbackInfoKHR::default();
+        // `pFeedbackInfo` 的顶层类型固定是 `VideoEncodeSessionParametersFeedbackInfoKHR`，
+        // codec 专属反馈挂在它的 pNext 链上；直接传 codec 专属结构会违反 VUID
+        let mut feedback =
+            vk::VideoEncodeSessionParametersFeedbackInfoKHR::default().push(&mut h264_feedback);
         let this = Self::assemble(
             device,
             params,
             &info,
-            // `*mut _` 让编译器从 `&mut feedback` 推断具体类型，避免手写带生命周期参数的
-            // 结构体名；第二段 cast 到函数要求的 `*mut c_void`
             &mut feedback as *mut _ as *mut std::ffi::c_void,
         )?;
         Ok(this)
@@ -457,8 +460,10 @@ impl FrameEncoder {
         let parts = H264FrameParts::new(if is_idr { None } else { Some(ref_idx as u8) });
         let frame = build(&parts, is_idr, frame_num, idr_pic_id);
 
+        // CBR 下 constantQp 必须为 0（VUID-vkCmdEncodeVideoKHR-constantQp-08269），
+        // QP 由码控计算；填固定值会让驱动行为未定义
         let nalu_slice = vk::VideoEncodeH264NaluSliceInfoKHR::default()
-            .constant_qp(CONSTANT_QP)
+            .constant_qp(0)
             .std_slice_header(&frame.slice_header);
         let mut h264_picture_info = vk::VideoEncodeH264PictureInfoKHR::default()
             .nalu_slice_entries(std::slice::from_ref(&nalu_slice))
@@ -587,6 +592,10 @@ mod tests {
         assert_eq!(
             parts.ref_lists.RefPicList0[1], NO_REFERENCE_PICTURE,
             "其余表项应为空位"
+        );
+        assert_eq!(
+            parts.ref_lists.RefPicList1[0], NO_REFERENCE_PICTURE,
+            "未使用的 L1 也必须全部是空位"
         );
         assert_eq!(parts.ref_lists.num_ref_idx_l0_active_minus1, 0);
     }
@@ -733,7 +742,10 @@ mod tests {
                 let info = vk::VideoEncodeSessionParametersGetInfoKHR::default()
                     .video_session_parameters(params.params())
                     .push(&mut get_info);
-                let mut feedback = vk::VideoEncodeH264SessionParametersFeedbackInfoKHR::default();
+                let mut h264_feedback =
+                    vk::VideoEncodeH264SessionParametersFeedbackInfoKHR::default();
+                let mut feedback = vk::VideoEncodeSessionParametersFeedbackInfoKHR::default()
+                    .push(&mut h264_feedback);
                 let bytes = VideoSessionParameters::fetch_encoded(
                     &device,
                     &info,
@@ -742,8 +754,8 @@ mod tests {
                 .expect("带反馈地再取一次参数集");
                 println!(
                     "驱动覆盖情况: SPS={} PPS={} / 字节数 {}",
-                    feedback.has_std_sps_overrides != 0,
-                    feedback.has_std_pps_overrides != 0,
+                    h264_feedback.has_std_sps_overrides != 0,
+                    h264_feedback.has_std_pps_overrides != 0,
                     bytes.len()
                 );
             }
