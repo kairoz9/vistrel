@@ -116,7 +116,7 @@ cd rust-native && cargo build --release
 # For non-default targets, inject the triple as well:
 # ./gradlew buildAndCollect -Pvistrel.windowsTriple=<target>
 # ./gradlew buildAndCollect -Pvistrel.linuxTriple=<target>
-# Output: build/libs/<version>/vistrel-<loader>-<version>-<modversion>.jar
+# Output: build/libs/vistrel-<loader>-<version>-<modversion>.jar
 
 # 3. Build a single combination
 ./gradlew :fabric:26.3:assemble

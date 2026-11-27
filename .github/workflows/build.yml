@@ -195,7 +195,7 @@ jobs:
         run: ./gradlew buildAndCollect -x webAssets --no-daemon
 
       - name: Stage distributable jars
-        # 发布产物扁平化：只收玩家 jar（build/libs/<MC>/），sources jar 不随 Release 分发
+        # 发布产物扁平化：只收玩家 jar（build/libs/），sources jar 不随 Release 分发
         if: inputs.upload_jars
         run: |
           mkdir dist

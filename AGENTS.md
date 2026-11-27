@@ -85,7 +85,7 @@
 cd rust-native && cargo build --release
 
 # 2. 批量编译并打包全版本全加载器（1.20 / 1.21 / 26.1 / 26.2 / 26.3）的最终 Jar 包
-#    产物统一归拢到 build/libs/<MC 版本>/
+#    产物统一归拢到 build/libs/
 #    消费指定 target 编译产物时注入 -Pvistrel.windowsTriple=<target> / -Pvistrel.linuxTriple=<target>
 ./gradlew buildAndCollect
 
@@ -94,7 +94,7 @@ cd rust-native && cargo build --release
 ./gradlew :neoforge:1.21:assemble
 ./gradlew :forge:1.20:assemble
 
-# 3.5 单独归拢指定版本的产物到根 build/libs/<MC 版本>/
+# 3.5 单独归拢指定版本的产物到根 build/libs/
 ./gradlew :fabric:26.3:buildAndCollect
 
 # 4. 启动指定版本的目标客户端进行联调

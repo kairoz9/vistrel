@@ -53,5 +53,3 @@ neoForge {
         }
     }
 }
-
-sourceSets.named("main") { resources.srcDir("src/generated/resources") }

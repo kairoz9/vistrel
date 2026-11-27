@@ -58,11 +58,6 @@ stonecutter parameters {
 }
 
 
-// Spotless 用独立 configuration 解析格式化器，需从 mavenCentral 拉取
-repositories {
-    mavenCentral()
-}
-
 spotless {
     java {
         // 只格式化根源码；versions/ 与 build/ 是生成目录
@@ -113,5 +108,4 @@ tasks.register("buildAndCollect") {
     dependsOn(stonecutter.tasks.named("build"))
     dependsOn(stonecutter.tasks.named("buildAndCollect") { branch.id != "common" })
     dependsOn(tasks.named("check"))
-    dependsOn(tasks.named("webAssets"))
 }

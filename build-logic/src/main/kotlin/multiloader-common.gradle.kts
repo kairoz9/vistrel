@@ -20,7 +20,6 @@ fun Project.fabricVersionRange(mavenRange: String): String {
 }
 
 val minecraftVersion = project.name
-val obfuscated = prop("loomx.obfuscated").toBoolean()
 val modId = prop("mod.id")
 val modName = prop("mod.name")
 val modAuthor = prop("mod.author")
@@ -44,12 +43,13 @@ val expandProps = mapOf(
     "loader_version" to optionalProp("deps.loader_version"),
 )
 
-logger.lifecycle("[${project.path}] stonecutter version = $minecraftVersion (obfuscated: $obfuscated)")
-
 val loaderName = parent?.takeIf { it != rootProject }?.name ?: project.name
 
+// 归档名的唯一计算点：manifest 与 Maven 发布坐标都复用该值
+val projectArchivesName = "$modId-$loaderName-$minecraftVersion"
+
 base {
-    archivesName = "$modId-$loaderName-$minecraftVersion"
+    archivesName = projectArchivesName
 }
 
 java {
@@ -85,9 +85,9 @@ tasks.jar {
         attributes(
             "Specification-Title" to modName,
             "Specification-Vendor" to modAuthor,
-            "Specification-Version" to archiveVersion.get(),
+            "Specification-Version" to version,
             "Implementation-Title" to project.name,
-            "Implementation-Version" to archiveVersion.get(),
+            "Implementation-Version" to version,
             "Implementation-Vendor" to modAuthor,
             "Built-On-Minecraft" to minecraftVersion,
         )
@@ -115,7 +115,7 @@ tasks.processResources {
 publishing {
     publications {
         register("mavenJava", MavenPublication::class) {
-            artifactId = base.archivesName.get()
+            artifactId = projectArchivesName
             from(components["java"])
         }
     }

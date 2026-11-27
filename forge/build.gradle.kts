@@ -16,9 +16,6 @@ plugins {
 
 val modId = providers.gradleProperty("mod.id").get()
 
-// Include generated resources
-sourceSets.named("main") { resources.srcDir("src/generated/resources") }
-
 minecraft {
     runs {
         configureEach {
@@ -94,11 +91,11 @@ val srgJar = renamer.classes(fatJar) {
     archiveClassifier = "srg"
 }
 
-// 只收 SRG 发布产物与 sources jar；发布产物去 classifier 取标准名
 tasks.named<Copy>("buildAndCollect") {
-    val releaseJarName = "${base.archivesName.get()}-${version}.jar"
+    val archivesName = base.archivesName
+    val releaseVersion = version.toString()
     from(srgJar.flatMap { it.output }) {
-        rename { releaseJarName }
+        rename { "${archivesName.get()}-$releaseVersion.jar" }
     }
     from(tasks.named<Jar>("sourcesJar").flatMap { it.archiveFile })
 }

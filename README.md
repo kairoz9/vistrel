@@ -94,7 +94,7 @@ cd rust-native && cargo build --release
 # 非默认 target 编译时需同步注入：
 # ./gradlew buildAndCollect -Pvistrel.windowsTriple=<target>
 # ./gradlew buildAndCollect -Pvistrel.linuxTriple=<target>
-# 产物位于 build/libs/<版本>/vistrel-<loader>-<版本>-<mod版本>.jar
+# 产物位于 build/libs/vistrel-<loader>-<版本>-<mod版本>.jar
 
 # 3. 单独构建指定组合
 ./gradlew :fabric:26.3:assemble

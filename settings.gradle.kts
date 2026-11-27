@@ -24,10 +24,24 @@ pluginManagement {
                 includeGroupAndSubgroups("net.minecraftforge")
             }
         }
-        maven {
-            name = "KikuGie"
-            url = uri("https://maven.kikugie.dev/releases")
+        exclusiveContent {
+            forRepository {
+                maven {
+                    name = "KikuGie"
+                    url = uri("https://maven.kikugie.dev/releases")
+                }
+            }
+            filter {
+                includeGroupAndSubgroups("dev.kikugie")
+            }
         }
+    }
+}
+
+// 依赖仓库的单一来源；ForgeGradle 仍会向项目注入自己的仓库，故不启用 FAIL_ON_PROJECT_REPOS
+dependencyResolutionManagement {
+    repositories {
+        mavenCentral()
     }
 }
 
