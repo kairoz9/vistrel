@@ -913,7 +913,7 @@ mod tests {
                 println!("参数集 NAL 头: {headers:02x?}");
                 assert_eq!(headers, vec![0x40, 0x42, 0x44], "顺序应为 VPS → SPS → PPS");
 
-                // H.265 是本机唯一没法解码验证的 codec，覆盖情况比 H.264 更值得看
+                // H.265 的 SPS/PPS 字段更多，覆盖情况比 H.264 更值得看
                 let mut get_info = vk::VideoEncodeH265SessionParametersGetInfoKHR::default()
                     .write_std_vps(true)
                     .write_std_sps(true)

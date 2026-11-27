@@ -119,8 +119,8 @@ pub fn color_config() -> StdVideoAV1ColorConfig {
 /// `order_hint` 与 `ref_order_hint[8]` 由我们手写（NVENC 侧由驱动生成），
 /// 任何一处不一致，硬件解码器做 MV 投影时就会与编码端的理解分叉。
 ///
-/// 曾用 7（8 位），理由是「4 位装不下 60/120/240 的 GOP」。但那是误解：
-/// order hint 只需要表达**参考帧与当前帧的距离**，本实现永远参考上一帧，距离固定为 1。
+/// order hint 只需要表达**参考帧与当前帧的距离**；本实现永远参考上一帧，距离固定为
+/// 1，4 位足够。不要用「GOP 长度需要更多位」来放大它：距离与 GOP 长度无关。
 const ORDER_HINT_BITS_MINUS_1: u8 = 0;
 
 /// 序列头

@@ -338,10 +338,10 @@ impl FrameEncoder {
         codec_rate_control: Option<CodecRateControl<'_>>,
     ) -> Result<(), SubmitFailure> {
         // **begin 作用域必须声明本帧用到的全部槽位，含当前帧的输出槽**——排布规则与
-        // 07239 / 08215 两条 VU 的推导见 `begin_scope`。之前两种写法都错过：只在 encode
-        // 里给槽位（08215）、把 setup 槽按真实槽号绑进 begin（07239）
-        // **码控的三条 VU 只允许一种排布。**
+        // 07239 / 08215 两条 VU 的推导见 `begin_scope`：只在 encode 作用域里给槽位会
+        // 违反 08215，把 setup 槽按真实槽号绑进 begin 会违反 07239。
         //
+        // 码控侧另有三条约束：
         // - `vkCmdControlVideoCodingKHR` 必须在 video coding scope 内
         //   （VUID-vkCmdControlVideoCodingKHR-videocoding）⇒ 只能在 begin 之后；
         // - begin 的 pNext **不带** RC 时，会话状态必须是 DEFAULT（08253）；

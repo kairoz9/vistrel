@@ -68,18 +68,11 @@ impl VideoSession {
         let coded_extent = caps.align_extent(width, height)?;
         // 显示尺寸就是请求的几何；它小于等于编码尺寸，差值由码流里的裁剪窗口抹掉
         let display_extent = vk::Extent2D { width, height };
-        // **AV1 的 8 槽模型：DPB 槽数与活跃参考数都必须给到 8。**
-        //
-        // AV1 的 `NUM_REF_FRAMES` 是 8，且 KEY 帧的 `refresh_frame_flags` 被规范强制为
-        // 0xFF —— 那一刻八个参考槽同时有效，之后 P 帧每次只刷新其中一个。稳态下同时存在
-        // 「KEY 帧占若干槽 + 上一帧 + 当前帧」至少 3 张不同的图。
-        //
-        // 只声明 2 个 DPB 槽 / 2 个活跃参考时，驱动拿 2 个物理槽去表达 8 个逻辑槽，只能
-        // 靠别名。**别名「大致对」⇒ 沿参考链累积的彩色噪点；别名对不上 ⇒ 编码命令提交后
-        // 栅栏永不返回、画面全黑。** 这是 AV1 独有的结构（H.26x 永远只有 1 个活动参考），
-        // 所以同一套槽位管线代码 H.264 一直正常、只有 AV1 坏。
-        //
-        // 代价是多占 6 层显存（1080p 每层约 3.1 MB，合计约 19 MB）。
+        // AV1 有 8 个逻辑参考槽（`NUM_REF_FRAMES`，KEY 帧 `refresh_frame_flags =
+        // 0xFF`），本实现每帧只写 0/1 两个物理 DPB 槽；逻辑槽由
+        // `referenceNameSlotIndices` / `refresh_frame_flags` 对齐。
+        // 声明值取 min(驱动上限, 8)，下限由 `caps.validate()` 拒绝；代价是最多
+        // 多占 6 层显存（1080p 约 19 MB）。
         let is_av1 = matches!(caps.codec, crate::encode::VideoCodec::Av1);
         let dpb_slots = caps.max_dpb_slots.min(if is_av1 { 8 } else { 2 });
         let active_references =

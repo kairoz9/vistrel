@@ -35,8 +35,8 @@ pub(crate) const OPUS_SDP_FMTP: &str = "minptime=10;useinbandfec=1";
 
 /// H.264 协商参数串 (RFC 6184)
 ///
-/// `profile-level-id` 与编码器实际写入 SPS 的 Level 同源推导，避免协商层宣称的
-/// Level 与码流不一致（例如 SDP 宣称 Level 6.0 而实际码流是 4.2）。
+/// `profile-level-id` 由调用方传入的几何/帧率/码率推导；生产调用方传的是会话
+/// 上限包络，因此声明的是可达的最高 Level，当前档位的 SPS 只会等于或低于它。
 pub(crate) fn h264_sdp_fmtp(width: usize, height: usize, fps: usize, bitrate_kbps: u32) -> String {
     let level_idc = crate::encode::h264_level_idc(width, height, fps, bitrate_kbps);
     format!(
@@ -308,6 +308,9 @@ where
 }
 
 /// 从协商编解码列表解析指定编解码器的 PayloadType
+///
+/// 找不到目标 codec 时回退到列表首项；这是尽力而为的兼容路径，不是目标 codec
+/// 已被接受的证明——回退 PT 可能属于其他编码。
 pub(crate) fn resolve_codec_payload_type(
     codecs: &[RTCRtpCodecParameters],
     codec: VideoCodec,

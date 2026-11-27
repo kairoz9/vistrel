@@ -173,8 +173,8 @@ pub(super) fn build_encoder_config(
     codec: VideoCodec,
     input_format: NV_ENC_BUFFER_FORMAT,
 ) -> Result<(Box<NV_ENC_CONFIG>, NV_ENC_INITIALIZE_PARAMS), String> {
-    // fps 由 StreamingProfile 构造器钳到离散档位（≤240），码率由公式/带宽控制器
-    // 保证非零且远低于 u32 上限（见 `StreamingProfile::set_bitrate` 的不变量）——裸转换不会截断
+    // fps 由 StreamingProfile 钳到 1..=240，码率由公式/带宽控制器
+    // 保证非零且远低于 u32 上限——裸转换不会截断。
     let (fps, bitrate) = (profile.fps() as u32, profile.bitrate() as u32);
 
     // 1. 查询输入格式支持，确保驱动接受所请求的输入布局（生产是 NV12，采集侧已完成 CSC）

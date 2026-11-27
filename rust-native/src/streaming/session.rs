@@ -250,8 +250,9 @@ impl StreamingSession {
 
     /// 装配 MediaEngine，注册所选视频编码规格、RTX 重传码流、Opus 音频规格以及 RTP 头部扩展
     ///
-    /// 三种编码的 SDP Level 都按分辨率/帧率/码率推导，与编码器写进 SPS/序列头的 Level
-    /// 同源——协商层宣称的等级低于码流实际等级时，对端解码器会拒绝或行为异常。
+    /// 三种编码的 SDP Level 按会话上限包络（`MAX_WIDTH` × `MAX_HEIGHT` @
+    /// `sdp_ceiling_fps()`）推导，而不是当前 `effective` 档位：retier 不重新协商，
+    /// SDP 声明的是可达的最高等级；当前档位的 SPS Level 只会等于或低于它。
     fn build_media_engine(
         codec: VideoCodec,
         width: usize,
@@ -458,6 +459,8 @@ impl StreamingSession {
         let answer = pc.create_answer(None).await?;
         pc.set_local_description(answer.clone()).await?;
 
+        // 尽力而为：`get_parameters()` 失败或列表没有目标 codec 时回退到注册 PT；
+        // 该值不保证与 answer 一致，只用于协商异常时的最后一次尝试。
         let payload_type = if let Ok(params) = video_sender.get_parameters().await
             && let Some(pt) =
                 transport::resolve_codec_payload_type(&params.rtp_parameters.codecs, codec)

@@ -27,14 +27,14 @@ use crate::encode::{MAX_CODED_ALIGN, MAX_HEIGHT, MAX_WIDTH, nv12_len};
 /// 更深只是把延迟换成空转，取不到块时丢帧比排队正确。
 pub(crate) const POOL_DEPTH: usize = 3;
 
-/// 单块容量：**最大档位 coded 几何**的 NV12，即 2560 × 1472 × 1.5 = 5,652,480 字节
+/// 单块容量：**最大档位 coded 几何**的 NV12，即 3840 × 2176 × 1.5 = 12,533,760 字节
 ///
-/// 用 coded 而不是 display：GPU 侧 CSC 按编码尺寸读那 32 行补齐（生产侧只写了 display
-/// 行，差额 120 KB），缓冲必须装得下这些读取。
+/// 用 coded 而不是 display：GPU 侧 CSC 按编码尺寸读取对齐补齐的行（生产侧只写了
+/// display 行），缓冲必须装得下这些读取。
 ///
 /// 固定最大几何而不是按档位分配：内存域只在换 codec / 换后端时才变，块若随分辨率走，
 /// 每次改档位都要换批（等于把 `attach` 的析构点搬到用户点下钻的路径上）。代价是
-/// 1080p 档位每块多占约 2.5 MB。
+/// 1080p 档位每块多占约 9.4 MB。
 pub(crate) const HOST_SLOT_BYTES: usize = nv12_len(
     MAX_WIDTH,
     MAX_HEIGHT.div_ceil(MAX_CODED_ALIGN) * MAX_CODED_ALIGN,
