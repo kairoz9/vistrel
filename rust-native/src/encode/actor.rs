@@ -138,6 +138,20 @@ impl EncoderActor {
         }
     }
 
+    /// 采纳生效 codec；换代时丢弃发件箱里旧 codec 的包
+    ///
+    /// 发件箱单槽且非空时停止入箱，旧包会在无会话期间滞留；换 codec 后它属于
+    /// 另一条轨道，必须清掉。
+    fn adopt_codec(&mut self, codec: VideoCodec) {
+        if self.codec != codec
+            && let Some(packet) = self.output.take()
+        {
+            self.output.outcomes().record(FrameOutcome::Superseded);
+            drop(packet);
+        }
+        self.codec = codec;
+    }
+
     /// Actor 主循环：等待任一输入 -> 命令清空 -> 最新帧编码并放入发件箱
     ///
     /// 只用 current_thread runtime 驱动 `select!`/门铃/命令通道（没有定时器需求）：
@@ -448,7 +462,7 @@ impl EncoderActor {
                 Ok(fresh_blocks) => {
                     self.attach(fresh_blocks);
                     self.profile = profile;
-                    self.codec = codec;
+                    self.adopt_codec(codec);
                     // 同实例重配只保留槽位；几何或 codec 变化会让旧导入失效
                     if before_width != profile.width()
                         || before_height != profile.height()
@@ -577,7 +591,7 @@ impl EncoderActor {
         }
 
         self.profile = profile;
-        self.codec = codec;
+        self.adopt_codec(codec);
         ControlStatus::Ok
     }
 
@@ -678,6 +692,15 @@ impl EncoderActor {
                 .record_with(FrameOutcome::EncodeFailed, "尚无编码器");
             return;
         };
+
+        // 发件箱未消费时不得抢跑：覆盖已编码帧会切断参考链，丢弃未编码输入则
+        // 参考链完整。判定先于 `force_keyframe` 取用，挂起的请求不被消费。
+        if !self.output.is_empty() {
+            self.inbox
+                .outcomes()
+                .record_with(FrameOutcome::Superseded, "发件箱未消费，编码前丢弃本帧");
+            return;
+        }
 
         // 长度与布局由 `pad_in_place` 判；本处只判它无从知道的事：这帧是不是当前档位产出的
         if let FramePayload::Host { frame } = payload {
@@ -968,6 +991,50 @@ mod tests {
         assert_eq!(pool.stale_len(), 0, "换域时旧设备块必须已释放");
     }
 
+    /// 换 codec 时发件箱里的旧 codec 包必须清掉：新会话的轨道只认新 codec 的码流
+    #[test]
+    fn test_prepare_codec_change_discards_old_outbox_packet() {
+        let bell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
+        let output = test_outbox();
+        let (mut actor, _pool) =
+            test_actor_with_builder(inbox, Arc::clone(&output), fake_hardware_builder());
+
+        // 旧 codec 在位，发件箱里留一帧旧 codec 的包
+        assert_eq!(
+            prepare(
+                &mut actor,
+                tier(1280, 720, 60),
+                VideoCodec::H264,
+                Some(EncodeBackendKind::Nvenc)
+            ),
+            ControlStatus::Ok
+        );
+        output.post(StampedVideoPacket::now(VideoPacket {
+            nalu: Bytes::from_static(&[0, 0, 0, 1, 0x65]),
+            birth_nanos: 0,
+            is_keyframe: true,
+        }));
+        assert!(!output.is_empty());
+
+        // 新会话协商 H265：旧包属于另一条轨道，必须被清掉
+        assert_eq!(
+            prepare(
+                &mut actor,
+                tier(1280, 720, 60),
+                VideoCodec::H265,
+                Some(EncodeBackendKind::Nvenc)
+            ),
+            ControlStatus::Ok
+        );
+        assert!(output.is_empty(), "换 codec 后旧 codec 的包不得留在发件箱");
+        assert_eq!(
+            output.outcomes().count(FrameOutcome::Superseded),
+            1,
+            "清掉的旧包要计入 Superseded"
+        );
+    }
+
     /// **软编只能是目标，不能是回退**：指定硬编建不起来时必须显式失败，绝不静默换成软编
     #[test]
     fn test_prepare_fails_instead_of_falling_back_to_software() {
@@ -1205,6 +1272,46 @@ mod tests {
         state.encode_frame(&mut third, 33);
         drop(third);
         assert!(keyframe_of(&output), "RequestKeyframe 后下一帧必须出 IDR");
+    }
+
+    /// 发件箱未消费时丢弃输入而不是覆盖已编码帧：覆盖会切断参考链。
+    #[test]
+    fn test_encode_frame_drops_input_when_outbox_is_full() {
+        crate::encode::software::init_api_for_tests();
+        let bell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
+        let output = test_outbox();
+        let (mut state, pool) = test_actor(inbox, Arc::clone(&output));
+
+        let profile = StreamingProfile::new(1280, 720, 60, 4_000_000);
+        state.profile = profile;
+        if let Ok((encoder, blocks)) = VideoEncoder::new_software(profile, VideoCodec::H264) {
+            pool.attach(blocks);
+            state.encoder = Some(encoder);
+        }
+
+        // 首帧编码后故意不取走：发件箱保持非空
+        let mut first = host_payload(&pool, vec![0u8; host_bytes(&profile)]);
+        state.encode_frame(&mut first, 0);
+        drop(first);
+        assert!(!output.is_empty(), "首帧必须已入发件箱");
+
+        // 第二帧入口即被丢弃：发件箱与挂起的关键帧请求都不受影响
+        state.pending_keyframe = true;
+        let mut second = host_payload(&pool, vec![0u8; host_bytes(&profile)]);
+        state.encode_frame(&mut second, 16);
+        drop(second);
+        assert_eq!(
+            state.inbox.outcomes().count(FrameOutcome::Superseded),
+            1,
+            "发件箱未消费时必须在编码前丢弃输入"
+        );
+        assert!(state.pending_keyframe, "丢弃输入不得消费挂起的关键帧请求");
+        assert_eq!(
+            output.take().map(|p| p.packet.birth_nanos),
+            Some(0),
+            "发件箱必须仍是首帧，不得被第二帧覆盖"
+        );
     }
 
     /// 主机帧字节数与编码器几何不符时必须丢帧：错行距的像素交给编码器换的是一屏花屏

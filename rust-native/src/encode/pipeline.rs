@@ -68,7 +68,7 @@ pub struct VideoPipeline {
     heartbeat: Arc<Heartbeat>,
     /// 编码路径的当前阶段：Actor 与后端写入，JNI 诊断只读
     stage: Arc<StageCell>,
-    /// 发件箱（唯一活跃会话从它取件）：没有会话时帧照编照丢
+    /// 发件箱（唯一活跃会话从它取件）：无会话时只保留一帧，后续输入编码前丢弃
     output: Arc<FrameOutbox>,
     /// 编码线程句柄，只在关停时取用一次
     actor_handle: Mutex<Option<JoinHandle<()>>>,

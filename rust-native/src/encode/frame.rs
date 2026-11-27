@@ -105,7 +105,7 @@ impl RateLimitLog {
 pub(crate) enum FrameOutcome {
     /// 编成包并写入绑定轨道
     Admitted,
-    /// 未及上链就被放手（收件箱已被下一帧挤出、换代时清空，或发件箱被最新帧覆盖）
+    /// 未及上链就被放手（收件箱挤出、换代清空、发件箱覆盖，或编码前丢弃输入）
     Superseded,
     /// 池里没有可用块（编码线程停滞或正换代）
     PoolEmpty,
@@ -294,6 +294,11 @@ impl<T> Mailbox<T> {
             bell,
             outcomes,
         }
+    }
+
+    /// 当前槽是否为空；供上游在覆盖前做背压判定
+    pub(crate) fn is_empty(&self) -> bool {
+        self.slot.lock().is_none()
     }
 
     /// 覆盖旧值并摇铃；返回被挤掉的旧值，归还路径由调用方定
