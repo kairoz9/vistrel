@@ -179,7 +179,9 @@ impl Drop for SlotEntry {
 /// `reconfigure`。编码路径不判断、不分配、不注册——查不到句柄就报错。
 pub(crate) struct NvencBackend {
     cuda_ctx: Arc<CudaContext>,
-    session: NvencSession,
+    /// 当前编码会话；重建期间与失败后为 `None`——失败不保留旧会话，
+    /// 由下一次协商（用户刷新）整体重建
+    session: Option<NvencSession>,
     /// 池块强引用：与帧池、会话共享，重构几何时据此重建输入缓冲
     block_handles: Vec<Arc<PinnedHost>>,
     slots: SlotTable<SlotEntry>,
@@ -200,14 +202,8 @@ pub(crate) struct NvencBackend {
 impl Drop for NvencBackend {
     fn drop(&mut self) {
         // 固定次序析构：注册句柄 → 槽位显存 → 会话（输入缓冲随会话析构，见
-        // `NvencSession::drop`）。只在编码 actor 线程析构，上下文已绑定；逐字段借用：
-        // 各处互不相交，比走方法少一层间接
-        for entry in self.slots.values_mut() {
-            if let Some(registered) = entry.registered.take() {
-                self.session.unregister_resource(registered);
-            }
-        }
-        self.slots.clear();
+        // `NvencSession::drop`）。只在编码 actor 线程析构，上下文已绑定
+        self.clear_vram_slots();
     }
 }
 
@@ -219,6 +215,57 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 impl NvencBackend {
+    /// 当前会话；重建失败后为 Err
+    fn session(&self) -> Result<&NvencSession, String> {
+        self.session
+            .as_ref()
+            .ok_or_else(|| "NVENC 会话不可用".to_string())
+    }
+
+    fn session_mut(&mut self) -> Result<&mut NvencSession, String> {
+        self.session
+            .as_mut()
+            .ok_or_else(|| "NVENC 会话不可用".to_string())
+    }
+
+    /// 拆旧建新：NVENC 并发会话配额有限，新旧会话不得并存
+    ///
+    /// 先归还槽位注册再拆会话，新会话才拿得到配额。失败不恢复旧会话，后端保持
+    /// 无会话态，由下一次协商（用户刷新）重建；返回 Err 时槽位表已清空。
+    fn rebuild_session(
+        &mut self,
+        new_profile: StreamingProfile,
+        new_codec: VideoCodec,
+    ) -> Result<Vec<HostBlock>, String> {
+        let driver = match &self.session {
+            Some(session) => session.driver(),
+            None => NvencDriver::load()?,
+        };
+        // 槽位句柄绑定旧会话，必须在拆会话前归还
+        self.clear_vram_slots();
+        drop(self.session.take());
+
+        let session = NvencSession::new(
+            driver,
+            self.cuda_ctx.clone(),
+            new_profile,
+            new_codec,
+            &self.block_handles,
+            self.stream.cu_stream(),
+        )
+        .map_err(|e| {
+            format!(
+                "NVENC 会话重建失败（{}x{} {:?}）: {e}",
+                new_profile.width(),
+                new_profile.height(),
+                new_codec
+            )
+        })?;
+        self.session = Some(session);
+        // 上下文未变，老块仍属于本后端的 CUDA 域，继续用
+        Ok(Vec::new())
+    }
+
     /// 按档位构建（主机帧一律 NV12，行距即宽度）
     ///
     /// 帧块必须分配在**本后端自己的 CUDA 上下文**上，且几何一变也不失效
@@ -250,7 +297,7 @@ impl NvencBackend {
         Ok((
             Self {
                 cuda_ctx,
-                session,
+                session: Some(session),
                 block_handles,
                 slots: SlotTable::new(),
                 stage,
@@ -288,7 +335,7 @@ impl NvencBackend {
         // 兜底不变量：旧代帧已在 Actor 入口被拒收，导入期整批校验也保证
         // 槽位几何与会话一致，到这里还不符只可能是前两道防线的漏网。核对仍必须在
         // 等待与映射之前，让漏网帧以可诊断的错误丢在入口而不是交给驱动
-        let profile = self.session.profile();
+        let profile = *self.session()?.profile();
         let (profile_width, profile_height) = (profile.width() as u32, profile.height() as u32);
         if slot_width != profile_width || slot_height != profile_height {
             return Err(format!(
@@ -306,6 +353,8 @@ impl NvencBackend {
             buffer_format: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR,
         };
         self.session
+            .as_mut()
+            .ok_or_else(|| "NVENC 会话不可用".to_string())?
             .encode_from_resource(registered, spec, force_idr, frame_idx, &self.stage)
     }
 }
@@ -322,6 +371,10 @@ impl VideoEncodeBackend for NvencBackend {
         (1, 1)
     }
 
+    fn is_usable(&self) -> bool {
+        self.session.is_some()
+    }
+
     /// 批量注册导入显存槽位并一次性完成 NVENC 资源预注册
     fn import_vram_slots(&mut self, descriptors: &mut [VramSlotDescriptor]) -> Result<(), String> {
         if descriptors.is_empty() {
@@ -332,7 +385,7 @@ impl VideoEncodeBackend for NvencBackend {
         // 与 import_all 的全成全败同层
         //
         // NVENC 无设备粒度对齐，编码尺寸即采集尺寸：只收一种几何
-        let profile = self.session.profile();
+        let profile = *self.session()?.profile();
         ensure_batch_geometry(
             descriptors,
             (profile.width() as u32, profile.height() as u32),
@@ -355,9 +408,10 @@ impl VideoEncodeBackend for NvencBackend {
         // 注册期间句柄不落表：全部成功才一次性写入，任一失败则把已建立的逐个归还
         let mut registered: Vec<(u32, RegisteredResource)> = Vec::with_capacity(self.slots.len());
         let mut failure = None;
+        let session = self.session()?;
         for (slot_idx, entry) in self.slots.iter() {
             let slot = &entry.cuda;
-            match self.session.register_resource(
+            match session.register_resource(
                 NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY,
                 slot.cu_array.as_ptr().cast(),
                 slot.width,
@@ -376,7 +430,9 @@ impl VideoEncodeBackend for NvencBackend {
         // 任一注册失败：归还已建立的句柄后整表清空，保持「槽位只在当前 encoder 上有效」
         if let Some(e) = failure {
             for (_, handle) in registered {
-                self.session.unregister_resource(handle);
+                if let Some(session) = &self.session {
+                    session.unregister_resource(handle);
+                }
             }
             self.clear_vram_slots();
             return Err(e);
@@ -394,10 +450,13 @@ impl VideoEncodeBackend for NvencBackend {
     ///
     /// 先解注册再释放 CUarray，否则驱动会拿着已销毁的显存去注销。
     /// 只清槽位：系统内存输入缓冲是持久句柄，不挂注册表，原样保留。
+    /// 无会话时句柄已随旧会话失效，只丢包装，不再触碰驱动。
     fn clear_vram_slots(&mut self) {
-        for entry in self.slots.values_mut() {
-            if let Some(registered) = entry.registered.take() {
-                self.session.unregister_resource(registered);
+        if let Some(session) = &self.session {
+            for entry in self.slots.values_mut() {
+                if let Some(registered) = entry.registered.take() {
+                    session.unregister_resource(registered);
+                }
             }
         }
         self.slots.clear();
@@ -405,42 +464,24 @@ impl VideoEncodeBackend for NvencBackend {
 
     /// 重新配置编码器分辨率与码率
     ///
-    /// 同 codec 的分辨率 / 帧率 / 码率变更全部走会话内 `nvEncReconfigureEncoder`
-    /// 只有换 codec 才重建：`NvencSession` 若在重建路径上仍按旧几何持有输入登记，
-    /// 旧块仍然有效，因此重配恒返回空批（块绑的是 CUDA 上下文，不是会话）
+    /// 几何与 codec 都未变时走会话内 `nvEncReconfigureEncoder`（帧率 / 码率）；
+    /// 否则重建：max 包络是构造期常量，AV1 要求 level 覆盖包络，放宽到 4K 又会
+    /// 拒绝 720p 的 level，所以包络只能与当前档位同源。
     fn reconfigure(
         &mut self,
         new_profile: StreamingProfile,
         new_codec: VideoCodec,
     ) -> Result<Vec<HostBlock>, String> {
-        if self.session.codec() == new_codec {
-            self.session.reconfigure(new_profile)?;
+        let in_place = self.session.as_ref().is_some_and(|session| {
+            session.codec() == new_codec
+                && new_profile.width() == session.profile().width()
+                && new_profile.height() == session.profile().height()
+        });
+        if in_place {
+            self.session_mut()?.reconfigure(new_profile)?;
             return Ok(Vec::new());
         }
-
-        // 换 codec 必须重建会话。先把新会话完整建好，成功之后才动输入缓冲与旧会话——
-        // 任何一步失败都保持旧状态可用（codec 变更只会发生在会话建立的协商期，
-        // 不在逐帧热路径上）
-        let driver = self.session.driver();
-        let new_session = NvencSession::new(
-            driver,
-            self.cuda_ctx.clone(),
-            new_profile,
-            new_codec,
-            &self.block_handles,
-            self.stream.cu_stream(),
-        )?;
-
-        // 槽位绑的是旧 encoder 的句柄，生产者会在同一轮重建采集管线时
-        // `clearVramSlots` + `importVramSlots`。这里全部作废，让
-        // 「槽位只在当前 encoder 上有效」成为不变量，而不是靠几何比较去猜哪些还有用
-        self.clear_vram_slots();
-
-        // 新会话已带着新几何的输入缓冲建好，此时才切换：旧会话连同它的输入缓冲
-        // 一起析构，不存在「旧批先毁、新批未建」的窗口
-        self.session = new_session;
-        // 上下文未变，老块仍属于本后端的 CUDA 域，继续用
-        Ok(Vec::new())
+        self.rebuild_session(new_profile, new_codec)
     }
 
     /// 动态修改目标码率
@@ -448,9 +489,9 @@ impl VideoEncodeBackend for NvencBackend {
         if bps == 0 {
             return Ok(());
         }
-        let mut new_profile = *self.session.profile();
+        let mut new_profile = *self.session()?.profile();
         new_profile.set_bitrate(bps as usize);
-        self.session.reconfigure(new_profile)
+        self.session_mut()?.reconfigure(new_profile)
     }
 
     /// 编码统一入口：派发 CUDA 主机帧或 Vulkan Vram
@@ -468,6 +509,8 @@ impl VideoEncodeBackend for NvencBackend {
                 // 池块已按 CUDADEVICEPTR 登记（UVA 主机别名，零拷贝）：每帧映射后由
                 // 引擎经 PCIe 直读帧内容，没有 H2D 拷贝也没有主机同步点
                 self.session
+                    .as_mut()
+                    .ok_or_else(|| "NVENC 会话不可用".to_string())?
                     .encode_host(host.as_ptr(), force_idr, frame_idx, &self.stage)?
             }
             FramePayload::VramSlot { slot, sync_value } => {
@@ -513,7 +556,10 @@ impl VideoEncodeBackend for NvencBackend {
     #[cfg(test)]
     fn benchmark_stages(&self) -> BackendStageTimings {
         // 系统内存输入路径没有 H2D：input_copy_ns 固定为 0 是路径事实
-        self.session.benchmark_stages()
+        self.session
+            .as_ref()
+            .map(|session| session.benchmark_stages())
+            .unwrap_or_default()
     }
 }
 
@@ -542,12 +588,10 @@ mod tests {
     use crate::encode::pool::test_support::host_payload;
     use crate::encode::{StreamingProfile, VideoCodec};
 
-    /// 分辨率切换必须走会话内重配并真的产出新几何
+    /// 分辨率切换必须产出新几何的可用码流
     ///
-    /// 回归目标：分辨率切换必须走会话内重配——新建会话会与旧会话并存、撞 NVENC
-    /// 并发会话配额（`nvEncInitializeEncoder` 回 NV_ENC_ERR_OUT_OF_MEMORY）；
-    /// 会话建立时已声明最大尺寸，`nvEncReconfigureEncoder` 可就地改几何。
-    /// 本用例要求每个档位重配后都能立刻编出非空 IDR
+    /// 重建按几何声明 max 包络并先拆旧会话，不占并发会话配额；每个档位重配后
+    /// 必须立刻编出非空 IDR。
     #[test]
     #[ignore = "requires GPU"]
     fn test_reconfigure_across_resolutions_yields_idr() {
@@ -593,8 +637,34 @@ mod tests {
         }
         assert!(
             failures.is_empty(),
-            "分辨率切换必须全部可用（原地重配），实际失败: {failures:?}"
+            "分辨率切换必须全部可用（重建会话），实际失败: {failures:?}"
         );
+    }
+
+    /// 非 64 对齐几何 @240fps：AV1 level 必须按超级块对齐后的尺寸推导
+    ///
+    /// 1392×784 对齐为 1408×832 后样本率越过 Level 5.0；按显示尺寸推导会被驱动
+    /// 以 `Invalid Level` 拒绝初始化。控制组先确认本机 AV1 可用，避免无 GPU 时静默跳过。
+    #[test]
+    #[ignore = "requires GPU: 非 64 对齐几何的 AV1 level 边界"]
+    fn test_av1_non_aligned_geometry_initializes() {
+        let control = StreamingProfile::new(1280, 720, 60, 4_000_000);
+        if NvencBackend::new(control, VideoCodec::Av1, Arc::new(StageCell::new())).is_err() {
+            println!("NVENC AV1 不可用，跳过用例");
+            return;
+        }
+
+        let profile = StreamingProfile::new(1392, 784, 240, 18_500_000);
+        let (mut backend, blocks) =
+            NvencBackend::new(profile, VideoCodec::Av1, Arc::new(StageCell::new()))
+                .expect("1392x784@240 AV1 初始化不得因 level 被拒");
+        let pool = FramePool::new();
+        pool.attach(blocks);
+
+        let payload = host_payload(&pool, vec![0u8; 1392 * 784 * 3 / 2]);
+        let (nalu, is_key) = backend.encode(&payload, true, 1).expect("编码必须成功");
+        assert!(is_key, "强制 IDR 后必须报告关键帧");
+        assert!(!nalu.is_empty());
     }
 
     #[test]

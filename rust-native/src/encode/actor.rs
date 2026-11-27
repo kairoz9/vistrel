@@ -661,7 +661,22 @@ impl EncoderActor {
         let fresh_blocks = match reconfig {
             Ok(blocks) => blocks,
             Err(e) => {
-                log::error!("档位变更失败，维持原档位 {:?}: {}", self.profile, e);
+                // 重建失败已拆掉会话与槽位表：绑定立即失效，停止接收旧代显存帧
+                if self
+                    .encoder
+                    .as_ref()
+                    .is_some_and(|encoder| !encoder.is_usable())
+                {
+                    self.invalidate_binding();
+                    self.rejecting_frames = true;
+                    log::error!(
+                        "档位变更失败，编码器会话已拆除，等待重新协商 {:?}: {}",
+                        self.profile,
+                        e
+                    );
+                } else {
+                    log::error!("档位变更失败，维持原档位 {:?}: {}", self.profile, e);
+                }
                 return Err(RetierError::Rejected);
             }
         };
@@ -1606,6 +1621,9 @@ mod tests {
     struct FenceBackend {
         drain_ok: bool,
         import_ok: bool,
+        /// 模拟重建式重配失败；失败后后端转为不可用
+        fail_reconfigure: bool,
+        usable: bool,
     }
 
     impl VideoEncodeBackend for FenceBackend {
@@ -1631,7 +1649,15 @@ mod tests {
             _new_profile: StreamingProfile,
             _new_codec: VideoCodec,
         ) -> Result<Vec<HostBlock>, String> {
+            if self.fail_reconfigure {
+                self.usable = false;
+                return Err("重配失败模拟".to_string());
+            }
             Ok(Vec::new())
+        }
+
+        fn is_usable(&self) -> bool {
+            self.usable
         }
 
         fn set_bitrate(&mut self, _bps: u32) -> Result<(), String> {
@@ -1660,8 +1686,12 @@ mod tests {
         }
     }
 
-    /// 围栏测试工厂：交出硬件身份编码器（行为按用例配置）
-    fn fence_backend_builder(drain_ok: bool, import_ok: bool) -> Arc<HardwareBuilder> {
+    /// 围栏测试工厂：可额外模拟重建失败
+    fn fence_backend_builder_with(
+        drain_ok: bool,
+        import_ok: bool,
+        fail_reconfigure: bool,
+    ) -> Arc<HardwareBuilder> {
         Arc::new(move |profile, codec, _kind, _stage| {
             Ok((
                 VideoEncoder::from_backend(
@@ -1670,6 +1700,8 @@ mod tests {
                     Box::new(FenceBackend {
                         drain_ok,
                         import_ok,
+                        fail_reconfigure,
+                        usable: true,
                     }),
                 ),
                 fake_device_blocks(FAKE_DEVICE_DOMAIN),
@@ -1684,6 +1716,17 @@ mod tests {
         drain_ok: bool,
         import_ok: bool,
     ) -> (EncoderActor, Arc<FramePool>) {
+        fence_actor_with(inbox, output, drain_ok, import_ok, false)
+    }
+
+    /// 围栏测试专用构造：可额外模拟重建失败
+    fn fence_actor_with(
+        inbox: Arc<FrameInbox>,
+        output: Arc<FrameOutbox>,
+        drain_ok: bool,
+        import_ok: bool,
+        fail_reconfigure: bool,
+    ) -> (EncoderActor, Arc<FramePool>) {
         let pool = FramePool::new();
         let actor = EncoderActor::new_with_hardware_builder(
             inbox,
@@ -1692,7 +1735,7 @@ mod tests {
             Arc::new(Heartbeat::new()),
             Arc::new(StageCell::new()),
             empty_binding(),
-            fence_backend_builder(drain_ok, import_ok),
+            fence_backend_builder_with(drain_ok, import_ok, fail_reconfigure),
         );
         (actor, pool)
     }
@@ -2100,5 +2143,42 @@ mod tests {
 
         assert_eq!(import_slots(&mut actor, 1), ControlStatus::Ok);
         assert!(!actor.rejecting_frames);
+    }
+
+    /// 重建失败即后端不可用：Actor 必须摘除绑定并拒收显存帧，等待重新协商
+    #[test]
+    fn test_retier_rebuild_failure_detaches_binding() {
+        let bell = Arc::new(Notify::new());
+        let inbox = Arc::new(FrameInbox::new(Arc::clone(&bell)));
+        let output = test_outbox();
+        let (mut actor, _pool) = fence_actor_with(inbox.clone(), output, true, true, true);
+
+        assert_eq!(
+            prepare(
+                &mut actor,
+                tier(1280, 720, 60),
+                VideoCodec::H264,
+                Some(EncodeBackendKind::Nvenc)
+            ),
+            ControlStatus::Ok
+        );
+        assert_eq!(import_slots(&mut actor, 1), ControlStatus::Ok);
+        let old = current_binding(&actor);
+
+        assert!(
+            switch_profile(&mut actor, tier(1600, 900, 60)).is_err(),
+            "重建失败必须拒绝档位变更"
+        );
+        assert!(actor.binding.load().is_none(), "失败后绑定必须摘除");
+        assert!(actor.rejecting_frames, "失败后必须拒收显存帧");
+
+        inbox.push(vram_frame(&old, 1, 77));
+        let frame = inbox.take().expect("帧在收件箱");
+        actor.handle_frame(frame);
+        assert_eq!(
+            inbox.outcomes().count(FrameOutcome::FenceDropped),
+            1,
+            "失败后的旧代帧必须在入口拒收"
+        );
     }
 }

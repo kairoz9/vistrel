@@ -13,7 +13,7 @@ use super::InputSpec;
 use super::dl::NvencDriver;
 use super::ffi::*;
 use crate::encode::hardware::nvenc::nvfn;
-use crate::encode::{MAX_HEIGHT, MAX_WIDTH, StreamingProfile, VideoCodec};
+use crate::encode::{StreamingProfile, VideoCodec};
 
 const FRAME_INTERVAL_P_NO_B_FRAMES: i32 = 1;
 const DEFAULT_DAR_WIDTH: u32 = 16;
@@ -30,17 +30,16 @@ fn intra_refresh_timing(fps: u32) -> (u32, u32) {
 
 /// 把随档位重算的 Intra-Refresh 波次与显式 Level 写入对应 codec 的配置
 ///
-/// 构造期与 reconfigure 共用：波次由帧率推导（约 0.5s 一轮），Level 由帧率/码率与
-/// **会话声明的最大几何**推导——NVENC 校验 level 必须覆盖创建时的
-/// `maxEncodeWidth/maxEncodeHeight`。
+/// 构造期与 reconfigure 共用：波次由帧率推导（约 0.5s 一轮），Level 由当前几何、
+/// 帧率与码率推导。按 4K 包络推导会把 720p 流标成 Level 6.x，手机硬解会直接拒绝。
 pub(super) fn apply_refresh_and_level(
     codec: VideoCodec,
     config: &mut NV_ENC_CONFIG,
+    width: usize,
+    height: usize,
     fps: u32,
     bitrate: u32,
 ) {
-    // Level 基准是会话可能用到的最大尺寸，不是当前档位
-    let (width, height) = (MAX_WIDTH, MAX_HEIGHT);
     let (period, cnt) = intra_refresh_timing(fps);
     let kbps = bitrate / 1000;
     // SAFETY: union 取成员需要 unsafe；codec 与构造会话时一致（重配不改 codec），
@@ -340,7 +339,14 @@ pub(super) fn build_encoder_config(
     }
 
     // Intra-Refresh 波次与 Level 依赖帧率/几何/码率，与 reconfigure 共用同一推导
-    apply_refresh_and_level(codec, &mut config, fps, bitrate);
+    apply_refresh_and_level(
+        codec,
+        &mut config,
+        profile.width(),
+        profile.height(),
+        fps,
+        bitrate,
+    );
 
     // 4. 初始化编码器
     let (dar_w, dar_h) = calculate_dar(profile.width() as u32, profile.height() as u32);
@@ -353,10 +359,10 @@ pub(super) fn build_encoder_config(
     init_params.presetGUID = NV_ENC_PRESET_P4_GUID;
     init_params.encodeWidth = profile.width() as u32;
     init_params.encodeHeight = profile.height() as u32;
-    // 声明本会话可能用到的最大尺寸：Reconfigure API 只有在创建会话时给出了
-    // maxEncodeWidth/Height，才允许后续在同一会话内改分辨率
-    init_params.maxEncodeWidth = MAX_WIDTH as u32;
-    init_params.maxEncodeHeight = MAX_HEIGHT as u32;
+    // 包络与当前档位同源：AV1 要求 level 覆盖 maxEncodeWidth/Height，
+    // 4K 包络会让 720p 的 level 被以 Invalid Level 拒绝。
+    init_params.maxEncodeWidth = profile.width() as u32;
+    init_params.maxEncodeHeight = profile.height() as u32;
     init_params.darWidth = dar_w;
     init_params.darHeight = dar_h;
     init_params.frameRateNum = fps;

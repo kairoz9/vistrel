@@ -100,6 +100,13 @@ pub(crate) trait VideoEncodeBackend {
         new_codec: VideoCodec,
     ) -> Result<Vec<HostBlock>, String>;
 
+    /// 后端当前是否仍可编码
+    ///
+    /// 会话重建失败后为 `false`：后端已无可用会话，调用方应摘除槽位绑定并等待重建。
+    fn is_usable(&self) -> bool {
+        true
+    }
+
     /// 跟随 Followed Bitrate 的无状态码率下发
     fn set_bitrate(&mut self, bps: u32) -> Result<(), String>;
 
@@ -284,6 +291,11 @@ impl VideoEncoder {
     /// 查询当前后端是否为硬件编码
     pub(crate) fn is_hardware(&self) -> bool {
         !matches!(self.backend.kind(), EncodeBackendKind::Software)
+    }
+
+    /// 后端当前是否仍可编码；重建失败后为 `false`
+    pub(crate) fn is_usable(&self) -> bool {
+        self.backend.is_usable()
     }
 
     /// 排空当前编码后端的所有在途任务并等待硬件闲置

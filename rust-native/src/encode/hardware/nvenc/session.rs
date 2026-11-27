@@ -11,9 +11,7 @@ use cudarc::driver::CudaContext;
 use super::cuda::PinnedHost;
 use super::dl::NvencDriver;
 use super::ffi::*;
-use super::session_params::{
-    apply_refresh_and_level, build_encoder_config, calculate_dar, open_encoder,
-};
+use super::session_params::{apply_refresh_and_level, build_encoder_config, open_encoder};
 use super::{BitstreamHandle, EncoderHandle, InputSpec, RegisteredResource};
 #[cfg(test)]
 use crate::encode::encoder::BackendStageTimings;
@@ -270,15 +268,15 @@ impl NvencSession {
         Ok(session)
     }
 
-    /// 动态重新配置帧率 / 码率 / 分辨率
+    /// 重新配置编码器的帧率与码率
     ///
-    /// 分辨率变更走 Reconfigure API：前提是建会话时声明了
-    /// `maxEncodeWidth/maxEncodeHeight`（见 `build_encoder_config`）。
-    /// 会话 codec 构造期定死、无参数可改——换 codec 走会话重建，
-    /// 由 [`NvencBackend::reconfigure`](super::NvencBackend::reconfigure) 判定。
+    /// 只在几何与 codec 都不变时可用；分辨率变化由
+    /// [`NvencBackend::reconfigure`](super::NvencBackend::reconfigure) 重建会话，
+    /// 因为 max 包络固定为构造时的档位，AV1 要求 level 覆盖它。
     pub fn reconfigure(&mut self, profile: StreamingProfile) -> Result<(), String> {
-        let resolution_changed =
-            profile.width() != self.profile.width() || profile.height() != self.profile.height();
+        if profile.width() != self.profile.width() || profile.height() != self.profile.height() {
+            return Err("分辨率变更必须重建 NVENC 会话".to_string());
+        }
 
         // 不变量同 `build_encoder_config`：fps/码率由 StreamingProfile 保证落在 u32 且非零
         let fps = profile.fps() as u32;
@@ -291,13 +289,14 @@ impl NvencSession {
         candidate_config.rcParams.vbvBufferSize = frame_size_bits;
         candidate_config.rcParams.vbvInitialDelay = frame_size_bits;
         // Level 与 Intra-Refresh 波次随新档位重算，推导与构造期共用同一处实现。
-        apply_refresh_and_level(self.codec, &mut candidate_config, fps, bitrate);
-
-        // 输入登记参数里的 width/height/pitch 描述缓冲布局：沿用旧值会让驱动按旧行距
-        // 读新几何的帧。先按新几何重登，失败则回滚旧几何，会话保持可用
-        if resolution_changed {
-            self.reregister_device_inputs(profile.width(), profile.height())?;
-        }
+        apply_refresh_and_level(
+            self.codec,
+            &mut candidate_config,
+            profile.width(),
+            profile.height(),
+            fps,
+            bitrate,
+        );
 
         // SAFETY: 该结构为 bindgen 生成的 C POD，嵌入的 INITIALIZE_PARAMS 中枚举字段
         // （tuningInfo）0 值合法（UNDEFINED），其余成员均为整型/指针，全零位模式合法；
@@ -308,16 +307,6 @@ impl NvencSession {
         reconf_params.reInitEncodeParams.encodeConfig = &mut candidate_config;
         reconf_params.reInitEncodeParams.frameRateNum = fps;
         reconf_params.reInitEncodeParams.frameRateDen = 1;
-        if resolution_changed {
-            reconf_params.reInitEncodeParams.encodeWidth = profile.width() as u32;
-            reconf_params.reInitEncodeParams.encodeHeight = profile.height() as u32;
-            let (dar_w, dar_h) = calculate_dar(profile.width() as u32, profile.height() as u32);
-            reconf_params.reInitEncodeParams.darWidth = dar_w;
-            reconf_params.reInitEncodeParams.darHeight = dar_h;
-            // 改分辨率后下一帧必须是 IDR，否则解码端沿用旧序列头
-            reconf_params.set_forceIDR(1);
-            reconf_params.set_resetEncoder(1);
-        }
         let reconfigure = nvfn!(self.driver, nvEncReconfigureEncoder);
         unsafe {
             // SAFETY: reconf_params 已完整初始化（version 与全部输入字段就位）；
@@ -334,81 +323,6 @@ impl NvencSession {
         self.init_params.encodeConfig = &mut *self.config;
         self.profile = profile;
         Ok(())
-    }
-
-    /// 按新几何重登全部主机帧输入资源
-    ///
-    /// 登记是一次性的句柄契约，改几何只能注销后重登。全成全败：新几何登记失败时
-    /// 回滚到旧几何，保持会话仍可编码（否则一次失败的切换会把整条编码链打死）
-    fn reregister_device_inputs(&mut self, width: usize, height: usize) -> Result<(), String> {
-        // 先克隆强引用再注销：注销会释放会话侧引用，批必须活到重登完成
-        let blocks: Vec<Arc<PinnedHost>> = self
-            .device_inputs
-            .iter()
-            .map(|input| Arc::clone(&input.block))
-            .collect();
-        let old = (self.profile.width(), self.profile.height());
-        // 先全部注销：之后无论成败都没有残留句柄指向旧几何
-        self.destroy_device_inputs();
-        match self.register_blocks(&blocks, width, height) {
-            Ok(inputs) => {
-                self.device_inputs = inputs;
-                Ok(())
-            }
-            Err(e) => match self.register_blocks(&blocks, old.0, old.1) {
-                Ok(inputs) => {
-                    self.device_inputs = inputs;
-                    Err(e)
-                }
-                Err(e2) => Err(format!("{e}；回滚失败: {e2}")),
-            },
-        }
-    }
-
-    /// 把一批池块按给定几何登记为编码输入
-    fn register_blocks(
-        &self,
-        blocks: &[Arc<PinnedHost>],
-        width: usize,
-        height: usize,
-    ) -> Result<Vec<DeviceInput>, String> {
-        let register = nvfn!(self.driver, nvEncRegisterResource);
-        let mut inputs: Vec<DeviceInput> = Vec::with_capacity(blocks.len());
-        for (i, block) in blocks.iter().enumerate() {
-            let base = block.as_ptr();
-            // SAFETY: 该结构为 bindgen 生成的 C POD，成员均为整型/指针或 0 值合法的
-            // 枚举（UNDEFINED / DIRECTX 等），全零位模式合法；NVENC 约定调用方零初始化
-            // 并回填 version，保留字段必须保持 0
-            let mut reg_params: NV_ENC_REGISTER_RESOURCE = unsafe { std::mem::zeroed() };
-            reg_params.version = NV_ENC_REGISTER_RESOURCE_VER;
-            reg_params.resourceType =
-                NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
-            reg_params.width = width as u32;
-            reg_params.height = height as u32;
-            reg_params.pitch = width as u32;
-            reg_params.resourceToRegister = base.cast_mut().cast();
-            reg_params.bufferFormat = NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12;
-            let register_res = unsafe {
-                // SAFETY: reg_params 已完整初始化；block 由调用方的 `Arc` 保证存活；
-                // encoder 由本会话独占持有
-                register(self.encoder.as_raw(), &mut reg_params)
-            };
-            let Some(registered) = (register_res == NVENCSTATUS::NV_ENC_SUCCESS)
-                .then(|| RegisteredResource::from_raw(reg_params.registeredResource))
-                .flatten()
-            else {
-                // 已登记的前几块就地注销，全成全败
-                for input in inputs {
-                    self.unregister_resource(input.registered);
-                }
-                return Err(format!("block {i}: nvEncRegisterResource failed"));
-            };
-            inputs.push(DeviceInput {
-                block: Arc::clone(block),
-                registered,
-            });
-        }
-        Ok(inputs)
     }
 
     /// 在会话上注册一个编码输入资源，返回驱动句柄

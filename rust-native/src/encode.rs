@@ -499,7 +499,7 @@ pub fn h264_level_idc(width: usize, height: usize, fps: usize, bitrate_kbps: u32
 /// 依据分辨率、帧率与码率推导 HEVC Level IDC
 ///
 /// RFC 7798 的 `level-id` 就是 `general_level_idc`（30 × level），与写进 SPS 的值同源。
-/// `bitrate_kbps` 单位为 kbit/s。
+/// `bitrate_kbps` 单位为 kbit/s；样本数按 64×64 CTB 对齐后的编码尺寸计算。
 pub fn hevc_level_idc(width: usize, height: usize, fps: usize, bitrate_kbps: u32) -> u8 {
     // (Level IDC, MaxLumaPs 亮度样本/帧, MaxLumaSr 样本/秒, MaxBR kbps @ Main tier)
     // 数值取自 ITU-T H.265 Table A.8。工程使用 Main profile，故取 Main tier 的码率上限；
@@ -520,14 +520,23 @@ pub fn hevc_level_idc(width: usize, height: usize, fps: usize, bitrate_kbps: u32
         (186, 35_651_584, 4_278_190_080, 240_000),
     ];
 
-    let luma = width as u64 * height as u64;
+    let luma = block_aligned_luma(width, height);
     first_satisfying(&LEVELS, luma, luma * fps as u64, bitrate_kbps)
+}
+
+/// 64×64 CTB / 超级块对齐后的亮度样本数
+///
+/// NVENC 用编码尺寸而非显示尺寸校验 HEVC / AV1 level
+fn block_aligned_luma(width: usize, height: usize) -> u64 {
+    let aligned = |v: usize| v.next_multiple_of(64);
+    aligned(width) as u64 * aligned(height) as u64
 }
 
 /// 依据分辨率、帧率与码率推导 AV1 Level 索引
 ///
 /// RFC 9585 的 `level-idx` 是 AV1 规范 Annex A 的 level 索引（0 = Level 2.0），
-/// 与写进序列头 `seq_level_idx` 的取值同源。`bitrate_kbps` 单位为 kbit/s。
+/// 与写进序列头 `seq_level_idx` 的取值同源。`bitrate_kbps` 单位为 kbit/s；
+/// 样本数按 64×64 超级块对齐后的编码尺寸计算。
 pub fn av1_level_idx(width: usize, height: usize, fps: usize, bitrate_kbps: u32) -> u8 {
     // (seq_level_idx, MaxPicSize 样本/帧, MaxDisplayRate 样本/秒, MaxBitrate kbps @ Main profile)
     // 数值取自 AV1 规范 Annex A Table A.3；只列已定义的级别，索引留出规范的空洞
@@ -548,7 +557,7 @@ pub fn av1_level_idx(width: usize, height: usize, fps: usize, bitrate_kbps: u32)
         (19, 35_651_584, 4_278_190_080, 160_000), // 6.3
     ];
 
-    let pic = width as u64 * height as u64;
+    let pic = block_aligned_luma(width, height);
     first_satisfying(&LEVELS, pic, pic * fps as u64, bitrate_kbps)
 }
 
@@ -984,5 +993,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// HEVC / AV1 的 level 按 64×64 CTB / 超级块对齐后的编码尺寸推导
+    ///
+    /// 1392×784@240 的显示尺寸样本率在 Level 5.0 内，但 64 对齐后的 1408×832 越过
+    /// 上限；按显示尺寸推导会被 NVENC 以 `Invalid Level` 拒绝初始化。
+    #[test]
+    fn test_hevc_av1_level_uses_block_aligned_geometry() {
+        assert_eq!(av1_level_idx(1392, 784, 240, 18_500), 13);
+        assert_eq!(hevc_level_idc(1392, 784, 240, 18_500), 153);
+        // 已按 64 对齐的几何不受影响
+        assert_eq!(av1_level_idx(1408, 768, 240, 18_500), 12);
     }
 }
