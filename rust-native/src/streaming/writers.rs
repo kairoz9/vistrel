@@ -106,11 +106,13 @@ impl VideoWriter {
             return true;
         };
         if pending.posted_at.elapsed() > STALE_AFTER {
-            // 过期帧没碰过链路，不必要 IDR：后面的帧序仍然自洽。
-            // 这一闸排在门控之前：等 IDR 的会话同样不该写一帧已经过期的 IDR
+            // 已编码帧被丢 = 参考链断开，后续 P 帧仍在引用它：必须重新要 IDR，
+            // 并在其上链前只放行关键帧，否则解码会一直失败到下一次 PLI。
             self.outbox
                 .outcomes()
                 .record_with(FrameOutcome::WriteStalled, "排队超期，已丢帧");
+            self.waiting_for_keyframe.store(true, Ordering::Release);
+            self.throttle.request_throttled();
             return true;
         }
         // 门控未开：不要 P 帧，就地再要一次 IDR（走节流版：写卡住时逐帧无条件请求，
@@ -157,6 +159,7 @@ impl VideoWriter {
                         self.outbox
                             .outcomes()
                             .record_with(FrameOutcome::TrackWriteFailed, "写轨道失败");
+                        self.waiting_for_keyframe.store(true, Ordering::Release);
                         self.throttle.request_throttled();
                     }
                     Err(_) => {
@@ -164,6 +167,7 @@ impl VideoWriter {
                             FrameOutcome::WriteStalled,
                             format!("{}ms 内未写完，已丢帧", WRITE_TIMEOUT.as_millis()),
                         );
+                        self.waiting_for_keyframe.store(true, Ordering::Release);
                         self.throttle.request_throttled();
                     }
                 };
@@ -427,11 +431,13 @@ mod tests {
         );
     }
 
-    /// 排队超过两个帧间隔的帧直接丢弃，不碰链路
+    /// 排队超过两个帧间隔的帧直接丢弃，并重新要 IDR（已编码帧被丢即参考链断开）
     #[tokio::test(start_paused = true)]
     async fn test_delivery_drops_stale_pending_without_writing() {
+        use crate::encode::control::ControlCommand;
+
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let (writer, _cmd_rx) = make_video_writer(Some(tx));
+        let (writer, mut cmd_rx) = make_video_writer(Some(tx));
 
         post(&writer, video_frame(1, true));
         // 60fps 下门槛为 33ms：空等 60ms 已经过了两个帧间隔
@@ -444,6 +450,10 @@ mod tests {
             1
         );
         assert_eq!(writer.outbox.outcomes().count(FrameOutcome::Admitted), 0);
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(ControlCommand::RequestKeyframe)),
+            "丢弃已编码帧后必须重新请求 IDR"
+        );
     }
 
     /// 写失败时门控保持关闭：下一次 P 帧入口就自愈请求，不等下一个 IDR
