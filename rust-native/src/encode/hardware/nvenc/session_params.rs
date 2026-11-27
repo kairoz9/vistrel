@@ -377,18 +377,9 @@ pub(super) fn build_encoder_config(
         // SAFETY: init_params 已完整初始化，encodeConfig 指向堆上地址稳定的 config
         let res = initialize(encoder.as_raw(), &mut init_params);
         if res != NVENCSTATUS::NV_ENC_SUCCESS {
-            // 状态码不带细节（如 INVALID_PARAM），last_error 会直接点名无效参数
-            let detail = driver
-                .api()
-                .nvEncGetLastErrorString
-                .map(|get| {
-                    // SAFETY: encoder 为有效会话句柄；返回值为驱动内部字符串，
-                    // 仅在本调用内读取
-                    std::ffi::CStr::from_ptr(get(encoder.as_raw()))
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .unwrap_or_default();
+            // 状态码不带细节（如 INVALID_PARAM），last_error 会直接点名无效参数；
+            // 它同时负责函数指针缺位与返回值 NULL 的兜底
+            let detail = super::session::last_error(driver, encoder);
             return Err(format!(
                 "nvEncInitializeEncoder failed: {:?} ({})",
                 res, detail

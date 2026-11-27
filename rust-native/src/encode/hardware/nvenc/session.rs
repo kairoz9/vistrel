@@ -437,7 +437,10 @@ impl NvencSession {
         frame_idx: u64,
         stage: &StageCell,
     ) -> Result<(Vec<u8>, bool), String> {
-        // 1. 映射。此处的 `?` 是安全的：映射尚未成功，没有需要归还的东西。
+        // 先取函数指针与码流句柄：查询失败不取句柄，映射失败只归还句柄，
+        // 不会留下未解映射的资源
+        let map = nvfn!(self.driver, nvEncMapInputResource);
+        let handle = self.take_bitstream()?;
         stage.set(EncodeStage::MapInput);
         // SAFETY: 该结构为 bindgen 生成的 C POD，成员均为整型/指针或 0 值合法的枚举
         // （BUFFER_FORMAT 的 UNDEFINED），全零位模式合法；version 随后回填
@@ -445,7 +448,6 @@ impl NvencSession {
         map_params.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
         map_params.registeredResource = registered.as_raw();
 
-        let map = nvfn!(self.driver, nvEncMapInputResource);
         #[cfg(test)]
         {
             self.benchmark_stages = BackendStageTimings::default();
@@ -454,6 +456,7 @@ impl NvencSession {
             // SAFETY: registered 由调用方持有且尚未注销
             let res = map(self.encoder.as_raw(), &mut map_params);
             if res != NVENCSTATUS::NV_ENC_SUCCESS || map_params.mappedResource.is_null() {
+                self.recycle_bitstream(handle);
                 return Err(format!(
                     "nvEncMapInputResource failed ({:?}): {:?}",
                     registered, res
@@ -468,8 +471,7 @@ impl NvencSession {
             ..spec
         };
 
-        // 2. 提交：句柄取出 → 编码 → 锁定 → 拷出 → 守卫收尾 → 句柄放回
-        let handle = self.take_bitstream()?;
+        // 提交：编码 → 锁定 → 拷出 → 守卫收尾 → 句柄放回
         let mut pic_params = build_pic_params(mapped_ptr, spec, force_idr, frame_idx);
         let encode_started = std::time::Instant::now();
         let result = encode_and_lock(
@@ -508,12 +510,15 @@ impl NvencSession {
             buffer_format: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
         };
 
+        // 先取函数指针与码流句柄：查询失败不取句柄，映射失败只归还句柄，
+        // 不会留下未解映射的资源
+        let map = nvfn!(self.driver, nvEncMapInputResource);
+        let handle = self.take_bitstream()?;
         // SAFETY: 该结构为 bindgen 生成的 C POD，成员均为整型/指针或 0 值合法的枚举
         // （BUFFER_FORMAT 的 UNDEFINED），全零位模式合法；version 随后回填
         let mut map_params: NV_ENC_MAP_INPUT_RESOURCE = unsafe { std::mem::zeroed() };
         map_params.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
         map_params.registeredResource = registered.as_raw();
-        let map = nvfn!(self.driver, nvEncMapInputResource);
         #[cfg(test)]
         {
             self.benchmark_stages = BackendStageTimings::default();
@@ -523,6 +528,7 @@ impl NvencSession {
             // SAFETY: registered 由调用方持有且尚未注销
             let res = map(self.encoder.as_raw(), &mut map_params);
             if res != NVENCSTATUS::NV_ENC_SUCCESS || map_params.mappedResource.is_null() {
+                self.recycle_bitstream(handle);
                 return Err(format!("nvEncMapInputResource failed: {res:?}"));
             }
         }
@@ -532,8 +538,6 @@ impl NvencSession {
             buffer_format: mapped_fmt,
             ..spec
         };
-
-        let handle = self.take_bitstream()?;
         let mut pic_params = build_pic_params(mapped_ptr, spec, force_idr, frame_idx);
         let encode_started = std::time::Instant::now();
         let result = encode_and_lock(
