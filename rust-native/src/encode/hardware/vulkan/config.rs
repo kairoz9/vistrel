@@ -512,6 +512,8 @@ impl CodingControl {
     }
 
     /// 运行期改码率：下一帧随码控命令重发，不需要重建会话
+    ///
+    /// 先钳制再比较：请求超出驱动上限、但落值等于当前值时不算变更，不重发码控。
     pub fn set_bitrate(&mut self, bps: u64) {
         if bps == 0 {
             return;
@@ -742,6 +744,9 @@ mod tests {
         assert!(coding.needs_config());
 
         coding.mark_applied();
+        coding.set_bitrate(25_000_000);
+        assert_eq!(coding.bitrate_bps(), 20_000_000);
+        assert!(!coding.needs_config(), "钳制到当前值不应重发码控");
         coding.set_bitrate(20_000_000);
         assert!(!coding.needs_config(), "值未变化不应重发码控");
 
