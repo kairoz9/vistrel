@@ -317,6 +317,19 @@ enum CodecRateControl<'a> {
     Av1(vk::VideoEncodeAV1RateControlInfoKHR<'a>),
 }
 
+
+/// 把推导出的 level 换算成与 `max_level_idc` 相同的枚举域
+///
+/// H.264/H.265 的 std 字段是枚举，AV1 的 `maxLevel` 与 `seq_level_idx` 同域；
+/// 三个映射在这里收口，`FrameEncoder::new` 不必按 codec 分支。
+fn level_enum(codec: VideoCodec, level: u32) -> Result<u32, String> {
+    match codec {
+        VideoCodec::H264 => h264::level_to_vk(level),
+        VideoCodec::H265 => hevc::level_enum(level),
+        VideoCodec::Av1 => Ok(level),
+    }
+}
+
 impl FrameEncoder {
     /// 帧编码器构造：校验档位与能力快照一致（codec 错位即报错）、请求码率钳进驱动
     /// 声明上限（钳制写回档位，0 视为无上限）、建视频会话与参数对象（level 与
@@ -370,6 +383,22 @@ impl FrameEncoder {
             profile.fps(),
             (bitrate_bps / 1000) as u32,
         );
+        // 推导 level 不能超过驱动上限：低端编码器可能只到 4.1，而 1080p60 + 8 Mbps
+        // 就是 4.2。超限时声明该 level 不合法，明确报错胜过静默降级，由上层换后端
+        // 或降档；SDP 的 level 仍按内容推导，不受这里影响。
+        let level_vk = level_enum(caps.codec, level)?;
+        if level_vk > caps.max_level_idc {
+            return Err(format!(
+                "{:?} 档位 {}x{}@{} 需要 level 枚举 {}（码流值 {}），超过驱动声明的上限 {}",
+                caps.codec,
+                profile.width(),
+                profile.height(),
+                profile.fps(),
+                level_vk,
+                level,
+                caps.max_level_idc
+            ));
+        }
         // SPS 的 frame_num 位宽必须装得下整个 GOP，否则参考链会错乱
         let params = match caps.codec {
             VideoCodec::H264 => VideoSessionParameters::new_h264(
@@ -926,6 +955,21 @@ pub(super) fn make_noisy_frame(extent: vk::Extent2D, seed: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 推导 level 必须换算到与 `max_level_idc` 相同的枚举域
+    #[test]
+    fn test_level_enum_domains() {
+        // H.264 语法值 42（4.2）在 std 里是枚举 12
+        assert_eq!(level_enum(VideoCodec::H264, 42), Ok(12));
+        // H.265 语法值 123（4.1 × 30）是枚举 6
+        assert_eq!(level_enum(VideoCodec::H265, 123), Ok(6));
+        // AV1 的 seq_level_idx 与 StdVideoAV1Level 同域
+        assert_eq!(level_enum(VideoCodec::Av1, 9), Ok(9));
+        assert!(
+            level_enum(VideoCodec::H264, 43).is_err(),
+            "非法语法值必须拒绝"
+        );
+    }
 
     /// `frame_num` 位宽换算：装得下 `gop_length + 1` 个不重复值
     ///

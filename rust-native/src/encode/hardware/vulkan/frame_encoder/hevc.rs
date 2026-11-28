@@ -139,43 +139,46 @@ pub fn vui() -> StdVideoH265SequenceParameterSetVui {
     }
 }
 
-/// 码流 `general_level_idc`（level 数值 × 30）→ `StdVideoH265LevelIdc` 枚举值
+/// 码流 `general_level_idc`（level × 30）→ `StdVideoH265LevelIdc` 枚举
 ///
-/// `StdVideoH265ProfileTierLevel::general_level_idc` 的类型是枚举（0 = 1.0 … 12 = 6.2），
-/// 不是码流语法元素；把 123 这类语法值直接填进去会被驱动当成越界枚举，序列化出 255。
-fn level_enum(general_level_idc: u32) -> u32 {
+/// std 字段是枚举（0 = 1.0 … 12 = 6.2），不是语法元素；直接填 123 这类值会被驱动
+/// 当成越界枚举序列化。未知值必须报错——调用方还要拿它和驱动上限比较。
+/// `pub(super)`：`FrameEncoder::new` 的 level 门禁复用同一映射。
+pub(super) fn level_enum(general_level_idc: u32) -> Result<u32, String> {
     match general_level_idc {
-        30 => 0,   // 1.0
-        60 => 1,   // 2.0
-        63 => 2,   // 2.1
-        90 => 3,   // 3.0
-        93 => 4,   // 3.1
-        120 => 5,  // 4.0
-        123 => 6,  // 4.1
-        150 => 7,  // 5.0
-        153 => 8,  // 5.1
-        156 => 9,  // 5.2
-        180 => 10, // 6.0
-        183 => 11, // 6.1
-        _ => 12,   // 6.2；`hevc_level_idc` 只会返回上表的值
+        30 => Ok(0),   // 1.0
+        60 => Ok(1),   // 2.0
+        63 => Ok(2),   // 2.1
+        90 => Ok(3),   // 3.0
+        93 => Ok(4),   // 3.1
+        120 => Ok(5),  // 4.0
+        123 => Ok(6),  // 4.1
+        150 => Ok(7),  // 5.0
+        153 => Ok(8),  // 5.1
+        156 => Ok(9),  // 5.2
+        180 => Ok(10), // 6.0
+        183 => Ok(11), // 6.1
+        186 => Ok(12), // 6.2
+        _ => Err(format!(
+            "H.265 general_level_idc {general_level_idc} 没有对应的 StdVideoH265LevelIdc 枚举"
+        )),
     }
 }
 
 /// profile / tier / level
 ///
-/// `general_level_idc` 是码流里的 level 数值 × 30（如 4.1 → 123）；这里换算成
-/// `StdVideoH265LevelIdc` 枚举值——std 结构存的是枚举，不是语法元素。
-pub fn profile_tier_level(general_level_idc: u32) -> StdVideoH265ProfileTierLevel {
+/// `general_level_idc` 是 level × 30 的语法值；枚举转换见 [`level_enum`]。
+pub fn profile_tier_level(general_level_idc: u32) -> Result<StdVideoH265ProfileTierLevel, String> {
     // SAFETY: 位域 POD，全零位模式合法
     let mut flags = unsafe { std::mem::zeroed::<StdVideoH265ProfileTierLevelFlags>() };
     // 逐行扫描、仅帧编码
     flags.set_general_progressive_source_flag(1);
     flags.set_general_frame_only_constraint_flag(1);
-    StdVideoH265ProfileTierLevel {
+    Ok(StdVideoH265ProfileTierLevel {
         flags,
         general_profile_idc: PROFILE_MAIN,
-        general_level_idc: level_enum(general_level_idc),
-    }
+        general_level_idc: level_enum(general_level_idc)?,
+    })
 }
 
 /// 构造 VPS / SPS / PPS
@@ -534,7 +537,7 @@ impl VideoSessionParameters {
         }
         let extent = session.coded_extent();
         let dpb = dpb();
-        let ptl = profile_tier_level(level_idc);
+        let ptl = profile_tier_level(level_idc)?;
         let vui = vui();
         let sets = parameter_sets(
             extent,
@@ -738,7 +741,7 @@ mod tests {
     #[test]
     fn test_sps_declares_vui() {
         let dpb = dpb();
-        let ptl = profile_tier_level(93);
+        let ptl = profile_tier_level(93).expect("3.1 必须能映射到枚举");
         let vui = vui();
         let sets = parameter_sets(
             vk::Extent2D {
@@ -766,16 +769,38 @@ mod tests {
     /// std 的 `general_level_idc` 是枚举而非码流语法值：123 必须落到 4.1（枚举 6）
     #[test]
     fn test_profile_tier_level_converts_codec_level_to_enum() {
-        assert_eq!(profile_tier_level(93).general_level_idc, 4, "3.1");
-        assert_eq!(profile_tier_level(123).general_level_idc, 6, "4.1");
-        assert_eq!(profile_tier_level(186).general_level_idc, 12, "6.2");
+        assert_eq!(
+            profile_tier_level(93)
+                .expect("3.1 必须能映射到枚举")
+                .general_level_idc,
+            4,
+            "3.1"
+        );
+        assert_eq!(
+            profile_tier_level(123)
+                .expect("4.1 必须能映射到枚举")
+                .general_level_idc,
+            6,
+            "4.1"
+        );
+        assert_eq!(
+            profile_tier_level(186)
+                .expect("6.2 必须能映射到枚举")
+                .general_level_idc,
+            12,
+            "6.2"
+        );
+        assert!(
+            level_enum(1).is_err(),
+            "未知 level 必须报错，不能静默落到 6.2"
+        );
     }
 
     /// 变换层级给满 32 → 4 的四层；层级 0 会让 NVIDIA H.265 只编码顶部少量 CTB
     #[test]
     fn test_sps_transform_hierarchy_is_full_depth() {
         let dpb = dpb();
-        let ptl = profile_tier_level(93);
+        let ptl = profile_tier_level(93).expect("3.1 必须能映射到枚举");
         let vui = vui();
         let sets = parameter_sets(
             vk::Extent2D {
