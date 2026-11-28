@@ -428,6 +428,13 @@ impl VideoSessionParameters {
             &info,
             &mut feedback as *mut _ as *mut std::ffi::c_void,
         )?;
+        if h264_feedback.has_std_sps_overrides != 0 || h264_feedback.has_std_pps_overrides != 0 {
+            log::debug!(
+                "H.264 参数集被驱动覆写: SPS={} PPS={}；码流以驱动回吐的字节为准",
+                h264_feedback.has_std_sps_overrides != 0,
+                h264_feedback.has_std_pps_overrides != 0,
+            );
+        }
         Ok(this)
     }
 }
@@ -793,7 +800,10 @@ mod tests {
             }
         };
         // 分阶段打印：SIGSEGV 时靠最后一条标记定位崩在哪一步
-        println!("编码器就绪, 开始造帧");
+        println!(
+            "编码器就绪, 开始造帧 (HAS_OVERRIDES={})",
+            encoder.feedback_has_overrides
+        );
 
         let extent = encoder.extent();
         let pixels = extent.width as usize * extent.height as usize;

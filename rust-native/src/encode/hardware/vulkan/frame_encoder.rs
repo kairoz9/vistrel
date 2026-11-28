@@ -173,6 +173,10 @@ pub struct FrameEncoder {
     /// AV1 码控的量化索引上下限（来自 `CodecCaps`）；H.26x 用标准固定的 QP 范围，不读这里
     min_q_index: u32,
     max_q_index: u32,
+    /// 反馈查询是否包含 `HAS_OVERRIDES`（驱动支持时）
+    feedback_has_overrides: bool,
+    /// 是否已经报告过逐帧覆写，避免每帧刷日志
+    overrides_seen: bool,
     /// 驱动声明的最大 intra-refresh 周期；0 表示不支持
     max_intra_refresh_cycle: u32,
     /// 已启用的 intra-refresh 周期；`None` 表示关闭
@@ -479,8 +483,17 @@ impl FrameEncoder {
         //
         // profile 必须与本次编码的 codec 一致：查询池是按视频 profile 创建的，声明成别的
         // codec 属于参数不符。这里复用上面那份 —— 它已经是本 codec 的 profile。
+        //
+        // `HAS_OVERRIDES` 是可选能力：支持时一并打开，逐帧判断驱动是否改写了帧头参数。
+        let feedback_has_overrides = caps
+            .feedback_flags
+            .contains(vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_HAS_OVERRIDES);
+        let mut feedback_flags = vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN;
+        if feedback_has_overrides {
+            feedback_flags |= vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_HAS_OVERRIDES;
+        }
         let mut feedback_create = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default()
-            .encode_feedback_flags(vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN);
+            .encode_feedback_flags(feedback_flags);
         // feedback_create 是叶子，直接 push；video_profile 已经挂了 h264_profile 子链，
         // push 会因 next.p_next 非空而 panic，必须用 extend 让 ash 找到子链尾节点再拼接。
         //
@@ -572,6 +585,8 @@ impl FrameEncoder {
             // AV1 的量化索引范围来自能力查询；H.26x 不读这两个字段
             min_q_index: caps.min_q_index,
             max_q_index: caps.max_q_index,
+            feedback_has_overrides,
+            overrides_seen: false,
             // 准入条件必须两条同时成立：能力查询说支持（模式非空、周期 >= 2）**且**
             // 逻辑设备真的开启了该 feature 位。只看前者会在 feature 未链进 create_info
             // 的机器上下发非法参数

@@ -593,6 +593,17 @@ impl VideoSessionParameters {
             &info,
             &mut feedback as *mut _ as *mut std::ffi::c_void,
         )?;
+        if h265_feedback.has_std_vps_overrides != 0
+            || h265_feedback.has_std_sps_overrides != 0
+            || h265_feedback.has_std_pps_overrides != 0
+        {
+            log::debug!(
+                "H.265 参数集被驱动覆写: VPS={} SPS={} PPS={}；码流以驱动回吐的字节为准",
+                h265_feedback.has_std_vps_overrides != 0,
+                h265_feedback.has_std_sps_overrides != 0,
+                h265_feedback.has_std_pps_overrides != 0,
+            );
+        }
         Ok(this)
     }
 }

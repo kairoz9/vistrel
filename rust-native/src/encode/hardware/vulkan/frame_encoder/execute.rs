@@ -23,16 +23,49 @@ const VBV_MS: u32 = 500;
 
 /// `VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR` 的结果布局
 ///
-/// 规范：请求的反馈值在前，带 `VK_QUERY_RESULT_WITH_STATUS_BIT_KHR` 时
-/// `VkQueryResultStatusKHR` 追加在后。两者都是 32 位，`repr(C)` 保证没有 padding，
-/// 因此 stride 就等于结构体大小。
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
+/// 反馈值按 `encodeFeedbackFlags` 的位序排列，`VkQueryResultStatusKHR` 追加在最后：
+/// 只开 `BYTES_WRITTEN` 时是 `[bytes_written, status]`；再开 `HAS_OVERRIDES` 时是
+/// `[bytes_written, has_overrides, status]`。
+#[derive(Clone, Copy)]
 struct EncodeFeedback {
-    /// `VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BYTES_WRITTEN_BIT_KHR` 的结果
-    bytes_written: u32,
-    /// `VkQueryResultStatusKHR`
-    status: u32,
+    /// 至多两个反馈值 + 一个状态
+    values: [u32; 3],
+    /// 查询是否包含 `HAS_OVERRIDES`；决定状态落在 `values[1]` 还是 `values[2]`
+    has_overrides: bool,
+}
+
+impl EncodeFeedback {
+    fn new(has_overrides: bool) -> Self {
+        Self {
+            values: [0; 3],
+            has_overrides,
+        }
+    }
+
+    /// `dataSize` / `stride`：反馈值个数 + 状态
+    fn size(&self) -> usize {
+        (1 + usize::from(self.has_overrides) + 1) * std::mem::size_of::<u32>()
+    }
+
+    fn bytes_written(&self) -> u64 {
+        u64::from(self.values[0])
+    }
+
+    fn overrides(&self) -> u32 {
+        if self.has_overrides {
+            self.values[1]
+        } else {
+            0
+        }
+    }
+
+    fn status(&self) -> u32 {
+        if self.has_overrides {
+            self.values[2]
+        } else {
+            self.values[1]
+        }
+    }
 }
 
 /// `VK_QUERY_RESULT_STATUS_COMPLETE_KHR`
@@ -205,14 +238,13 @@ impl FrameEncoder {
         #[cfg(test)]
         self.read_gpu_timings()?;
 
-        // 读 feedback。布局是「先结果、后状态」：请求的反馈值在前，带
-        // VK_QUERY_RESULT_WITH_STATUS_BIT_KHR 时 VkQueryResultStatusKHR 追加在结果之后。
-        let mut feedback = EncodeFeedback::default();
-        let size = std::mem::size_of::<EncodeFeedback>();
+        // 读 feedback：布局见 `EncodeFeedback`
+        let mut feedback = EncodeFeedback::new(self.feedback_has_overrides);
+        let size = feedback.size();
         // 走 `fp_v1_0()` 的原始指针而不是封装：这条命令要带 `WITH_STATUS_KHR` 与显式
         // stride，封装版只收一个 `&mut [T]`，表达不了这两个参数。
         let fp = self.device.device().fp_v1_0();
-        // SAFETY: feedback 是 `#[repr(C)]` 的两个 u32，大小等于 data_size 与 stride；
+        // SAFETY: feedback.values 是栈上 3 个 u32，容量覆盖「两个反馈值 + 状态」；
         // device 句柄由本结构持有且存活
         let res = unsafe {
             (fp.get_query_pool_results)(
@@ -221,7 +253,7 @@ impl FrameEncoder {
                 0,
                 1,
                 size,
-                (&mut feedback as *mut EncodeFeedback).cast(),
+                feedback.values.as_mut_ptr().cast(),
                 size as u64,
                 vk::QueryResultFlags::WAIT | vk::QueryResultFlags::WITH_STATUS_KHR,
             )
@@ -229,11 +261,13 @@ impl FrameEncoder {
         if res != vk::Result::SUCCESS {
             return Err(format!("读取 feedback 查询失败: {res:?}"));
         }
-        let bytes_written = u64::from(feedback.bytes_written);
-        if feedback.status != QUERY_STATUS_COMPLETE {
+        let bytes_written = feedback.bytes_written();
+        let has_overrides = feedback.overrides();
+        let status = feedback.status();
+        if status != QUERY_STATUS_COMPLETE {
             return Err(format!(
                 "编码查询状态非完成: {}（已写 {bytes_written} 字节）",
-                feedback.status
+                status
             ));
         }
         if bytes_written == 0 || bytes_written > self.bitstream.size() {
@@ -241,6 +275,14 @@ impl FrameEncoder {
                 "反馈的码流长度异常: {bytes_written}（缓冲 {}）",
                 self.bitstream.size()
             ));
+        }
+        // 只报一次：逐帧刷同一条日志没有信息量，且会淹没真正的一次性告警
+        if has_overrides != 0 && !self.overrides_seen {
+            self.overrides_seen = true;
+            log::debug!(
+                "{:?} 编码器报告逐帧参数被驱动覆写，应用侧 std 字段与码流可能不一致",
+                self.codec
+            );
         }
         Ok(bytes_written)
     }
