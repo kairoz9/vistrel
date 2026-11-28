@@ -271,15 +271,9 @@ pub struct IntraRefreshCaps {
 impl IntraRefreshCaps {
     /// 三项同时成立才真正可用
     ///
-    /// 依据不是扩展名，而是能力查询给出的三项：
-    ///
-    /// - `modes` 非空：驱动声明了至少一种刷新模式；
-    /// - `max_cycle_duration >= 2`：周期小于 2 构不成渐进刷新；
-    /// - **`max_active_reference_pictures != 0`**：按规范，该字段为 0 表示实现
-    ///   **不支持** intra refresh。只查前两项会漏掉这一档，于是对一个不支持的驱动
-    ///   照常下发 `VkVideoEncodeIntraRefreshInfoKHR`——驱动静默忽略，每帧退化成普通
-    ///   P 帧，而 GOP 又是按「有渐进刷新」选的超长值，结果是任何一次解码错误都长期
-    ///   不恢复（花屏）。
+    /// `modes` 非空、`max_cycle_duration >= 2`，且 `max_active_reference_pictures != 0`
+    /// （规范中 0 表示不支持）。漏掉最后一项会让驱动静默忽略 intra-refresh，而 GOP
+    /// 仍按渐进刷新选超长值，解码错误长期不恢复。
     pub fn supported(&self) -> bool {
         !self.modes.is_empty()
             && self.max_cycle_duration >= 2

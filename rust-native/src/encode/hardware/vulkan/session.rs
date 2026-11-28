@@ -1,9 +1,8 @@
 //! Vulkan Video 编码会话与其参数对象 (Video Session & Session Parameters)
 //!
-//! **[`VideoSession`]** 只负责「把会话建起来并绑好内存」：几何、DPB 与 std 头版本
-//! 全部由 [`SessionConfig`] 给定，任何一项都不写死。本阶段不含编码命令。内存绑定按
-//! 全成全败处理：任一块分配或绑定失败，`SessionGuard` 逆序销毁会话并释放已分配的内存块，
-//! 绝不留下半就绪的会话。
+//! **[`VideoSession`]** 只负责把会话建起来并绑好内存：几何、DPB 与 std 头版本
+//! 全部由 [`SessionConfig`] 给定。内存绑定全成全败，`SessionGuard` 在失败时逆序
+//! 销毁会话并释放已分配内存。
 //!
 //! **[`VideoSessionParameters`]**：编码会话建好之后、发出第一条编码命令之前，必须先把
 //! 参数集交给驱动：Vulkan Video 不做码流语法解析，序列/图像参数集的每个字段都得由应用
@@ -40,8 +39,7 @@ pub struct VideoSession {
 impl VideoSession {
     /// 按静态会话配置建会话
     ///
-    /// 几何、DPB 与参考帧数已在 [`SessionConfig::build`] 中算好：对齐到设备声明的
-    /// 粒度、DPB/活跃参考取驱动上限与策略的较小值。
+    /// 几何、DPB 与活跃参考数已在 [`SessionConfig::build`] 算好。
     pub fn new(device: &VideoDevice, config: &SessionConfig) -> Result<Self, String> {
         // 能力探测用的队列族必须与实际建设备用的那一个一致，否则会话会绑到错的队列上
         if let Some(family) = config.queue_family()
@@ -266,8 +264,7 @@ pub struct VideoSessionParameters {
 impl VideoSessionParameters {
     /// 按静态序列头配置构造参数对象
     ///
-    /// 唯一的 codec 分派点：codec 专属的构造函数收在这里，调用方只传
-    /// [`SequenceConfig`]，不按 codec 选方法。
+    /// 唯一的 codec 分派点：调用方只传 [`SequenceConfig`]，不按 codec 选方法。
     pub(super) fn new(
         device: &VideoDevice,
         session: &VideoSession,

@@ -60,12 +60,11 @@ pub(super) fn frame_num_bits(gop_length: u32) -> u32 {
     bits.clamp(4, 12)
 }
 
-/// 本帧的 intra-refresh 参数；`None` 表示本轮未启用
+/// 本帧的 intra-refresh 参数；`None` 表示未启用
 ///
-/// KEY / IDR 帧本身全帧内，索引无意义，用 0 表示从头开始；其余帧按周期推进（索引在
-/// `finish_frame` 里推进）。`intra_refresh_cycle_duration` 必须与建会话时选定的周期
-/// 一致（见 [`SessionConfig::build`]），否则驱动按它切分条带、我们按另一个周期推进，
-/// 会有区域永远轮不到刷新——表现是误差只增不减。
+/// KEY / IDR 帧全帧内，索引固定为 0；其余帧按周期推进（见 `finish_frame`）。
+/// 周期必须与建会话时选定的一致，否则驱动按它切分条带、我们按另一个周期推进，
+/// 会有区域永远轮不到刷新。
 fn intra_refresh_info<'a>(
     cycle: Option<u32>,
     index: u32,
@@ -348,12 +347,10 @@ pub(super) fn level_enum(codec: VideoCodec, level: u32) -> Result<u32, String> {
 }
 
 impl FrameEncoder {
-    /// 帧编码器构造：按静态会话配置建会话、参数对象、输入图、DPB 与码流缓冲，
-    /// 并接管运行期码控状态。能力钳制与 level 门禁已在 `SessionConfig::build`
-    /// 完成，这里只做资源分配。
+    /// 按静态会话配置建会话、参数对象、输入图、DPB 与码流缓冲，并接管运行期码控。
+    /// 能力钳制与 level 门禁已在 `SessionConfig::build` 完成，这里只做资源分配。
     ///
-    /// 全成全败，任一环节失败即 `Err`。CSC 是可选能力，其构造失败原样保留为 `Err`，
-    /// 主机帧与显存槽位两条路径据此报错，CPU 上传路径照常工作
+    /// 全成全败。CSC 是可选能力：构造失败保留为 `Err`，只影响主机帧与显存槽位路径。
     pub fn new(
         device: &VideoDevice,
         config: SessionConfig,

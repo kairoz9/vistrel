@@ -1,11 +1,8 @@
 //! 编码会话的静态配置与运行期码控状态
 //!
-//! 两类值的寿命不同，分开建模：
-//!
-//! - [`SessionConfig`] 在会话创建前一次算好，之后不再变化：格式、对齐后的 extent、
-//!   DPB、level、序列头参数、码流缓冲、GOP 与 intra-refresh 周期。
-//! - [`CodingControl`] 只装运行期会变的码控状态：当前码率/帧率、上次真正下发的值、
-//!   是否需要重发。静态上限来自 [`RateControlLimits`]。
+//! [`SessionConfig`] 在会话创建前一次算好：格式、对齐后的 extent、DPB、level、
+//! 序列头参数、码流缓冲、GOP 与 intra-refresh 周期。运行期会变的码率/帧率、
+//! applied 快照与重发标记归 [`CodingControl`]，静态上限来自 [`RateControlLimits`]。
 //!
 //! 探测结果 [`CodecCaps`] 只用于构造 [`SessionConfig`]；`VideoSession` 与
 //! `FrameEncoder` 不再直接读驱动能力字段。
@@ -19,11 +16,9 @@ use crate::encode::{StreamingProfile, VideoCodec, nv12_len};
 /// 编码输入图格式：NV12（两平面 4:2:0）
 const PICTURE_FORMAT: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
 
-/// 启用 intra-refresh 时的 GOP 长度
+/// 启用 intra-refresh 时的 GOP 长度：12 位 `frame_num` 的上界
 ///
-/// 取 12 位 `frame_num` 能表达的上界（`MaxFrameNum = 4096`），即「不靠周期性 IDR，
-/// 靠渐进刷新兜底」。不能取 16 位的 65535：一旦驱动静默忽略 intra-refresh，这串帧
-/// 就全是普通 P 帧，任何一次解码错误都会一直残留到下一个 IDR。
+/// 不能取 16 位的 65535——驱动一旦静默忽略 intra-refresh，解码错误会残留到下一个 IDR。
 const INTRA_REFRESH_GOP: u32 = 4095;
 
 /// 默认 CBR 虚拟缓冲长度（毫秒）
@@ -51,9 +46,7 @@ impl Default for EncodePolicy {
 }
 
 /// intra-refresh 的启用策略
-///
-/// 完整取值面：生产默认只走 `Prefer`，`Fixed` / `Disable` 供调用方按场景覆盖
-#[allow(dead_code)]
+#[allow(dead_code)] // 生产默认只用 Prefer，Fixed/Disable 供调用方覆盖
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntraRefreshPolicy {
     /// 驱动支持就启用，周期取 fps/2 并按驱动上限封顶
@@ -65,9 +58,7 @@ pub enum IntraRefreshPolicy {
 }
 
 /// GOP 策略
-///
-/// 完整取值面：生产默认只走 `Auto`，`Fixed` 供调用方按场景覆盖
-#[allow(dead_code)]
+#[allow(dead_code)] // 生产默认只用 Auto，Fixed 供调用方覆盖
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GopPolicy {
     /// 无 intra-refresh 时 1 秒一个 IDR；启用时用 [`INTRA_REFRESH_GOP`]
@@ -97,11 +88,10 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
-    /// 把驱动能力、协商档位与策略煮成一份静态会话配置
+    /// 把驱动能力、协商档位与策略煮成静态会话配置
     ///
-    /// 所有钳制、level 门禁、DPB/参考帧取小、GOP 与 intra-refresh 决策都在这里完成。
-    /// `device_supports_intra_refresh` 来自逻辑设备的 feature 位：能力查询说支持、但
-    /// feature 没开时不能启用。
+    /// 所有钳制、level 门禁、DPB 与 GOP/intra-refresh 决策都在这里完成。
+    /// `device_supports_intra_refresh` 来自逻辑设备 feature 位，不能只看能力查询。
     pub fn build(
         caps: &CodecCaps,
         profile: &StreamingProfile,
@@ -323,7 +313,7 @@ impl SessionConfig {
     }
 }
 
-/// DPB 槽位与活跃参考数：能力上限与编码策略取小后的结果
+/// DPB 槽位与活跃参考数：AV1 声明 8 个逻辑槽，H.26x 只要当前帧 + 1 参考
 #[derive(Debug, Clone, Copy)]
 struct DpbConfig {
     slots: u32,
@@ -472,7 +462,7 @@ impl QuantRange {
 /// 上一次真正配置进会话的码控值
 ///
 /// begin 的 `VkVideoEncodeRateControlInfoKHR` 必须与已配置状态逐字段一致（08254），
-/// 所以这里单独留存一份；当前值在作用域内再配进去，差一帧、永远一致。
+/// 因此单独留存；当前值在作用域内再配进去。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AppliedRateControl {
     pub bitrate_bps: u64,
@@ -570,8 +560,7 @@ mod tests {
     use super::super::caps::{H26xCaps, IntraRefreshCaps};
     use super::*;
 
-    /// 最小可用的 H.264 能力快照：1080p60 推导到 level 4.2（枚举 12），
-    /// 上限给到 5.2（15）；DPB 与参考帧都高于本实现实际取用值
+    /// 最小可用的 H.264 能力快照：1080p60 → level 4.2，上限 5.2（枚举 15）
     fn h264_caps() -> CodecCaps {
         CodecCaps {
             queue_family: Some(0),

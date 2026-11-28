@@ -193,8 +193,8 @@ impl VulkanVideoBackend {
         let caps: CodecCaps = caps::probe_codec(&instance, codec)?;
         let device = VideoDevice::new(&instance, codec)?;
 
-        // 2. 把能力、档位与策略煮成静态会话配置。intra-refresh 只有能力三项与设备
-        //    feature 位同时成立才会启用；GOP 与码控初值随之确定。
+        // 2. 把能力、档位与策略煮成静态会话配置；intra-refresh 还需设备 feature 位，
+        //    GOP 与码控初值随之确定。
         let policy = EncodePolicy::default();
         let config =
             SessionConfig::build(&caps, &profile, &policy, device.supports_intra_refresh())?;
