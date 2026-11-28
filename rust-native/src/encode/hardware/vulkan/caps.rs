@@ -111,7 +111,7 @@ pub struct CodecCaps {
     pub min_bitstream_size_alignment: u64,
     pub max_dpb_slots: u32,
     pub max_active_reference_pictures: u32,
-    /// 驱动声明的码率上限；请求超出属于非法用法，`FrameEncoder` 按它钳制
+    /// 驱动声明的码率上限；请求超出属于非法用法，`SessionConfig::build` 按它钳制
     pub max_bitrate: u64,
     pub rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR,
     /// codec 专属能力：同一时刻只有当前 codec 的字段存在

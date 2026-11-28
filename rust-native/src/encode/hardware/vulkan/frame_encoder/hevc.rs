@@ -49,7 +49,9 @@ use crate::encode::hardware::vulkan::device::VideoDevice;
 use crate::encode::hardware::vulkan::session::{VideoSession, VideoSessionParameters};
 
 #[cfg(test)]
-use super::{make_noisy_frame, test_profile};
+use super::{make_noisy_frame, test_frame_encoder, test_session_config};
+#[cfg(test)]
+use crate::encode::hardware::vulkan::config::{H265SequenceConfig, SequenceConfig};
 #[cfg(test)]
 use crate::encode::hardware::vulkan::context::VulkanInstance;
 #[cfg(test)]
@@ -142,7 +144,7 @@ pub fn vui() -> StdVideoH265SequenceParameterSetVui {
 ///
 /// std 字段是枚举（0 = 1.0 … 12 = 6.2），不是语法元素；直接填 123 这类值会被驱动
 /// 当成越界枚举序列化。未知值必须报错——调用方还要拿它和驱动上限比较。
-/// `pub(super)`：`FrameEncoder::new` 的 level 门禁复用同一映射。
+/// `pub(super)`：`SessionConfig::build` 的 level 门禁复用同一映射。
 pub(super) fn level_enum(general_level_idc: u32) -> Result<u32, String> {
     match general_level_idc {
         30 => Ok(0),   // 1.0
@@ -524,7 +526,7 @@ impl VideoSessionParameters {
     ///
     /// `dpb` / `ptl` / `vui` 必须是本函数的局部变量：`parameter_sets` 只把它们的地址
     /// 存进参数集，不拥有它们。挪到返回值里就会悬垂。
-    pub(super) fn new_h265(
+    pub(in crate::encode::hardware::vulkan) fn new_h265(
         device: &VideoDevice,
         session: &VideoSession,
         level_idc: u32,
@@ -925,7 +927,14 @@ mod tests {
                 return;
             }
         };
-        let session = match VideoSession::new(&device, &caps, 1920, 1080) {
+        let config = match test_session_config(&caps, 60) {
+            Ok(config) => config,
+            Err(e) => {
+                println!("会话配置构造失败，跳过: {e}");
+                return;
+            }
+        };
+        let session = match VideoSession::new(&device, &config) {
             Ok(session) => session,
             Err(e) => {
                 println!("H.265 会话创建失败，跳过: {e}");
@@ -934,7 +943,11 @@ mod tests {
         };
         // 与生产路径同源：按内容推导 level，而不是驱动声明的最高 level
         let level = u32::from(crate::encode::hevc_level_idc(1920, 1080, 60, 8_000));
-        match VideoSessionParameters::new_h265(&device, &session, level, 9) {
+        let sequence = SequenceConfig::H265(H265SequenceConfig {
+            level_idc: level,
+            frame_num_bits: 9,
+        });
+        match VideoSessionParameters::new(&device, &session, &sequence) {
             Ok(params) => {
                 let sets = params.parameter_sets();
                 println!(
@@ -1011,7 +1024,7 @@ mod tests {
                 return;
             }
         };
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), 15) {
+        let mut encoder = match test_frame_encoder(&device, &caps, 15) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("H.265 编码器初始化失败: {e}");

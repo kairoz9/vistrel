@@ -18,9 +18,6 @@ use ash::vk::{self, TaggedStructure};
 use super::{CodecGopRemaining, CodecRateControl, FrameEncoder, PendingUpload, Scope};
 use crate::encode::VideoCodec;
 
-/// CBR 虚拟缓冲长度（毫秒）
-const VBV_MS: u32 = 500;
-
 /// `VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR` 的结果布局
 ///
 /// 反馈值按 `encodeFeedbackFlags` 的位序排列，`VkQueryResultStatusKHR` 追加在最后：
@@ -168,11 +165,7 @@ impl FrameEncoder {
                 (self.intra_refresh_index + 1) % cycle
             };
         }
-        self.rate_control_initialized = true;
-        self.rate_control_dirty = false;
-        // 记下这次真正配置进会话的值：下一帧 begin 的声明必须与它逐字段一致（08254）
-        self.configured_bitrate_bps = self.bitrate_bps();
-        self.configured_fps = self.fps();
+        self.coding.mark_applied();
         // 下一帧的参考槽装的就是这一帧，它的类型要在这里记下来
         self.last_was_idr = is_idr;
 
@@ -399,16 +392,17 @@ impl FrameEncoder {
         //   `averageBitrate` / `maxBitrate` 也在比较范围内。
         //
         // 码率每帧跟着带宽估计变，所以「begin 用当前值」必然与上一帧配置的状态不符。
-        // 解法是**一帧滞后**：begin 声明 `configured_*`（上次真正配置进会话的值），
-        // 作用域内的控制命令再配当前值。首帧状态是 DEFAULT，begin 不带 RC。
-        let first = !self.rate_control_initialized;
+        // 解法是**一帧滞后**：begin 声明 `CodingControl::applied()`（上次真正配置进
+        // 会话的值），作用域内的控制命令再配当前值。首帧状态是 DEFAULT，begin 不带 RC。
+        let first = !self.coding.has_applied();
         // 本实现固定为单层码控（三个 codec 都只建一个 layer）；栈上数组避免逐帧堆分配
         assert_eq!(layers.len(), 1, "本实现只支持单层码控");
+        let applied = self.coding.applied().unwrap_or_default();
         let mut layers_prev = [layers[0]];
         for l in &mut layers_prev {
-            l.average_bitrate = self.configured_bitrate_bps;
-            l.max_bitrate = self.configured_bitrate_bps;
-            l.frame_rate_numerator = self.configured_fps;
+            l.average_bitrate = applied.bitrate_bps;
+            l.max_bitrate = applied.bitrate_bps;
+            l.frame_rate_numerator = applied.fps;
         }
         let mut rc_for_begin = if first {
             None
@@ -417,16 +411,16 @@ impl FrameEncoder {
                 vk::VideoEncodeRateControlInfoKHR::default()
                     .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
                     .layers(&layers_prev)
-                    .virtual_buffer_size_in_ms(VBV_MS)
-                    .initial_virtual_buffer_size_in_ms(VBV_MS),
+                    .virtual_buffer_size_in_ms(self.coding.vbv_ms())
+                    .initial_virtual_buffer_size_in_ms(self.coding.vbv_ms()),
             )
         };
         let mut codec_for_begin = codec_rate_control;
         let mut rc_for_control = vk::VideoEncodeRateControlInfoKHR::default()
             .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
             .layers(layers)
-            .virtual_buffer_size_in_ms(VBV_MS)
-            .initial_virtual_buffer_size_in_ms(VBV_MS);
+            .virtual_buffer_size_in_ms(self.coding.vbv_ms())
+            .initial_virtual_buffer_size_in_ms(self.coding.vbv_ms());
         let mut codec_for_control = codec_rate_control;
 
         let mut begin_info = vk::VideoBeginCodingInfoKHR::default()
@@ -520,7 +514,7 @@ impl FrameEncoder {
 
             // 码控只在首帧或参数变更后下发。**每帧下发会把驱动状态反复重置**，实测画面全黑。
             // 首帧带 RESET 把会话拉到已知起点；其余帧只同步码率，不动参考状态。
-            if self.rate_control_dirty {
+            if self.coding.needs_config() {
                 let mut control = vk::VideoCodingControlInfoKHR::default().flags(if first {
                     vk::VideoCodingControlFlagsKHR::RESET
                         | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL

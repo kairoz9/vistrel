@@ -8,6 +8,7 @@
 //! 才与它写出的 slice NAL 同源。
 
 pub(crate) mod caps;
+mod config;
 pub(crate) mod context;
 mod csc;
 mod device;
@@ -33,24 +34,13 @@ use ash::vk;
 use bytes::Bytes;
 
 use caps::CodecCaps;
+use config::{EncodePolicy, SessionConfig};
 use context::VulkanInstance;
 use frame_encoder::FrameEncoder;
 use vram_slot::VramSlot;
 
 /// 主机帧池的 Vulkan 块类型（`frame.rs` 经此引用，不开放整个 device 模块）
 pub(crate) use device::{HostBuffer, VideoDevice};
-
-/// 启用 intra-refresh 时的 GOP 长度
-///
-/// 取 12 位 `frame_num` 能表达的上界（`MaxFrameNum = 4096`），即「不靠周期性 IDR，
-/// 靠渐进刷新兜底」。
-///
-/// **不能取 16 位的 65535**：intra-refresh 是否真的生效取决于驱动
-/// （`maxIntraRefreshActiveReferencePictures` 与 `maxActiveReferencePictures` 必须
-/// 都够），一旦驱动静默忽略 `VkVideoEncodeIntraRefreshInfoKHR`，这串帧就全是普通 P 帧，
-/// 任何一次解码错误都会一直残留到下一个 IDR——65535 帧在 @240fps 是 273 秒，
-/// 表现为「花屏几分钟不恢复」。4095 帧（@60fps 68 秒）是能接受的最坏恢复时间。
-const INTRA_REFRESH_GOP: u32 = 4095;
 
 /// 把 RGBA 转成**编码尺寸**的 NV12（BT.709 + Limited Range）
 ///
@@ -203,29 +193,15 @@ impl VulkanVideoBackend {
         let caps: CodecCaps = caps::probe_codec(&instance, codec)?;
         let device = VideoDevice::new(&instance, codec)?;
 
-        // 2. intra-refresh：设备真的开启了 feature 位、且驱动声明了可用周期才启用。
-        //    三个 codec 走同一套：`VkVideoEncodeIntraRefreshInfoKHR` 是 codec 无关的
-        //    扩展，H.264 / H.265 / AV1 的编码命令都能挂。周期取 0.5s（fps/2），
-        //    与 NVENC 的 `intra_refresh_timing` 同一口径。
-        //
-        //    准入条件必须同时满足三项（见 `CodecCaps::supports_intra_refresh`），
-        //    其中 `intra_refresh.max_active_reference_pictures != 0` 最容易漏 ——
-        //    漏了会对不支持的驱动照常下发，驱动静默忽略，每帧退化成普通 P 帧，
-        //    而 GOP 是按「有渐进刷新」选的超长值，于是任何一次解码错误都永不恢复。
-        let intra_cycle = if caps.supports_intra_refresh() && device.supports_intra_refresh() {
-            Some((fps / 2).max(2).min(caps.intra_refresh.max_cycle_duration))
-        } else {
-            None
-        };
-        // GOP：启用 intra-refresh 后靠渐进刷新兜底，不再周期性出 IDR；否则按 1 秒出 IDR
-        let gop = match intra_cycle {
-            Some(_) => INTRA_REFRESH_GOP,
-            None => fps.max(2),
-        };
-        let mut encoder = FrameEncoder::new(&device, &caps, profile, gop)?;
-        if let Some(cycle) = intra_cycle {
-            encoder.set_intra_refresh(cycle)?;
-        }
+        // 2. 把能力、档位与策略煮成静态会话配置。intra-refresh 只有能力三项与设备
+        //    feature 位同时成立才会启用；GOP 与码控初值随之确定。
+        let policy = EncodePolicy::default();
+        let config =
+            SessionConfig::build(&caps, &profile, &policy, device.supports_intra_refresh())?;
+        let intra_cycle = config.intra_refresh_cycle();
+        let gop = config.gop_length();
+        let coding = config.coding_control(fps);
+        let encoder = FrameEncoder::new(&device, config, coding)?;
 
         log::info!(
             "Vulkan {:?} {width}x{height}@{fps}: intra-refresh 模式 [{:?}] present={} \

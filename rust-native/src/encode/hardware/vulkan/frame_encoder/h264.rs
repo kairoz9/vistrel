@@ -35,7 +35,13 @@ use crate::encode::hardware::vulkan::session::{VideoSession, VideoSessionParamet
 const MIN_QP_H264: i32 = 18;
 
 #[cfg(test)]
-use super::{make_noisy_frame, test_profile};
+use super::test_session_config_with;
+#[cfg(test)]
+use super::{make_noisy_frame, test_frame_encoder, test_profile, test_session_config};
+#[cfg(test)]
+use crate::encode::hardware::vulkan::config::{
+    EncodePolicy, GopPolicy, H264SequenceConfig, IntraRefreshPolicy, SequenceConfig, SessionConfig,
+};
 #[cfg(test)]
 use crate::encode::hardware::vulkan::context::VulkanInstance;
 #[cfg(test)]
@@ -379,7 +385,7 @@ fn reference_info_of(frame_num: u32, primary_pic_type: u32) -> StdVideoEncodeH26
 
 impl VideoSessionParameters {
     /// 按会话的编码几何构造 SPS/PPS 并提交给驱动
-    pub(super) fn new_h264(
+    pub(in crate::encode::hardware::vulkan) fn new_h264(
         device: &VideoDevice,
         session: &VideoSession,
         level_idc: u32,
@@ -757,7 +763,14 @@ mod tests {
                 return;
             }
         };
-        let session = match VideoSession::new(&device, &caps, 1920, 1080) {
+        let config = match test_session_config(&caps, 60) {
+            Ok(config) => config,
+            Err(e) => {
+                println!("会话配置构造失败，跳过: {e}");
+                return;
+            }
+        };
+        let session = match VideoSession::new(&device, &config) {
             Ok(session) => session,
             Err(e) => {
                 println!("会话创建失败，跳过: {e}");
@@ -767,7 +780,11 @@ mod tests {
         // 与生产路径同源：按内容推导 level，而不是驱动声明的最高 level
         let level = u32::from(crate::encode::h264_level_idc(1920, 1080, 60, 8_000));
         let level_vk = level_to_vk(level).expect("推导出的 level 必须能映射到枚举");
-        match VideoSessionParameters::new_h264(&device, &session, level, 4) {
+        let sequence = SequenceConfig::H264(H264SequenceConfig {
+            level_idc: level,
+            frame_num_bits: 4,
+        });
+        match VideoSessionParameters::new(&device, &session, &sequence) {
             Ok(params) => {
                 let sets = params.parameter_sets();
                 println!(
@@ -851,7 +868,7 @@ mod tests {
                 return;
             }
         };
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), 15) {
+        let mut encoder = match test_frame_encoder(&device, &caps, 15) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("编码器初始化失败: {e}");
@@ -987,7 +1004,7 @@ mod tests {
                 return;
             }
         };
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), 15) {
+        let mut encoder = match test_frame_encoder(&device, &caps, 15) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("编码器初始化失败: {e}");
@@ -1052,34 +1069,50 @@ mod tests {
             return;
         }
 
+        // 越界策略必须在构造期被拒，不能静默截断
+        let max_cycle = caps.intra_refresh.max_cycle_duration;
+        let too_small = EncodePolicy {
+            intra_refresh: IntraRefreshPolicy::Fixed(1),
+            ..Default::default()
+        };
+        assert!(
+            SessionConfig::build(&caps, &test_profile(), &too_small, true).is_err(),
+            "周期 < 2 必须被拒绝"
+        );
+        if max_cycle < u32::MAX {
+            let too_large = EncodePolicy {
+                intra_refresh: IntraRefreshPolicy::Fixed(max_cycle + 1),
+                ..Default::default()
+            };
+            assert!(
+                SessionConfig::build(&caps, &test_profile(), &too_large, true).is_err(),
+                "超过驱动上限必须被拒绝"
+            );
+        }
+
         // GOP 取 300 帧：frame_num 位宽应升到 9，否则参考链会在 GOP 中途断掉
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), 300) {
+        let policy = EncodePolicy {
+            gop: GopPolicy::Fixed(300),
+            ..Default::default()
+        };
+        let config = match test_session_config_with(&caps, &policy, true) {
+            Ok(config) => config,
+            Err(e) => {
+                println!("会话配置构造失败，跳过: {e}");
+                return;
+            }
+        };
+        let cycle = config
+            .intra_refresh_cycle()
+            .expect("能力与 feature 位都成立时必须启用 intra-refresh");
+        let coding = config.coding_control(60);
+        let mut encoder = match FrameEncoder::new(&device, config, coding) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("编码器初始化失败: {e}");
                 return;
             }
         };
-
-        let max_cycle = caps.intra_refresh.max_cycle_duration;
-        let cycle = max_cycle.clamp(2, 60);
-        if let Err(e) = encoder.set_intra_refresh(cycle) {
-            println!("启用 intra-refresh 失败: {e}");
-            return;
-        }
-        // 越界必须被拒，不能静默截断
-        assert!(encoder.set_intra_refresh(1).is_err(), "周期 < 2 必须被拒绝");
-        if max_cycle < u32::MAX {
-            assert!(
-                encoder.set_intra_refresh(max_cycle + 1).is_err(),
-                "超过驱动上限必须被拒绝"
-            );
-        }
-        assert_eq!(
-            encoder.intra_refresh_cycle(),
-            Some(cycle),
-            "失败调用不应改动状态"
-        );
 
         let extent = encoder.extent();
         let (idr, is_key) = match encoder.encode_idr(&make_noisy_frame(extent, 7)) {

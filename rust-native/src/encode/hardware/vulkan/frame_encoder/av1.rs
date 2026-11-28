@@ -41,12 +41,14 @@ use ash::vk::{self, TaggedStructure};
 
 use super::{CodecRateControl, FrameEncoder, begin_scope, intra_refresh_info, picture_resource};
 use crate::encode::VideoCodec;
-use crate::encode::hardware::vulkan::caps::Av1Caps;
+use crate::encode::hardware::vulkan::config::Av1SequenceConfig;
 use crate::encode::hardware::vulkan::device::VideoDevice;
 use crate::encode::hardware::vulkan::session::{VideoSession, VideoSessionParameters};
 
 #[cfg(test)]
-use super::{make_noisy_frame, test_profile};
+use super::{make_noisy_frame, test_frame_encoder, test_session_config, test_session_config_with};
+#[cfg(test)]
+use crate::encode::hardware::vulkan::config::EncodePolicy;
 #[cfg(test)]
 use crate::encode::hardware::vulkan::context::VulkanInstance;
 #[cfg(test)]
@@ -502,18 +504,17 @@ impl VideoSessionParameters {
     /// 2. 序列头的**字节**由驱动生成（`vkGetEncodedVideoSessionParametersKHR`），这里不写语法。
     ///    驱动可能在内部覆盖部分参数，只有它自己序列化出来的那份才与码流一致。
     ///
-    /// `level_idx` 必须是**按内容推导**的 AV1 level（`encode::av1_level_idx`），
-    /// 不能用驱动声明的最高 level；`maxOperatingPoints=0` 时不写操作点，见下。
-    pub(super) fn new_av1(
+    /// `config.level_idx` 必须是**按内容推导**的 AV1 level（`encode::av1_level_idx`），
+    /// 不能用驱动声明的最高 level；`config.operating_point_count == 0` 时不写操作点，见下。
+    pub(in crate::encode::hardware::vulkan) fn new_av1(
         device: &VideoDevice,
         session: &VideoSession,
-        caps: &Av1Caps,
-        level_idx: u32,
+        config: &Av1SequenceConfig,
     ) -> Result<Self, String> {
         let extent = session.coded_extent();
         // 两个局部都必须活到 create 调用结束：序列头只存它们的地址，不拥有它们
         let color = color_config();
-        let header = sequence_header(extent, &color, caps.av1_use_128x128_superblock());
+        let header = sequence_header(extent, &color, config.superblock_128);
         // `maxOperatingPoints > 0` 时，`seq_level_idx` 必须与 SDP 的 `level-idx` 同源。
         //
         // SDP 由 `transport::av1_sdp_fmtp` 按内容推导，浏览器据此分配解码资源
@@ -523,14 +524,14 @@ impl VideoSessionParameters {
         //
         // `std_operating_points` 只存指针：`ops` 必须活到
         // `create_video_session_parameters` 调用结束。
-        let ops = [operating_point(level_idx)];
+        let ops = [operating_point(config.level_idx)];
 
-        // `stdOperatingPointCount` 必须 <= `caps.max_operating_points`（VUID 10280）：
+        // `stdOperatingPointCount` 必须 <= 驱动声明的 `maxOperatingPoints`（VUID 10280）：
         // 0 表示实现不接受应用指定的操作点，此时必须省略数组、由驱动生成默认值。
         // 计数字段由 ash 的切片 setter 一并写入。
         let mut av1_params = vk::VideoEncodeAV1SessionParametersCreateInfoKHR::default()
             .std_sequence_header(&header);
-        if caps.max_operating_points > 0 {
+        if config.operating_point_count > 0 {
             av1_params = av1_params.std_operating_points(&ops);
         } else {
             log::debug!("AV1 驱动 maxOperatingPoints=0：不传操作点参数，序列头由驱动填默认操作点");
@@ -1106,7 +1107,14 @@ mod tests {
                 return;
             }
         };
-        let session = match VideoSession::new(&device, &caps, 1920, 1080) {
+        let config = match test_session_config(&caps, 60) {
+            Ok(config) => config,
+            Err(e) => {
+                println!("会话配置构造失败，跳过: {e}");
+                return;
+            }
+        };
+        let session = match VideoSession::new(&device, &config) {
             Ok(session) => session,
             Err(e) => {
                 println!("AV1 会话创建失败，跳过: {e}");
@@ -1115,11 +1123,7 @@ mod tests {
         };
         // 与生产路径同源：按内容推导 level，而不是驱动声明的最高 level
         let level_idx = u32::from(crate::encode::av1_level_idx(1920, 1080, 60, 8_000));
-        let av1_caps = match &caps.specific {
-            crate::encode::hardware::vulkan::caps::CodecSpecific::Av1(specific) => specific,
-            _ => unreachable!("probe_codec(Av1) 必然返回 Av1 变体"),
-        };
-        match VideoSessionParameters::new_av1(&device, &session, av1_caps, level_idx) {
+        match VideoSessionParameters::new(&device, &session, config.sequence()) {
             Ok(params) => {
                 let obu = params.parameter_sets();
                 println!(
@@ -1175,7 +1179,7 @@ mod tests {
                 return;
             }
         };
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), 15) {
+        let mut encoder = match test_frame_encoder(&device, &caps, 15) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("AV1 编码器初始化失败: {e}");
@@ -1251,7 +1255,7 @@ mod tests {
         if let (Ok(h264_caps), Ok(h264_device)) = (
             caps::probe_codec(&ctx, VideoCodec::H264),
             VideoDevice::new(&ctx, VideoCodec::H264),
-        ) && let Ok(mut h264) = FrameEncoder::new(&h264_device, &h264_caps, test_profile(), 15)
+        ) && let Ok(mut h264) = test_frame_encoder(&h264_device, &h264_caps, 15)
         {
             let h264_extent = h264.extent();
             let h264_key = match h264.encode_idr(&make_noisy_frame(h264_extent, 11)) {
@@ -1364,28 +1368,27 @@ mod tests {
         };
 
         // 与生产路径同一套准入：能力三项 + 设备 feature 位
-        let cycle = if caps.supports_intra_refresh() && device.supports_intra_refresh() {
-            Some((60 / 2).min(caps.intra_refresh.max_cycle_duration))
-        } else {
-            None
+        let config = match test_session_config_with(
+            &caps,
+            &EncodePolicy::default(),
+            device.supports_intra_refresh(),
+        ) {
+            Ok(config) => config,
+            Err(e) => {
+                println!("会话配置构造失败，跳过: {e}");
+                return;
+            }
         };
-        let gop = match cycle {
-            Some(_) => 4095,
-            None => 60,
-        };
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), gop) {
+        let cycle = config.intra_refresh_cycle();
+        let gop = config.gop_length();
+        let coding = config.coding_control(60);
+        let mut encoder = match FrameEncoder::new(&device, config, coding) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("AV1 编码器初始化失败: {e}");
                 return;
             }
         };
-        if let Some(c) = cycle
-            && let Err(e) = encoder.set_intra_refresh(c)
-        {
-            println!("开启 intra-refresh 失败: {e}");
-            return;
-        }
         println!("配置：GOP {gop} / intra-refresh {cycle:?}");
 
         let extent = encoder.extent();
