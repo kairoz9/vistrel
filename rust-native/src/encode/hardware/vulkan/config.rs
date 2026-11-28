@@ -46,24 +46,25 @@ impl Default for EncodePolicy {
 }
 
 /// intra-refresh 的启用策略
-#[allow(dead_code)] // 生产默认只用 Prefer，Fixed/Disable 供调用方覆盖
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntraRefreshPolicy {
     /// 驱动支持就启用，周期取 fps/2 并按驱动上限封顶
     Prefer,
     /// 显式周期；驱动不支持或超出范围时构造失败
+    #[allow(dead_code)] // 生产只用 Prefer；测试与调用方按需构造
     Fixed(u32),
     /// 不启用
+    #[allow(dead_code)] // 生产只用 Prefer；测试与调用方按需构造
     Disable,
 }
 
 /// GOP 策略
-#[allow(dead_code)] // 生产默认只用 Auto，Fixed 供调用方覆盖
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GopPolicy {
     /// 无 intra-refresh 时 1 秒一个 IDR；启用时用 [`INTRA_REFRESH_GOP`]
     Auto,
     /// 固定 GOP 长度
+    #[allow(dead_code)] // 生产只用 Auto；测试与调用方按需构造
     Fixed(u32),
 }
 
