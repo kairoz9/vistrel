@@ -139,16 +139,20 @@ const ORDER_HINT_BITS_MINUS_1: u8 = 0;
 /// 开 `enable_restoration` 后每帧必须按平面给 `FrameRestorationType` 与
 /// `LoopRestorationSize`，单元尺寸填错会直接破坏解码。
 ///
-/// - `use_128x128_superblock` 必须为 0：本机驱动只声明了 64x64 超级块
-///   （`superblock_sizes`）。FFmpeg 是按 `caps.superblockSizes` 读的，硬编码 0 与之等价。
+/// - `use_128x128_superblock` 由调用方按 `caps.superblock_sizes` 决定：128-only
+///   驱动必须声明 128，否则无法创建序列头。
 pub fn sequence_header(
     extent: vk::Extent2D,
     color: &StdVideoAV1ColorConfig,
+    use_128x128_superblock: bool,
 ) -> StdVideoAV1SequenceHeader {
     // SAFETY: 同 `color_config`，全零位模式合法
-    let flags = unsafe { std::mem::zeroed::<StdVideoAV1SequenceHeaderFlags>() };
-    // **不打开 `enable_order_hint`**（全零位即关闭）。理由见 `ORDER_HINT_BITS_MINUS_1`：
+    let mut flags = unsafe { std::mem::zeroed::<StdVideoAV1SequenceHeaderFlags>() };
+    // **不打开 `enable_order_hint`**（保持 0）。理由见 `ORDER_HINT_BITS_MINUS_1`：
     // 本实现不使用任何依赖 order hint 的工具，开着它只会多一份必须与解码端严格同步的状态。
+    if use_128x128_superblock {
+        flags.set_use_128x128_superblock(1);
+    }
 
     let max_w = extent.width.saturating_sub(1);
     let max_h = extent.height.saturating_sub(1);
@@ -180,8 +184,8 @@ pub fn sequence_header(
 
 /// 操作点信息
 ///
-/// AV1 至少要有一个操作点（`operating_points_cnt_minus_1 >= 0`），所以这里必须给一份，
-/// 不能传空数组。`seq_level_idx` 用驱动声明的最高 level —— 与 H.26x 侧同一套口径。
+/// `seq_level_idx` 由内容推导并与 SDP 同源，不能用驱动声明的最高 level；驱动
+/// `maxOperatingPoints=0` 时调用方不传数组，由驱动填默认值。
 pub fn operating_point(seq_level_idx: u32) -> StdVideoEncodeAV1OperatingPointInfo {
     // SAFETY: 同 `color_config`，全零位模式合法
     let flags = unsafe { std::mem::zeroed::<StdVideoEncodeAV1OperatingPointInfoFlags>() };
@@ -499,7 +503,7 @@ impl VideoSessionParameters {
     ///    驱动可能在内部覆盖部分参数，只有它自己序列化出来的那份才与码流一致。
     ///
     /// `level_idx` 必须是**按内容推导**的 AV1 level（`encode::av1_level_idx`），
-    /// 不能用驱动声明的最高 level —— 见 `operating_point` 调用处的说明。
+    /// 不能用驱动声明的最高 level；`maxOperatingPoints=0` 时不写操作点，见下。
     pub(super) fn new_av1(
         device: &VideoDevice,
         session: &VideoSession,
@@ -512,25 +516,28 @@ impl VideoSessionParameters {
         let extent = session.coded_extent();
         // 两个局部都必须活到 create 调用结束：序列头只存它们的地址，不拥有它们
         let color = color_config();
-        let header = sequence_header(extent, &color);
-        // **`seq_level_idx` 必须与 SDP 的 `level-idx` 同源。**
+        let header = sequence_header(extent, &color, caps.av1_use_128x128_superblock());
+        // `maxOperatingPoints > 0` 时，`seq_level_idx` 必须与 SDP 的 `level-idx` 同源。
         //
-        // SDP 由 `transport::av1_sdp_fmtp` 按分辨率/帧率/码率推导；浏览器在
-        // `configure()` 时用那个 level 分配解码资源（DPB 大小、带宽预算）。
-        // 如果序列头声明更高的 level（例如驱动支持的 6.0 而内容只需要 4.1），
-        // 硬件解码器就会「按 4.1 分配、按 6.0 解码」—— 资源不够，参考帧被挤掉，
-        // 表现为画面持续劣化。ffmpeg 不看 SDP，直接按码流的 level 解，所以测不出来。
+        // SDP 由 `transport::av1_sdp_fmtp` 按内容推导，浏览器据此分配解码资源
+        // （DPB、带宽）。序列头若声明驱动支持的更高 level（如 6.0 而内容只需 4.1），
+        // 解码器会「按 4.1 分配、按 6.0 解码」，参考帧被挤掉，画面持续劣化。
+        // NVENC 侧（`nvenc/session.rs`）同样按内容推导。
         //
-        // NVENC 侧（`nvenc/session.rs`）本来就是这么做的，注释写着
-        // 「使序列头的 seq_level_idx 与 SDP 的 level-idx 同源」。
+        // `std_operating_points` 只存指针：`ops` 必须活到
+        // `create_video_session_parameters` 调用结束。
         let ops = [operating_point(level_idx)];
 
-        // 计数字段由切片 setter 一并写入：ash 对这个结构同样生成了切片版
-        // `std_operating_points`（虽然 `stdOperatingPointCount` 与 `pStdOperatingPoints`
-        // 不成常规配对，生成器的启发式仍然认出了它）
+        // `stdOperatingPointCount` 必须 <= `caps.max_operating_points`（VUID 10280）：
+        // 0 表示实现不接受应用指定的操作点，此时必须省略数组、由驱动生成默认值。
+        // 计数字段由 ash 的切片 setter 一并写入。
         let mut av1_params = vk::VideoEncodeAV1SessionParametersCreateInfoKHR::default()
-            .std_sequence_header(&header)
-            .std_operating_points(&ops);
+            .std_sequence_header(&header);
+        if caps.max_operating_points > 0 {
+            av1_params = av1_params.std_operating_points(&ops);
+        } else {
+            log::debug!("AV1 驱动 maxOperatingPoints=0：不传操作点参数，序列头由驱动填默认操作点");
+        }
 
         let create_info = vk::VideoSessionParametersCreateInfoKHR::default()
             .video_session(session.session())
@@ -762,6 +769,7 @@ mod tests {
                 height: 1088,
             },
             &color,
+            false,
         );
 
         assert_eq!(header.seq_profile, AV1_PROFILE_MAIN);
@@ -777,8 +785,22 @@ mod tests {
 
         // film grain 被 VUID 强制为 0，打开会让会话参数创建直接失败
         assert_eq!(header.flags.film_grain_params_present(), 0);
-        // 超级块尺寸必须是 64x64：本机驱动只声明了 TYPE_64
+        // 驱动只支持 64x64 时序列头不能声明 128
         assert_eq!(header.flags.use_128x128_superblock(), 0);
+        // 驱动支持 128x128（或只支持 128）时必须能声明它
+        let header128 = sequence_header(
+            vk::Extent2D {
+                width: 1920,
+                height: 1088,
+            },
+            &color,
+            true,
+        );
+        assert_eq!(
+            header128.flags.use_128x128_superblock(),
+            1,
+            "128-only 驱动必须能生成合法的序列头"
+        );
         // 序列头工具全部为 0（含 order hint）
         assert_eq!(
             header.flags.enable_order_hint(),
