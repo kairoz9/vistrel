@@ -1,22 +1,22 @@
-//! 一帧编码的执行管线 (Frame Execution Pipeline)
+//! 一帧编码的执行管线：录制、提交、读回与状态推进
 //!
-//! 编码命令描述好之后，从这里走到「码流到手、状态推进」：[`FrameEncoder::record_and_submit`]
-//! 录制全部命令（上传拷贝 → DPB 布局 → begin → 码控 → encode → end）并提交等待，
-//! [`FrameEncoder::submit_encode`] 做失败分诊（提交未落地才回滚布局；在途超时永久毒化）
-//! 与 feedback 读取，[`FrameEncoder::finish_frame`] 读回码流、推进逐帧状态、给 IDR 拼参数集。
-//!
-//! 三个 codec 的差别只在「怎么构造编码命令」（见 `h264` / `hevc` / `av1`），
-//! 这条管线对它们完全一致。
+//! 从编码命令描述好之后开始：[`VulkanEncoder::record_and_submit`] 录制全部命令
+//! （上传拷贝 → DPB 布局 → begin → 码控 → encode → end）并提交等待，
+//! [`VulkanEncoder::submit_encode`] 做失败分诊与 feedback 读取，
+//! [`VulkanEncoder::finish_frame`] 读回码流、推进逐帧状态、给 IDR 拼参数集。
 //!
 //! **等待超时与永久毒化**：提交已落地但时间线等待超时（`InFlight`）时，命令缓冲
 //! 仍在途且绝不可复用——对在途命令缓冲 reset 是规范违规。编码器自此永久毒化：
-//! 后续录制在入口短路拒绝，排空（`drain`）直接报错；拆构期的风险是游戏侧不得
-//! 销毁在途命令缓冲引用的显存，这些资源随 `VkDevice` 在引擎关停时统一回收。
+//! 后续录制在入口短路拒绝，排空（`drain`）直接报错。毒化后的资源回收仍有
+//! `device_wait_idle` 阻塞风险；在所有权边界确定前，游戏侧不得销毁在途命令缓冲
+//! 引用的显存。
 
 use ash::vk::{self, TaggedStructure};
 
-use super::{CodecGopRemaining, CodecRateControl, FrameEncoder, PendingUpload, Scope};
-use crate::encode::VideoCodec;
+use super::{PendingUpload, Scope, VulkanEncoder};
+use crate::encode::hardware::vulkan::codec::{CodecGopRemaining, CodecRateControl};
+
+// ---- 执行管线：录制、提交、读回 ----
 
 /// `VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR` 的结果布局
 ///
@@ -96,7 +96,7 @@ impl From<String> for SubmitFailure {
     }
 }
 
-/// GPU 时间戳探针：一次提交里写下的四个边界点（顺序即录制顺序）
+/// GPU 时间戳探针：一次提交里写下的五个边界点（顺序即录制顺序）
 ///
 /// 前两个在编码作用域之内、后两个夹住整个作用域，因此
 /// `ENCODE_START → ENCODE_END` 就是 `vkCmdEncodeVideoKHR` 本身的 GPU 时间，
@@ -132,17 +132,17 @@ fn dump_path() -> Option<&'static str> {
     PATH.as_deref()
 }
 
-impl FrameEncoder {
+impl VulkanEncoder {
     /// 编码一帧之后的公共收尾：读码流、推进状态、IDR 拼参数集
     ///
-    /// 各 codec 的差别只在「怎么构造编码命令」，收尾完全一致，因此抽出来共用。
-    pub(super) fn finish_frame(
+    /// 各 codec 的差别只在「怎么构造编码命令」，收尾由本方法统一完成。
+    pub(in crate::encode::hardware::vulkan) fn finish_frame(
         &mut self,
         bytes_written: u64,
         is_idr: bool,
     ) -> Result<(Vec<u8>, bool), String> {
         let extent = self.image.extent();
-        // 码流缓冲是持久映射的：读回只做一次拷贝，不再有 map/unmap 往返。
+        // 码流缓冲是持久映射的：读回只做一次拷贝，没有 map/unmap 往返。
         // IDR 必须自带参数集（驱动不写 SPS/PPS，解码器没有它们就无法初始化），
         // 前缀拼接在这一次分配里完成
         let out = if is_idr {
@@ -152,9 +152,9 @@ impl FrameEncoder {
             self.bitstream.read(bytes_written as usize)?
         };
 
-        // 状态推进：下一帧写另一个槽，帧号递增（IDR 后从 1 开始）。这三个值都是本函数
-        // 所持有状态的直接推导（`setup_idx` 就是当时的 `next_slot`），不再由调用方回传 ——
-        // 回传错一次，槽的写入顺序与参考关系就会错位，且要等到下一帧才暴露。
+        // 状态推进：下一帧写另一个槽，帧号递增（IDR 后从 1 开始）。这三个值都从本函数
+        // 持有的状态直接推导（`setup_idx` 就是当时的 `next_slot`）；让调用方回传会多一条
+        // 可能错位的输入，槽的写入顺序与参考关系一旦出错，要等到下一帧才暴露。
         self.next_slot = 1 - self.next_slot;
         self.frame_num = if is_idr { 1 } else { self.frame_num + 1 };
         // IDR 是全帧内，刷新周期从头开始；其余帧推进一格
@@ -166,17 +166,14 @@ impl FrameEncoder {
             };
         }
         self.coding.mark_applied();
-        // 下一帧的参考槽装的就是这一帧，它的类型要在这里记下来
-        self.last_was_idr = is_idr;
+        self.codec_state.finish_frame(is_idr);
 
         // 排障：`VISTREL_DUMP_IVF=<path>` 时把码流按 IVF 落盘，供 ffprobe / ffmpeg 读。
         // 必须放在参数集拼接之后，否则 IVF 里的 IDR 缺序列头，ffprobe 认不出 codec。
         // dump_ivf 的 fourcc 写死 AV01，只对 AV1 会话落盘——其它 codec 会产出被
         // ffprobe 认错的文件
-        if let Some(path) = dump_path()
-            && matches!(self.codec, VideoCodec::Av1)
-        {
-            dump_ivf(path, extent.width, extent.height, &out);
+        if let Some(path) = dump_path() {
+            super::super::codec::dump_ivf(self.codec, path, extent.width, extent.height, &out);
         }
 
         // 关键帧上报口径：只有真 IDR 才算。渐进刷新的帧虽然是「I 宏块」，但不等于 IDR，
@@ -189,7 +186,7 @@ impl FrameEncoder {
     /// 与 codec 无关的部分全在这里：begin/end coding、feedback query、提交等待、回读。
     /// `codec_rate_control` 与 `gop_remaining` 都由各 codec 构造（结构体是 codec 专属的），
     /// 会被挂进 `vkCmdBeginVideoCodingKHR` 的 pNext —— 见 [`Self::record_and_submit`] 里的说明。
-    pub(super) fn submit_encode(
+    pub(in crate::encode::hardware::vulkan) fn submit_encode(
         &mut self,
         encode_info: &vk::VideoEncodeInfoKHR<'_>,
         scope: &Scope<'_>,
@@ -234,7 +231,7 @@ impl FrameEncoder {
             csc.finish();
         }
 
-        // 本帧的 GPU 时间戳：提交已完成，四个查询必然可用
+        // 本帧的 GPU 时间戳：提交已完成，五个查询必然可用
         #[cfg(test)]
         self.read_gpu_timings()?;
 
@@ -298,7 +295,7 @@ impl FrameEncoder {
             return;
         };
         // SAFETY: 命令缓冲处于录制态且由本结构独占；pool 由本结构创建并在整个
-        // 结构存活期内有效；query 由四个 `TS_*` 常量给出，均 < TS_COUNT
+        // 结构存活期内有效；query 由五个 `TS_*` 常量给出，均 < TS_COUNT
         unsafe {
             self.device.device().cmd_write_timestamp2(
                 self.cmd,
@@ -309,7 +306,7 @@ impl FrameEncoder {
         }
     }
 
-    /// 读回本帧的四个 GPU 时间戳并折算成纳秒
+    /// 读回本帧的五个 GPU 时间戳并折算成纳秒
     ///
     /// 视频队列族的时间戳位数常常不足 64（NVIDIA 给 32 位），因此差值必须先按有效位数
     /// 截断再做回绕减法：高位是垃圾，不截断会把几毫秒算成几十秒。回绕周期 = 2^bits 个
@@ -326,7 +323,7 @@ impl FrameEncoder {
         // 结果必然可用，这里只做有限次轮询——读不到就报错，绝不挂死。
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
         loop {
-            // SAFETY: stamps 是 4 个 u64，data_size 与 stride 都按它给出；device 存活
+            // SAFETY: stamps 是 5 个 u64，data_size 与 stride 都按它给出；device 存活
             let res = unsafe {
                 (fp.get_query_pool_results)(
                     self.device.device().handle(),
@@ -430,22 +427,14 @@ impl FrameEncoder {
         if let Some(rc) = rc_for_begin.as_mut() {
             begin_info = begin_info.push(rc);
             if let Some(ref mut crc) = codec_for_begin {
-                begin_info = match crc {
-                    CodecRateControl::H264(x) => begin_info.push(x),
-                    CodecRateControl::H265(x) => begin_info.push(x),
-                    CodecRateControl::Av1(x) => begin_info.push(x),
-                };
+                begin_info = crc.push_begin(begin_info);
             }
         }
         // `requiresGopRemainingFrames` 时每次 begin 都必须带（VUID 08256 / 10282），
         // 与码控是否重发无关。按值存进局部，begin 只持有它的地址。
         let mut gop_for_begin = gop_remaining;
         if let Some(ref mut gop) = gop_for_begin {
-            begin_info = match gop {
-                CodecGopRemaining::H264(x) => begin_info.push(x),
-                CodecGopRemaining::H265(x) => begin_info.push(x),
-                CodecGopRemaining::Av1(x) => begin_info.push(x),
-            };
+            begin_info = gop.push_begin(begin_info);
         }
         let end_info = vk::VideoEndCodingInfoKHR::default();
         // 唯一的等待来源：计算队列上的 CSC 产物。主机 NV12 路径没有
@@ -523,11 +512,7 @@ impl FrameEncoder {
                 });
                 control = control.push(&mut rc_for_control);
                 if let Some(ref mut crc) = codec_for_control {
-                    control = match crc {
-                        CodecRateControl::H264(x) => control.push(x),
-                        CodecRateControl::H265(x) => control.push(x),
-                        CodecRateControl::Av1(x) => control.push(x),
-                    };
+                    control = crc.push_control(control);
                 }
                 self.device
                     .video_queue_table()
@@ -582,7 +567,7 @@ impl FrameEncoder {
                 .wait_semaphore_infos(wait_slice)
                 .signal_semaphore_infos(&signal_slice);
             // SAFETY: submit 及其引用的 cmds / wait_one 在调用期间均存活；
-            // 同步通过时间线信号量保证，不再传递 VkFence
+            // 同步通过时间线信号量保证，不传递 VkFence
             #[cfg(test)]
             let t_sub = std::time::Instant::now();
             device
@@ -620,64 +605,4 @@ impl FrameEncoder {
 
         Ok(())
     }
-}
-
-/// 调试用：把一帧码流按 IVF 容器追加落盘，供 `ffprobe` / `ffmpeg` 直接读
-///
-/// **为什么用 IVF 而不是裸 OBU**：ffmpeg 的 `obu` demuxer 靠 temporal delimiter 切帧，
-/// 而驱动的输出不保证带 TD。IVF 只是 32 字节文件头 + 每帧 `(u32 长度, u64 时间戳, 数据)`，
-/// 自己拼十几行就够，且 ffmpeg 原生支持。
-///
-/// **只用于排障**（`VISTREL_DUMP_IVF` 开关）：写文件在编码热路径上，`write_all` 失败
-/// 一律静默忽略——调试代码不该因为磁盘问题让编码器报错。
-///
-/// fourcc 写死 `AV01`：本函数只为 AV1 排障，拿 H.264 / H.265 跑出来的文件 ffprobe 会认错。
-fn dump_ivf(path: &str, width: u32, height: u32, frame: &[u8]) {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    // 时间戳用独立自增计数，不用 `frame_num`：后者在每次 IDR 归零，会让 IVF 里的
-    // 时间戳倒退，ffmpeg 可能据此重排或告警。IVF 的 timebase 是 60/1，计数即帧序号。
-    static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
-    // 打不开只报一次，避免每帧刷屏
-    static OPEN_FAILED: std::sync::Once = std::sync::Once::new();
-
-    // 头只在文件不存在时写：存在说明是同一轮的后续帧，直接追加
-    let fresh = !std::path::Path::new(path).exists();
-    let mut file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(e) => {
-            OPEN_FAILED.call_once(|| log::warn!("码流落盘失败（{path}）: {e}"));
-            return;
-        }
-    };
-
-    if fresh {
-        // 打印绝对路径：编码器跑在 Minecraft 进程里，工作目录不一定是命令行所在目录，
-        // 「文件在哪」本身就是一个需要排除的变量
-        if let Ok(cwd) = std::env::current_dir() {
-            log::info!("码流落盘: {}", cwd.join(path).display());
-        }
-        let mut header = Vec::with_capacity(32);
-        header.extend_from_slice(b"DKIF");
-        header.extend_from_slice(&0u16.to_le_bytes()); // version
-        header.extend_from_slice(&32u16.to_le_bytes()); // 文件头长度
-        header.extend_from_slice(b"AV01");
-        header.extend_from_slice(&(width as u16).to_le_bytes());
-        header.extend_from_slice(&(height as u16).to_le_bytes());
-        header.extend_from_slice(&60u32.to_le_bytes()); // timebase 分母
-        header.extend_from_slice(&1u32.to_le_bytes()); // timebase 分子
-        header.extend_from_slice(&0u32.to_le_bytes()); // 帧数，0 = 未知
-        header.extend_from_slice(&0u32.to_le_bytes());
-        let _ = file.write_all(&header);
-    }
-
-    let ts = FRAME_SEQ.fetch_add(1, Ordering::Relaxed);
-    let _ = file.write_all(&(frame.len() as u32).to_le_bytes());
-    let _ = file.write_all(&ts.to_le_bytes());
-    let _ = file.write_all(frame);
 }
