@@ -117,7 +117,7 @@ pub(super) fn sps(
     vui: &StdVideoH264SequenceParameterSetVui,
 ) -> StdVideoH264SequenceParameterSet {
     // 位宽上限 12：`log2_max_frame_num_minus4` 语法元素取值 0..=12 虽允许 16 位，
-    // 但 16 位 `frame_num` 在解码器侧兼容性差，见 `codec::sequence::frame_num_bits`
+    // 但 16 位 `frame_num` 在解码器侧兼容性差，见 `codec::h26x::frame_num_bits`
     let bits = frame_num_bits.clamp(4, 12);
     // SAFETY: `StdVideoH264SpsFlags` 是 `#[repr(C)]` 的纯位域 POD，bindgen 不派生
     // `Default`；全零位模式合法（所有标志位为 0），随后由 setter 逐位打开需要的项
@@ -265,12 +265,7 @@ impl VideoSessionParameters {
         // codec 专属反馈挂在它的 pNext 链上；直接传 codec 专属结构会违反 VUID
         let mut feedback =
             vk::VideoEncodeSessionParametersFeedbackInfoKHR::default().push(&mut h264_feedback);
-        let this = Self::assemble(
-            device,
-            params,
-            &info,
-            &mut feedback as *mut _ as *mut std::ffi::c_void,
-        )?;
+        let this = Self::assemble(device, params, &info, Some(&mut feedback))?;
         if h264_feedback.has_std_sps_overrides != 0 || h264_feedback.has_std_pps_overrides != 0 {
             log::debug!(
                 "H.264 参数集被驱动覆写: SPS={} PPS={}；码流以驱动回吐的字节为准",

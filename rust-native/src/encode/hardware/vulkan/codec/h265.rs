@@ -12,7 +12,7 @@ mod params;
 #[cfg(test)]
 mod tests;
 
-pub(in crate::encode::hardware::vulkan) use self::params::level_enum;
+pub(in crate::encode::hardware::vulkan) use self::params::level_to_vk;
 
 /// H.265 的静态序列头参数
 #[derive(Debug, Clone, Copy)]

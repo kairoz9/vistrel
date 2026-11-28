@@ -115,7 +115,7 @@ impl CodecCaps {
         self.specific.codec()
     }
 
-    /// 驱动声明的最高 level，与 `codec::level_enum` 的输出同域
+    /// 驱动声明的最高 level，与 `codec::level_to_vk` 的输出同域
     pub fn max_level(&self) -> u32 {
         self.specific.max_level()
     }
@@ -259,9 +259,11 @@ impl CodecCaps {
 
 /// 探测单个 codec 的能力，复用调用方已有的 instance
 ///
-/// 不自己建 instance：建会话时已经有一个了，没必要再来一个（整机探测报告在
-/// `test_support`，测试自己建）。
-pub(crate) fn probe_codec(ctx: &VulkanInstance, codec: VideoCodec) -> Result<CodecCaps, String> {
+/// 不自己建 instance：建会话时已经有一个了，没必要再来一个。
+pub(in crate::encode::hardware) fn probe_codec(
+    ctx: &VulkanInstance,
+    codec: VideoCodec,
+) -> Result<CodecCaps, String> {
     // `vkGetPhysicalDeviceVideoCapabilitiesKHR` 是 `VK_KHR_video_queue` 的实例级命令。
     // 扩展没声明时命令表里是空指针：构造不报错，调用即崩，所以必须先挡在这里。
     if !ctx.supports_device_extension("VK_KHR_video_queue") {

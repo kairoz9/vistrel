@@ -1,4 +1,8 @@
 //! AV1 每帧参数与编码命令装配
+//!
+//! **帧头的自引用已拆开**：`StdVideoEncodeAV1PictureInfo` 的指针字段指向
+//! [`Av1FrameParts`]；[`build`] 借用 `parts` 并返回 [`Av1FrameStd<'a>`]，帧头存活期间
+//! `parts` 移不动、改不了，约束交给借用检查器。
 
 use std::marker::PhantomData;
 

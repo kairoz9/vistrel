@@ -12,7 +12,7 @@ use self::h26x::H26xCaps;
 use crate::encode::VideoCodec;
 
 pub(in crate::encode::hardware::vulkan) mod av1;
-pub(crate) mod caps;
+pub(in crate::encode::hardware) mod caps;
 pub(in crate::encode::hardware::vulkan) mod config;
 pub(in crate::encode::hardware::vulkan) mod h264;
 pub(in crate::encode::hardware::vulkan) mod h265;
@@ -206,7 +206,7 @@ impl CodecSpecific {
         }
     }
 
-    /// 驱动声明的最高 level，与 `codec::level_enum` 的输出同域
+    /// 驱动声明的最高 level，与 `codec::level_to_vk` 的输出同域
     pub(in crate::encode::hardware::vulkan) fn max_level(&self) -> u32 {
         match self {
             Self::H264(caps) | Self::H265(caps) => caps.max_level_idc,
@@ -269,10 +269,10 @@ impl CodecSpecific {
 ///
 /// H.264/H.265 的 std 字段是枚举，AV1 的 `maxLevel` 与 `seq_level_idx` 同域；
 /// 三个映射在这里收口，`SessionConfig::build` 不必按 codec 分支。
-pub(super) fn level_enum(codec: VideoCodec, level: u32) -> Result<u32, String> {
+pub(super) fn level_to_vk(codec: VideoCodec, level: u32) -> Result<u32, String> {
     match codec {
         VideoCodec::H264 => self::h264::level_to_vk(level),
-        VideoCodec::H265 => self::h265::level_enum(level),
+        VideoCodec::H265 => self::h265::level_to_vk(level),
         VideoCodec::Av1 => Ok(level),
     }
 }
@@ -413,15 +413,15 @@ mod tests {
 
     /// 推导 level 必须换算到与 `CodecCaps::max_level` 相同的枚举域
     #[test]
-    fn test_level_enum_domains() {
+    fn test_level_to_vk_domains() {
         // H.264 语法值 42（4.2）在 std 里是枚举 12
-        assert_eq!(level_enum(VideoCodec::H264, 42), Ok(12));
+        assert_eq!(level_to_vk(VideoCodec::H264, 42), Ok(12));
         // H.265 语法值 123（4.1 × 30）是枚举 6
-        assert_eq!(level_enum(VideoCodec::H265, 123), Ok(6));
+        assert_eq!(level_to_vk(VideoCodec::H265, 123), Ok(6));
         // AV1 的 seq_level_idx 与 StdVideoAV1Level 同域
-        assert_eq!(level_enum(VideoCodec::Av1, 9), Ok(9));
+        assert_eq!(level_to_vk(VideoCodec::Av1, 9), Ok(9));
         assert!(
-            level_enum(VideoCodec::H264, 43).is_err(),
+            level_to_vk(VideoCodec::H264, 43).is_err(),
             "非法语法值必须拒绝"
         );
     }

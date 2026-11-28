@@ -1,4 +1,8 @@
 //! H.265 会话级码流参数：VPS / SPS / PPS / VUI 与参数集装配
+//!
+//! **参数集的生命周期约束**：`pDecPicBufMgr` / `pProfileTierLevel` /
+//! `pSequenceParameterSetVui` 是裸指针。[`parameter_sets`] 只存调用方给的引用，
+//! 不拥有它们；调用方必须保证这三个结构体活到参数集用完为止。
 
 use ash::vk::native::{
     StdVideoH265DecPicBufMgr, StdVideoH265PictureParameterSet, StdVideoH265PpsFlags,
@@ -95,8 +99,8 @@ pub fn vui() -> StdVideoH265SequenceParameterSetVui {
 ///
 /// std 字段是枚举（0 = 1.0 … 12 = 6.2），不是语法元素；直接填 123 这类值会被驱动
 /// 当成越界枚举序列化。未知值必须报错——调用方还要拿它和驱动上限比较。
-/// `pub(super)`：`SessionConfig::build` 的 level 门禁复用同一映射。
-pub(in crate::encode::hardware::vulkan) fn level_enum(
+/// 可见性限定在 `encode::hardware::vulkan`：`SessionConfig::build` 的 level 门禁复用同一映射。
+pub(in crate::encode::hardware::vulkan) fn level_to_vk(
     general_level_idc: u32,
 ) -> Result<u32, String> {
     match general_level_idc {
@@ -121,7 +125,7 @@ pub(in crate::encode::hardware::vulkan) fn level_enum(
 
 /// profile / tier / level
 ///
-/// `general_level_idc` 是 level × 30 的语法值；枚举转换见 [`level_enum`]。
+/// `general_level_idc` 是 level × 30 的语法值；枚举转换见 [`level_to_vk`]。
 pub fn profile_tier_level(general_level_idc: u32) -> Result<StdVideoH265ProfileTierLevel, String> {
     // SAFETY: 位域 POD，全零位模式合法
     let mut flags = unsafe { std::mem::zeroed::<StdVideoH265ProfileTierLevelFlags>() };
@@ -131,7 +135,7 @@ pub fn profile_tier_level(general_level_idc: u32) -> Result<StdVideoH265ProfileT
     Ok(StdVideoH265ProfileTierLevel {
         flags,
         general_profile_idc: PROFILE_MAIN,
-        general_level_idc: level_enum(general_level_idc)?,
+        general_level_idc: level_to_vk(general_level_idc)?,
     })
 }
 
@@ -351,12 +355,7 @@ impl VideoSessionParameters {
         // codec 专属反馈挂在它的 pNext 链上；直接传 codec 专属结构会违反 VUID
         let mut feedback =
             vk::VideoEncodeSessionParametersFeedbackInfoKHR::default().push(&mut h265_feedback);
-        let this = Self::assemble(
-            device,
-            params,
-            &info,
-            &mut feedback as *mut _ as *mut std::ffi::c_void,
-        )?;
+        let this = Self::assemble(device, params, &info, Some(&mut feedback))?;
         if h265_feedback.has_std_vps_overrides != 0
             || h265_feedback.has_std_sps_overrides != 0
             || h265_feedback.has_std_pps_overrides != 0

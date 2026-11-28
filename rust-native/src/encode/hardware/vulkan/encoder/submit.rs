@@ -7,8 +7,9 @@
 //!
 //! **等待超时与永久毒化**：提交已落地但时间线等待超时（`InFlight`）时，命令缓冲
 //! 仍在途且绝不可复用——对在途命令缓冲 reset 是规范违规。编码器自此永久毒化：
-//! 后续录制在入口短路拒绝，排空（`drain`）直接报错；拆构期的风险是游戏侧不得
-//! 销毁在途命令缓冲引用的显存，这些资源随 `VkDevice` 在引擎关停时统一回收。
+//! 后续录制在入口短路拒绝，排空（`drain`）直接报错。毒化后的资源回收仍有
+//! `device_wait_idle` 阻塞风险；在所有权边界确定前，游戏侧不得销毁在途命令缓冲
+//! 引用的显存。
 
 use ash::vk::{self, TaggedStructure};
 
@@ -95,7 +96,7 @@ impl From<String> for SubmitFailure {
     }
 }
 
-/// GPU 时间戳探针：一次提交里写下的四个边界点（顺序即录制顺序）
+/// GPU 时间戳探针：一次提交里写下的五个边界点（顺序即录制顺序）
 ///
 /// 前两个在编码作用域之内、后两个夹住整个作用域，因此
 /// `ENCODE_START → ENCODE_END` 就是 `vkCmdEncodeVideoKHR` 本身的 GPU 时间，
@@ -134,14 +135,14 @@ fn dump_path() -> Option<&'static str> {
 impl VulkanEncoder {
     /// 编码一帧之后的公共收尾：读码流、推进状态、IDR 拼参数集
     ///
-    /// 各 codec 的差别只在「怎么构造编码命令」，收尾完全一致，因此抽出来共用。
+    /// 各 codec 的差别只在「怎么构造编码命令」，收尾由本方法统一完成。
     pub(in crate::encode::hardware::vulkan) fn finish_frame(
         &mut self,
         bytes_written: u64,
         is_idr: bool,
     ) -> Result<(Vec<u8>, bool), String> {
         let extent = self.image.extent();
-        // 码流缓冲是持久映射的：读回只做一次拷贝，不再有 map/unmap 往返。
+        // 码流缓冲是持久映射的：读回只做一次拷贝，没有 map/unmap 往返。
         // IDR 必须自带参数集（驱动不写 SPS/PPS，解码器没有它们就无法初始化），
         // 前缀拼接在这一次分配里完成
         let out = if is_idr {
@@ -151,9 +152,9 @@ impl VulkanEncoder {
             self.bitstream.read(bytes_written as usize)?
         };
 
-        // 状态推进：下一帧写另一个槽，帧号递增（IDR 后从 1 开始）。这三个值都是本函数
-        // 所持有状态的直接推导（`setup_idx` 就是当时的 `next_slot`），不再由调用方回传 ——
-        // 回传错一次，槽的写入顺序与参考关系就会错位，且要等到下一帧才暴露。
+        // 状态推进：下一帧写另一个槽，帧号递增（IDR 后从 1 开始）。这三个值都从本函数
+        // 持有的状态直接推导（`setup_idx` 就是当时的 `next_slot`）；让调用方回传会多一条
+        // 可能错位的输入，槽的写入顺序与参考关系一旦出错，要等到下一帧才暴露。
         self.next_slot = 1 - self.next_slot;
         self.frame_num = if is_idr { 1 } else { self.frame_num + 1 };
         // IDR 是全帧内，刷新周期从头开始；其余帧推进一格
@@ -230,7 +231,7 @@ impl VulkanEncoder {
             csc.finish();
         }
 
-        // 本帧的 GPU 时间戳：提交已完成，四个查询必然可用
+        // 本帧的 GPU 时间戳：提交已完成，五个查询必然可用
         #[cfg(test)]
         self.read_gpu_timings()?;
 
@@ -294,7 +295,7 @@ impl VulkanEncoder {
             return;
         };
         // SAFETY: 命令缓冲处于录制态且由本结构独占；pool 由本结构创建并在整个
-        // 结构存活期内有效；query 由四个 `TS_*` 常量给出，均 < TS_COUNT
+        // 结构存活期内有效；query 由五个 `TS_*` 常量给出，均 < TS_COUNT
         unsafe {
             self.device.device().cmd_write_timestamp2(
                 self.cmd,
@@ -305,7 +306,7 @@ impl VulkanEncoder {
         }
     }
 
-    /// 读回本帧的四个 GPU 时间戳并折算成纳秒
+    /// 读回本帧的五个 GPU 时间戳并折算成纳秒
     ///
     /// 视频队列族的时间戳位数常常不足 64（NVIDIA 给 32 位），因此差值必须先按有效位数
     /// 截断再做回绕减法：高位是垃圾，不截断会把几毫秒算成几十秒。回绕周期 = 2^bits 个
@@ -322,7 +323,7 @@ impl VulkanEncoder {
         // 结果必然可用，这里只做有限次轮询——读不到就报错，绝不挂死。
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
         loop {
-            // SAFETY: stamps 是 4 个 u64，data_size 与 stride 都按它给出；device 存活
+            // SAFETY: stamps 是 5 个 u64，data_size 与 stride 都按它给出；device 存活
             let res = unsafe {
                 (fp.get_query_pool_results)(
                     self.device.device().handle(),
@@ -566,7 +567,7 @@ impl VulkanEncoder {
                 .wait_semaphore_infos(wait_slice)
                 .signal_semaphore_infos(&signal_slice);
             // SAFETY: submit 及其引用的 cmds / wait_one 在调用期间均存活；
-            // 同步通过时间线信号量保证，不再传递 VkFence
+            // 同步通过时间线信号量保证，不传递 VkFence
             #[cfg(test)]
             let t_sub = std::time::Instant::now();
             device

@@ -4,14 +4,10 @@
 //! 命令缓冲与时间线信号量；每次调用把一帧输入编码成码流。
 //!
 //! 三个 codec 的「std 结构 + 会话参数装配 + 编码命令装配」各自收在 `codec/` 下的
-//! `h264` / `h265` / `av1`；本模块持有 codec 共享的机器（结构体、公开入口）。
-//! 构造与资源归还在 `builder` 子模块，一帧的执行管线在 `submit` 子模块，测试夹具在
-//! `test_support` 子模块。
+//! `h264` / `h265` / `av1`；本模块持有共享的结构体与公开入口，构造与资源归还在
+//! `builder`，一帧的执行管线在 `submit`，测试夹具在 `test_support`。
 //!
 //! 码流缓冲是主机可见的：构造时映射一次，逐帧只做 memcpy 读取，省掉一次拷贝。
-//!
-//! 三个 codec 的差别只在「怎么构造编码命令」（见 `codec/` 下的 `h264` / `h265` / `av1`），
-//! 提交与读回对它们完全一致。
 
 use ash::vk;
 
@@ -113,7 +109,7 @@ pub(in crate::encode::hardware::vulkan) fn begin_scope<'a>(
 
 /// 本帧待录制的输入图上传
 ///
-/// 上传不再自己提交：它被录进编码命令缓冲，与编码命令同处一次提交，中间没有 CPU 往返。
+/// 上传不单独提交：它被录进编码命令缓冲，与编码命令同处一次提交，中间没有 CPU 往返。
 /// 因此「本帧的像素从哪来」必须由公开入口先登记，再由 `submit_encode` 在录制时消费。
 ///
 /// 每个公开入口都会先登记再进 `encode_prepared`，所以即使 `encode_prepared` 中途失败，
@@ -197,6 +193,7 @@ pub struct FrameProfileTimings {
 }
 
 impl VulkanEncoder {
+    /// 编码尺寸（coded extent）
     pub fn extent(&self) -> vk::Extent2D {
         self.image.extent()
     }
@@ -218,12 +215,12 @@ impl VulkanEncoder {
         self.csc.is_ok()
     }
 
-    /// 是否因提交等待超时毒化；毒化后的行为约束与拆构风险见 `submit` 子模块文档
+    /// 是否因提交等待超时毒化（行为约束见 `submit` 子模块文档）
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
 
-    /// 目标帧率（帧/秒）
+    /// 本编码器服务的 codec
     pub(in crate::encode::hardware::vulkan) fn codec(&self) -> VideoCodec {
         self.codec
     }
@@ -238,6 +235,7 @@ impl VulkanEncoder {
         self.session.display_extent()
     }
 
+    /// 目标帧率（帧/秒）
     pub(in crate::encode::hardware::vulkan) fn fps(&self) -> u32 {
         self.coding.fps()
     }
@@ -254,6 +252,7 @@ impl VulkanEncoder {
         self.coding.set_bitrate(bps);
     }
 
+    /// 当前目标码率（bps，测试用）
     #[cfg(test)]
     pub fn bitrate(&self) -> u64 {
         self.bitrate_bps()
@@ -298,6 +297,7 @@ impl VulkanEncoder {
         self.encode_prepared(force_idr)
     }
 
+    /// 最近一帧的阶段耗时（测试/剖析用）
     #[cfg(test)]
     pub fn last_timings(&self) -> FrameProfileTimings {
         self.last_timings

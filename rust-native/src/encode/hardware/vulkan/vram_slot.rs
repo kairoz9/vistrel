@@ -54,8 +54,8 @@ impl VramSlot {
 
     /// 本帧要等的时间线信号量与值；`None` 表示不需要等
     ///
-    /// 等待交给 GPU：返回值直接进 `vkQueueSubmit2` 的 `waitSemaphoreInfos`，主机不再
-    /// 调 `vkWaitSemaphores`。这样渲染侧还在画的时候，CSC 与编码指令已经录好并提交，
+    /// 等待交给 GPU：返回值直接进 `vkQueueSubmit2` 的 `waitSemaphoreInfos`，主机不调
+    /// `vkWaitSemaphores`。这样渲染侧还在画的时候，CSC 与编码指令已经录好并提交，
     /// GPU 侧没有「渲染完 → 唤醒 CPU → CPU 再提交」的空档。
     ///
     /// 生产侧没给信号量时返回 `None`——此时调用方拿到的是「可能还没写完」的画面，

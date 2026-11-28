@@ -39,7 +39,10 @@ use encoder::VulkanEncoder;
 use vram_slot::VramSlot;
 
 /// 探测单个 codec 的能力；供 `hardware` 汇总各后端时调用
-pub(crate) fn probe_codec(ctx: &VulkanInstance, codec: VideoCodec) -> Result<CodecCaps, String> {
+pub(in crate::encode::hardware) fn probe_codec(
+    ctx: &VulkanInstance,
+    codec: VideoCodec,
+) -> Result<CodecCaps, String> {
     codec::caps::probe_codec(ctx, codec)
 }
 
@@ -310,7 +313,7 @@ impl VideoEncodeBackend for VulkanVideoBackend {
         Ok(())
     }
 
-    /// 排空：等待超时过的编码器仍带着在途命令缓冲（毒化机制见 `execute` 模块文档）
+    /// 排空：等待超时过的编码器仍带着在途命令缓冲（毒化机制见 `encoder::submit` 模块文档）
     ///
     /// 编码逐帧同步：`encode` 在时间线信号量上等到 2s 上限才返回码流，返回时没有在途
     /// 任务，所以正常路径下这里无须等任何东西。

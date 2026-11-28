@@ -219,6 +219,6 @@ impl VideoSessionParameters {
         // 也没有对应的 FeedbackInfo
         let info =
             vk::VideoEncodeSessionParametersGetInfoKHR::default().video_session_parameters(params);
-        Self::assemble(device, params, &info, std::ptr::null_mut())
+        Self::assemble(device, params, &info, None)
     }
 }

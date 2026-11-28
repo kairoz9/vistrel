@@ -233,12 +233,8 @@ fn test_vulkan_video_h264_session_parameters() {
             let mut h264_feedback = vk::VideoEncodeH264SessionParametersFeedbackInfoKHR::default();
             let mut feedback =
                 vk::VideoEncodeSessionParametersFeedbackInfoKHR::default().push(&mut h264_feedback);
-            let bytes = VideoSessionParameters::fetch_encoded(
-                &device,
-                &info,
-                &mut feedback as *mut _ as *mut std::ffi::c_void,
-            )
-            .expect("带反馈地再取一次参数集");
+            let bytes = VideoSessionParameters::fetch_encoded(&device, &info, Some(&mut feedback))
+                .expect("带反馈地再取一次参数集");
             println!(
                 "驱动覆盖情况: SPS={} PPS={} / 字节数 {}",
                 h264_feedback.has_std_sps_overrides != 0,

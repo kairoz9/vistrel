@@ -90,7 +90,7 @@ fn test_profile_tier_level_converts_codec_level_to_enum() {
         "6.2"
     );
     assert!(
-        level_enum(1).is_err(),
+        level_to_vk(1).is_err(),
         "未知 level 必须报错，不能静默落到 6.2"
     );
 }
@@ -272,12 +272,8 @@ fn test_vulkan_video_h265_session_parameters() {
             let mut h265_feedback = vk::VideoEncodeH265SessionParametersFeedbackInfoKHR::default();
             let mut feedback =
                 vk::VideoEncodeSessionParametersFeedbackInfoKHR::default().push(&mut h265_feedback);
-            let bytes = VideoSessionParameters::fetch_encoded(
-                &device,
-                &info,
-                &mut feedback as *mut _ as *mut std::ffi::c_void,
-            )
-            .expect("带反馈地再取一次参数集");
+            let bytes = VideoSessionParameters::fetch_encoded(&device, &info, Some(&mut feedback))
+                .expect("带反馈地再取一次参数集");
             println!(
                 "驱动覆盖情况: VPS={} SPS={} PPS={} / 字节数 {}",
                 h265_feedback.has_std_vps_overrides != 0,

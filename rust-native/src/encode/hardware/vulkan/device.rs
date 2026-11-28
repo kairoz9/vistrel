@@ -31,7 +31,7 @@ pub use self::host_buffer::HostBuffer;
 
 /// 计算着色器**输出平面**的格式是否支持 `STORAGE_IMAGE`
 ///
-/// 源图已改成 sampled image（RGBA8 / BGRA8 的采样支持是规范保证的，不需要查），
+/// 源图走 sampled image（RGBA8 / BGRA8 的采样支持是规范保证的，不需要查），
 /// 所以只剩两个输出平面要准入。这是「不同机器真的会不一样」的项，必须运行时查、
 /// 不支持就 fail-closed。
 #[derive(Debug, Clone, Copy, Default)]
@@ -277,7 +277,7 @@ impl VideoDevice {
         };
 
         // Intra-Refresh 的准入结论在建设备之前就已确定，feature 位也已链进 create_info；
-        // 这里只做转存，不再查询——查询与启用必须是同一份数据，否则会「查到支持但没开启」
+        // 这里只做转存；查询与启用必须使用同一份数据，否则会「查到支持但没开启」
         let intra_refresh = intra_refresh_supported;
 
         // GPU 时间戳探针的两项准入：队列族的 validBits 决定能不能写时间戳，
@@ -308,7 +308,7 @@ impl VideoDevice {
             .contains(vk::FormatFeatureFlags::STORAGE_IMAGE),
         };
 
-        // 两张命令表在建设备时一次填满，之后全后端共用，不再逐条解析。
+        // 两张命令表在建设备时一次填满，之后全后端共用。
         //
         // `load` 把 `vkGetDeviceProcAddr` 的返回值直接转成函数指针、**不检查空指针**，
         // 所以表可用性的前提是上面已确认两个视频扩展都已启用（缺任何一个都已在此前

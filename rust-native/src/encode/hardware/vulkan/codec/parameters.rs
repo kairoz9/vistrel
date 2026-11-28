@@ -53,16 +53,17 @@ impl VideoSessionParameters {
 
     /// 公共收尾：取驱动序列化的参数集字节并组装 `Self`
     ///
-    /// `feedback` 传 null 时不取反馈；非 null 时必须指向顶层的
-    /// `VideoEncodeSessionParametersFeedbackInfoKHR`，codec 专属反馈挂在它的 pNext 链上。
+    /// `feedback` 为 `None` 时不取反馈；`Some` 时传顶层反馈结构，codec 专属反馈
+    /// 挂在它的 pNext 链上。
     ///
-    /// 各 codec 的参数集构造在 `codec/{h264,h265}/params.rs` 与 `codec/av1/sequence.rs`，经本方法与
-    /// [`Self::fetch_encoded`] 收尾——字段不外泄，调用方拿不到「半组装」的对象。
+    /// 各 codec 的参数集构造在 `codec/{h264,h265}/params.rs` 与
+    /// `codec/av1/sequence.rs`，经本方法与 [`Self::fetch_encoded`] 收尾——字段不外泄，
+    /// 调用方拿不到「半组装」的对象。
     pub(in crate::encode::hardware::vulkan) fn assemble(
         device: &VideoDevice,
         params: vk::VideoSessionParametersKHR,
         info: &vk::VideoEncodeSessionParametersGetInfoKHR<'_>,
-        feedback: *mut std::ffi::c_void,
+        feedback: Option<&mut vk::VideoEncodeSessionParametersFeedbackInfoKHR<'_>>,
     ) -> Result<Self, String> {
         let parameter_sets = match Self::fetch_encoded(device, info, feedback) {
             Ok(bytes) => bytes,
@@ -89,28 +90,31 @@ impl VideoSessionParameters {
     /// `info` 的 `pNext` 链决定取哪些参数集：H.264 / H.265 必须挂 codec 专属的
     /// `VideoEncode*SessionParametersGetInfoKHR`（VUID 08262 / 08265），AV1 留空。
     ///
-    /// `feedback` 为 null 时不取反馈；非 null 时必须指向顶层的
-    /// `VideoEncodeSessionParametersFeedbackInfoKHR`，codec 专属反馈挂在它的 pNext 链上。
+    /// `feedback` 为 `None` 时不取反馈；`Some` 时传顶层反馈结构，codec 专属反馈
+    /// 挂在它的 pNext 链上。
     pub(in crate::encode::hardware::vulkan) fn fetch_encoded(
         device: &VideoDevice,
         info: &vk::VideoEncodeSessionParametersGetInfoKHR<'_>,
-        feedback: *mut std::ffi::c_void,
+        feedback: Option<&mut vk::VideoEncodeSessionParametersFeedbackInfoKHR<'_>>,
     ) -> Result<Vec<u8>, String> {
         // 走 `fp()` 暴露的原始指针，不用 ash 的封装：封装把 `pDataSize` 变成了切片长度、
         // 并丢弃驱动写回的实际字节数，而两段式查询要靠它先读回长度、再按长度取字节。
         let fp = device.video_encode_queue_table().fp();
         // `Device::handle` 在这个 ash rev 上是安全方法，不需要 unsafe
         let raw_device = device.device().handle();
+        let feedback_ptr = feedback.map_or(std::ptr::null_mut(), |feedback| {
+            feedback as *mut vk::VideoEncodeSessionParametersFeedbackInfoKHR<'_>
+        });
 
         // 第一段：只问长度
         let mut size = 0usize;
-        // SAFETY: pData 为 null 是标准两段式查询首调，只写 size；feedback 由调用方保证
-        // 指向其声明的 codec 专属反馈结构（或为 null）
+        // SAFETY: pData 为 null 是标准两段式查询首调，只写 size；feedback_ptr 来自
+        // `Option<&mut>`，引用在调用期间存活，None 时为 null
         let res = unsafe {
             (fp.get_encoded_video_session_parameters_khr)(
                 raw_device,
                 info,
-                feedback.cast(),
+                feedback_ptr,
                 &mut size,
                 std::ptr::null_mut(),
             )
@@ -126,12 +130,13 @@ impl VideoSessionParameters {
         // 并把 `pDataSize` 写 0。缓冲大小取自首调，撞上它说明两次调用之间尺寸变了
         let mut buf = vec![0u8; size];
         let mut written = size;
-        // SAFETY: buf 长度等于首调给出的 size，written 以同值传入
+        // SAFETY: buf 长度等于首调给出的 size，written 以同值传入；feedback_ptr 的有效期
+        // 与首调相同
         let res = unsafe {
             (fp.get_encoded_video_session_parameters_khr)(
                 raw_device,
                 info,
-                feedback.cast(),
+                feedback_ptr,
                 &mut written,
                 buf.as_mut_ptr() as *mut std::ffi::c_void,
             )

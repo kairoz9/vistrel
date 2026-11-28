@@ -24,9 +24,10 @@ use crate::encode::hardware::vulkan::session::VideoSession;
 
 /// `VulkanEncoder` 构造期的资源守卫
 ///
-/// `query_pool` / `pool` / `cmd` / `timeline_sem` 是裸句柄，`new` 里任一步失败都要逆序归还。
-/// 用 `Option` 表达「已创建」：`finish` 里 `take()` 之后守卫不再持有任何东西，
-/// 失败路径则靠 `Drop` 自动清理。会话、图像、暂存缓冲本身已是 RAII 类型，不在守卫里。
+/// `query_pool` / `ts_pool` / `pool` / `cmd` / `timeline_sem` 是裸句柄，`new` 里
+/// 任一步失败都要逆序归还。用 `Option` 表达「已创建」：`finish` 里 `take()` 之后
+/// 守卫不再持有任何东西，失败路径则靠 `Drop` 自动清理。会话、图像、暂存缓冲本身
+/// 已是 RAII 类型，不在守卫里。
 struct EncoderBuildGuard {
     device: VideoDevice,
     query_pool: Option<vk::QueryPool>,

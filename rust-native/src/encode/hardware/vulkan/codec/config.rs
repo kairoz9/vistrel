@@ -1,11 +1,11 @@
-//! 编码会话的静态配置与运行期码控状态
+//! 编码会话的静态配置
 //!
 //! [`SessionConfig`] 在会话创建前一次算好：格式、对齐后的 extent、DPB、level、
 //! 序列头参数、码流缓冲、GOP 与 intra-refresh 周期。运行期码控状态在
 //! [`super::rate_control`]。
 //!
 //! 探测结果 [`CodecCaps`] 只用于构造 [`SessionConfig`]；`VideoSession` 与
-//! `VulkanEncoder` 不再直接读驱动能力字段。
+//! `VulkanEncoder` 只消费配置，不读取驱动能力字段。
 
 use ash::vk;
 
@@ -13,7 +13,7 @@ use ash::vk;
 use super::CodecSpecific;
 use super::SequenceConfig;
 use super::caps::CodecCaps;
-use super::level_enum;
+use super::level_to_vk;
 use super::rate_control::{CodingControl, RateControlLimits};
 use crate::encode::{StreamingProfile, VideoCodec, nv12_len};
 
@@ -176,7 +176,7 @@ impl SessionConfig {
             profile.fps(),
             (bitrate_bps / 1000) as u32,
         );
-        let level_vk = level_enum(codec, level)?;
+        let level_vk = level_to_vk(codec, level)?;
         if level_vk > caps.max_level() {
             return Err(format!(
                 "{codec:?} 档位 {}x{}@{} 需要 level 枚举 {}（码流值 {}），超过驱动声明的上限 {}",
@@ -301,7 +301,7 @@ impl SessionConfig {
     }
 }
 
-/// DPB 槽位与活跃参考数：AV1 声明 8 个逻辑槽，H.26x 只要当前帧 + 1 参考
+/// DPB 槽位与活跃参考数（上限由各 codec 的能力实现给出）
 #[derive(Debug, Clone, Copy)]
 struct DpbConfig {
     slots: u32,
