@@ -170,11 +170,12 @@ pub(crate) struct VulkanVideoBackend {
     slots: SlotTable<VramSlot>,
     /// 编码阻塞阶段出口：本后端只写阶段码，心跳由编码循环推进
     stage: Arc<StageCell>,
-    /// 本设备为该 codec 声明的 `pictureAccessGranularity`
+    /// 本设备为该 codec 声明的 coded extent 对齐粒度
     ///
-    /// 采集侧必须按它出帧（`StreamingProfile::coded_extent`）。存成字段而不是每次回查
-    /// `CodecCaps`，是因为上层要用它校正全局探测快照——探测后端与实际建成的后端
-    /// 可能不是同一个（见 `VideoEncoder::new_hardware`）。
+    /// 取 `pictureAccessGranularity` 与 AV1 `codedPictureAlignment` 的较大值；
+    /// `encodeInputPictureGranularity` 只影响输入图 padding，不改变采集侧交付的尺寸
+    /// （`StreamingProfile::coded_extent`）。存成字段是为了校正全局探测快照——探测
+    /// 后端与实际建成的后端可能不是同一个（见 `VideoEncoder::new_hardware`）。
     coded_align: (u32, u32),
 }
 
@@ -248,10 +249,7 @@ impl VulkanVideoBackend {
                 codec,
                 slots: SlotTable::new(),
                 stage,
-                coded_align: (
-                    caps.picture_access_granularity.width.max(1),
-                    caps.picture_access_granularity.height.max(1),
-                ),
+                coded_align: caps.coded_granularity(),
             },
             blocks,
         ))

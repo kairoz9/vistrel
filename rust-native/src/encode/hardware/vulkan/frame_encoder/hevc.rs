@@ -57,7 +57,7 @@ use crate::encode::hardware::vulkan::context::VulkanInstance;
 use crate::encode::hardware::vulkan::{caps, test_support};
 
 /// CBR 的 QP 地板：只约束「画质过好」的一侧，不参与码率上限。
-/// H.265 的 QP 范围是标准固定值 0..51
+/// 最终取值会钳进驱动声明的 `minQp..maxQp`（`FrameEncoder::qp_range`）。
 const MIN_QP_H265: i32 = 22;
 
 // ---- 会话级：VPS / SPS / PPS ----
@@ -139,43 +139,46 @@ pub fn vui() -> StdVideoH265SequenceParameterSetVui {
     }
 }
 
-/// 码流 `general_level_idc`（level 数值 × 30）→ `StdVideoH265LevelIdc` 枚举值
+/// 码流 `general_level_idc`（level × 30）→ `StdVideoH265LevelIdc` 枚举
 ///
-/// `StdVideoH265ProfileTierLevel::general_level_idc` 的类型是枚举（0 = 1.0 … 12 = 6.2），
-/// 不是码流语法元素；把 123 这类语法值直接填进去会被驱动当成越界枚举，序列化出 255。
-fn level_enum(general_level_idc: u32) -> u32 {
+/// std 字段是枚举（0 = 1.0 … 12 = 6.2），不是语法元素；直接填 123 这类值会被驱动
+/// 当成越界枚举序列化。未知值必须报错——调用方还要拿它和驱动上限比较。
+/// `pub(super)`：`FrameEncoder::new` 的 level 门禁复用同一映射。
+pub(super) fn level_enum(general_level_idc: u32) -> Result<u32, String> {
     match general_level_idc {
-        30 => 0,   // 1.0
-        60 => 1,   // 2.0
-        63 => 2,   // 2.1
-        90 => 3,   // 3.0
-        93 => 4,   // 3.1
-        120 => 5,  // 4.0
-        123 => 6,  // 4.1
-        150 => 7,  // 5.0
-        153 => 8,  // 5.1
-        156 => 9,  // 5.2
-        180 => 10, // 6.0
-        183 => 11, // 6.1
-        _ => 12,   // 6.2；`hevc_level_idc` 只会返回上表的值
+        30 => Ok(0),   // 1.0
+        60 => Ok(1),   // 2.0
+        63 => Ok(2),   // 2.1
+        90 => Ok(3),   // 3.0
+        93 => Ok(4),   // 3.1
+        120 => Ok(5),  // 4.0
+        123 => Ok(6),  // 4.1
+        150 => Ok(7),  // 5.0
+        153 => Ok(8),  // 5.1
+        156 => Ok(9),  // 5.2
+        180 => Ok(10), // 6.0
+        183 => Ok(11), // 6.1
+        186 => Ok(12), // 6.2
+        _ => Err(format!(
+            "H.265 general_level_idc {general_level_idc} 没有对应的 StdVideoH265LevelIdc 枚举"
+        )),
     }
 }
 
 /// profile / tier / level
 ///
-/// `general_level_idc` 是码流里的 level 数值 × 30（如 4.1 → 123）；这里换算成
-/// `StdVideoH265LevelIdc` 枚举值——std 结构存的是枚举，不是语法元素。
-pub fn profile_tier_level(general_level_idc: u32) -> StdVideoH265ProfileTierLevel {
+/// `general_level_idc` 是 level × 30 的语法值；枚举转换见 [`level_enum`]。
+pub fn profile_tier_level(general_level_idc: u32) -> Result<StdVideoH265ProfileTierLevel, String> {
     // SAFETY: 位域 POD，全零位模式合法
     let mut flags = unsafe { std::mem::zeroed::<StdVideoH265ProfileTierLevelFlags>() };
     // 逐行扫描、仅帧编码
     flags.set_general_progressive_source_flag(1);
     flags.set_general_frame_only_constraint_flag(1);
-    StdVideoH265ProfileTierLevel {
+    Ok(StdVideoH265ProfileTierLevel {
         flags,
         general_profile_idc: PROFILE_MAIN,
-        general_level_idc: level_enum(general_level_idc),
-    }
+        general_level_idc: level_enum(general_level_idc)?,
+    })
 }
 
 /// 构造 VPS / SPS / PPS
@@ -534,7 +537,7 @@ impl VideoSessionParameters {
         }
         let extent = session.coded_extent();
         let dpb = dpb();
-        let ptl = profile_tier_level(level_idc);
+        let ptl = profile_tier_level(level_idc)?;
         let vui = vui();
         let sets = parameter_sets(
             extent,
@@ -593,6 +596,17 @@ impl VideoSessionParameters {
             &info,
             &mut feedback as *mut _ as *mut std::ffi::c_void,
         )?;
+        if h265_feedback.has_std_vps_overrides != 0
+            || h265_feedback.has_std_sps_overrides != 0
+            || h265_feedback.has_std_pps_overrides != 0
+        {
+            log::debug!(
+                "H.265 参数集被驱动覆写: VPS={} SPS={} PPS={}；码流以驱动回吐的字节为准",
+                h265_feedback.has_std_vps_overrides != 0,
+                h265_feedback.has_std_sps_overrides != 0,
+                h265_feedback.has_std_pps_overrides != 0,
+            );
+        }
         Ok(this)
     }
 }
@@ -664,15 +678,17 @@ impl FrameEncoder {
             encode_info = encode_info.push(info);
         }
 
-        // CBR 码控：H.265 同样必须给出 QP 范围与 GOP 结构，缺了驱动判非法
+        // CBR 码控：H.265 同样必须给出 QP 范围与 GOP 结构，缺了驱动判非法。
+        // 地板取 `MIN_QP_H265`，再钳进驱动声明的 `minQp..maxQp`
+        let (min_qp_value, max_qp_value) = self.qp_range(MIN_QP_H265);
         let min_qp = vk::VideoEncodeH265QpKHR::default()
-            .qp_i(MIN_QP_H265)
-            .qp_p(MIN_QP_H265)
-            .qp_b(MIN_QP_H265);
+            .qp_i(min_qp_value)
+            .qp_p(min_qp_value)
+            .qp_b(min_qp_value);
         let max_qp = vk::VideoEncodeH265QpKHR::default()
-            .qp_i(51)
-            .qp_p(51)
-            .qp_b(51);
+            .qp_i(max_qp_value)
+            .qp_p(max_qp_value)
+            .qp_b(max_qp_value);
         let mut h265_layer = vk::VideoEncodeH265RateControlLayerInfoKHR::default()
             .use_min_qp(true)
             .min_qp(min_qp)
@@ -687,16 +703,23 @@ impl FrameEncoder {
         let layers = [layer];
         // codec 专属码控信息与 `VkVideoEncodeRateControlInfoKHR` 是兄弟，都挂在 begin 上
         let h265_rate_control = vk::VideoEncodeH265RateControlInfoKHR::default()
+            .flags(
+                vk::VideoEncodeH265RateControlFlagsKHR::REGULAR_GOP
+                    | vk::VideoEncodeH265RateControlFlagsKHR::REFERENCE_PATTERN_FLAT,
+            )
             .gop_frame_count(self.gop_length)
             .idr_period(self.gop_length)
             .consecutive_b_frame_count(0)
             .sub_layer_count(1);
         let scope = begin_scope(if is_idr { None } else { Some(&ref_slots[0]) }, &setup_slot);
+        // 驱动要求/偏好时，把本帧在 GOP 内的剩余 I/P 帧数一并交给码控
+        let gop_remaining = self.gop_remaining(VideoCodec::H265, frame_num, is_idr);
         let bytes_written = self.submit_encode(
             &encode_info,
             &scope,
             &layers,
             Some(CodecRateControl::H265(h265_rate_control)),
+            gop_remaining,
         )?;
         self.finish_frame(bytes_written, is_idr)
     }
@@ -727,7 +750,7 @@ mod tests {
     #[test]
     fn test_sps_declares_vui() {
         let dpb = dpb();
-        let ptl = profile_tier_level(93);
+        let ptl = profile_tier_level(93).expect("3.1 必须能映射到枚举");
         let vui = vui();
         let sets = parameter_sets(
             vk::Extent2D {
@@ -755,16 +778,38 @@ mod tests {
     /// std 的 `general_level_idc` 是枚举而非码流语法值：123 必须落到 4.1（枚举 6）
     #[test]
     fn test_profile_tier_level_converts_codec_level_to_enum() {
-        assert_eq!(profile_tier_level(93).general_level_idc, 4, "3.1");
-        assert_eq!(profile_tier_level(123).general_level_idc, 6, "4.1");
-        assert_eq!(profile_tier_level(186).general_level_idc, 12, "6.2");
+        assert_eq!(
+            profile_tier_level(93)
+                .expect("3.1 必须能映射到枚举")
+                .general_level_idc,
+            4,
+            "3.1"
+        );
+        assert_eq!(
+            profile_tier_level(123)
+                .expect("4.1 必须能映射到枚举")
+                .general_level_idc,
+            6,
+            "4.1"
+        );
+        assert_eq!(
+            profile_tier_level(186)
+                .expect("6.2 必须能映射到枚举")
+                .general_level_idc,
+            12,
+            "6.2"
+        );
+        assert!(
+            level_enum(1).is_err(),
+            "未知 level 必须报错，不能静默落到 6.2"
+        );
     }
 
     /// 变换层级给满 32 → 4 的四层；层级 0 会让 NVIDIA H.265 只编码顶部少量 CTB
     #[test]
     fn test_sps_transform_hierarchy_is_full_depth() {
         let dpb = dpb();
-        let ptl = profile_tier_level(93);
+        let ptl = profile_tier_level(93).expect("3.1 必须能映射到枚举");
         let vui = vui();
         let sets = parameter_sets(
             vk::Extent2D {

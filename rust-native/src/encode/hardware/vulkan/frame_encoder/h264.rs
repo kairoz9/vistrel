@@ -53,6 +53,37 @@ const H264_CHROMA_420: u32 = 1;
 /// 单参考帧：IPPP，够用且让 DPB 需求最小
 const MAX_NUM_REF_FRAMES: u8 = 1;
 
+/// H.264 码流语法 `level_idc`（10..62）→ `StdVideoH264LevelIdc` 枚举
+///
+/// 两者数值域不同（语法 4.2 = 42，枚举 4.2 = 12）；直接填语法值会被驱动按越界
+/// 枚举序列化。SDP 的 `profile-level-id` 仍用语法值，转换只发生在 std 边界。
+pub(super) fn level_to_vk(raw: u32) -> Result<u32, String> {
+    match raw {
+        10 => Ok(0),
+        11 => Ok(1),
+        12 => Ok(2),
+        13 => Ok(3),
+        20 => Ok(4),
+        21 => Ok(5),
+        22 => Ok(6),
+        30 => Ok(7),
+        31 => Ok(8),
+        32 => Ok(9),
+        40 => Ok(10),
+        41 => Ok(11),
+        42 => Ok(12),
+        50 => Ok(13),
+        51 => Ok(14),
+        52 => Ok(15),
+        60 => Ok(16),
+        61 => Ok(17),
+        62 => Ok(18),
+        _ => Err(format!(
+            "H.264 level_idc 语法值 {raw} 没有对应的 StdVideoH264LevelIdc 枚举"
+        )),
+    }
+}
+
 /// 序列参数集的 VUI：只声明色彩空间，不声明时序与 HRD
 ///
 /// **为什么必须有**：CSC 输出的是 BT.709 + Limited Range，而 VUI 是码流里唯一
@@ -98,9 +129,8 @@ pub(super) fn vui() -> StdVideoH264SequenceParameterSetVui {
 
 /// 序列参数集
 ///
-/// `level_idc` 是 `StdVideoH264LevelIdc` **枚举值**（4.2 = 42），由
-/// [`crate::encode::profile_level`] 按**当前档位**推导。不用 `CodecCaps::max_level_idc`：
-/// 那是驱动能力上限（H.264 常报 6.2），声明得比实际内容高，方向与 SDP 的声明相反。
+/// `level_idc` 是 `StdVideoH264LevelIdc` 枚举值，必须先经 [`level_to_vk`] 转换；
+/// 不用 `CodecCaps::max_level_idc`：那是驱动能力上限，比内容实际需要的高。
 ///
 /// `frame_num_bits` 是 `log2(MaxFrameNum)`，取值 4..=12。它由 GOP 长度决定：
 /// 一个 GOP 内的 `frame_num` 必须不重复，否则参考链会错乱。intra-refresh 需要长 GOP，
@@ -370,6 +400,8 @@ impl VideoSessionParameters {
         }
 
         let vui = vui();
+        // SPS 要枚举，SDP 要语法值：转换只发生在 Vulkan std 边界
+        let level_idc = level_to_vk(level_idc)?;
         let sps = sps(
             extent,
             session.display_extent(),
@@ -428,6 +460,13 @@ impl VideoSessionParameters {
             &info,
             &mut feedback as *mut _ as *mut std::ffi::c_void,
         )?;
+        if h264_feedback.has_std_sps_overrides != 0 || h264_feedback.has_std_pps_overrides != 0 {
+            log::debug!(
+                "H.264 参数集被驱动覆写: SPS={} PPS={}；码流以驱动回吐的字节为准",
+                h264_feedback.has_std_sps_overrides != 0,
+                h264_feedback.has_std_pps_overrides != 0,
+            );
+        }
         Ok(this)
     }
 }
@@ -514,16 +553,17 @@ impl FrameEncoder {
         }
 
         // CBR 码控：首帧带 RESET 建立初始状态，之后只在码率变更时重发
-        // CBR 下驱动要自己算 QP，必须给出合法的 QP 范围；缺省 0..0 会让算出的 QP 越界，
-        // 表现为 INVALID_VIDEO_STD_PARAMETERS。H.264 的 QP 范围是 0..51（标准固定值）
+        // CBR 下驱动要自己算 QP，缺省 0..0 会越界（INVALID_VIDEO_STD_PARAMETERS）；
+        // 地板取 `MIN_QP_H264`，再钳进驱动的 `minQp..maxQp`。
+        let (min_qp_value, max_qp_value) = self.qp_range(MIN_QP_H264);
         let min_qp = vk::VideoEncodeH264QpKHR::default()
-            .qp_i(MIN_QP_H264)
-            .qp_p(MIN_QP_H264)
-            .qp_b(MIN_QP_H264);
+            .qp_i(min_qp_value)
+            .qp_p(min_qp_value)
+            .qp_b(min_qp_value);
         let max_qp = vk::VideoEncodeH264QpKHR::default()
-            .qp_i(51)
-            .qp_p(51)
-            .qp_b(51);
+            .qp_i(max_qp_value)
+            .qp_p(max_qp_value)
+            .qp_b(max_qp_value);
         let mut h264_layer = vk::VideoEncodeH264RateControlLayerInfoKHR::default()
             .use_min_qp(true)
             .min_qp(min_qp)
@@ -540,16 +580,23 @@ impl FrameEncoder {
         // 它与 `VkVideoEncodeRateControlInfoKHR` 是**兄弟**，两者都直接挂在 begin 上
         // （ash 的 `Extends` 只允许这样挂，见 `CodecRateControl` 的说明）。
         let h264_rate_control = vk::VideoEncodeH264RateControlInfoKHR::default()
+            .flags(
+                vk::VideoEncodeH264RateControlFlagsKHR::REGULAR_GOP
+                    | vk::VideoEncodeH264RateControlFlagsKHR::REFERENCE_PATTERN_FLAT,
+            )
             .gop_frame_count(self.gop_length)
             .idr_period(self.gop_length)
             .consecutive_b_frame_count(0)
             .temporal_layer_count(1);
         let scope = begin_scope(if is_idr { None } else { Some(&ref_slots[0]) }, &setup_slot);
+        // 驱动要求/偏好时，把本帧在 GOP 内的剩余 I/P 帧数一并交给码控
+        let gop_remaining = self.gop_remaining(VideoCodec::H264, frame_num, is_idr);
         let bytes_written = self.submit_encode(
             &encode_info,
             &scope,
             &layers,
             Some(CodecRateControl::H264(h264_rate_control)),
+            gop_remaining,
         )?;
         self.finish_frame(bytes_written, is_idr)
     }
@@ -639,10 +686,13 @@ mod tests {
             width: 1920,
             height: 1080,
         };
-        let s = sps(coded, display, 42, 12, &vui);
+        let s = sps(coded, display, 12, 12, &vui);
 
         assert_eq!(s.profile_idc, H264_PROFILE_HIGH);
-        assert_eq!(s.level_idc, 42);
+        assert_eq!(
+            s.level_idc, 12,
+            "SPS 的 level 是枚举：4.2 = 12，不是语法值 42"
+        );
         assert_eq!(s.chroma_format_idc, H264_CHROMA_420);
         assert_eq!(s.max_num_ref_frames, MAX_NUM_REF_FRAMES);
         assert_eq!(s.flags.frame_cropping_flag(), 1);
@@ -657,6 +707,15 @@ mod tests {
             s.pSequenceParameterSetVui, &vui as *const StdVideoH264SequenceParameterSetVui,
             "VUI 指针必须指向调用方持有的那一份"
         );
+    }
+
+    /// level_idc 的语法值 → 枚举映射；4.2 是 12，越界值必须拒绝
+    #[test]
+    fn test_level_to_vk() {
+        assert_eq!(level_to_vk(42), Ok(12));
+        assert_eq!(level_to_vk(52), Ok(15));
+        assert_eq!(level_to_vk(62), Ok(18));
+        assert!(level_to_vk(43).is_err(), "不存在的语法值必须拒绝");
     }
 
     /// VUI：BT.709 + Limited Range——缺了它解码器按 BT.601 猜，整片偏色
@@ -713,14 +772,16 @@ mod tests {
         };
         // 与生产路径同源：按内容推导 level，而不是驱动声明的最高 level
         let level = u32::from(crate::encode::h264_level_idc(1920, 1080, 60, 8_000));
+        let level_vk = level_to_vk(level).expect("推导出的 level 必须能映射到枚举");
         match VideoSessionParameters::new_h264(&device, &session, &caps, level, 4) {
             Ok(params) => {
                 let sets = params.parameter_sets();
                 println!(
-                    "H.264 会话参数对象创建成功: SPS/PPS @ {}x{} / level_idc {}（推导，驱动上限 {}）/ frame_num 位宽 4 / 参数集 {} 字节 / 句柄 {:?}",
+                    "H.264 会话参数对象创建成功: SPS/PPS @ {}x{} / level 语法值 {} → 枚举 {}（驱动上限 {}）/ frame_num 位宽 4 / 参数集 {} 字节 / 句柄 {:?}",
                     session.coded_extent().width,
                     session.coded_extent().height,
                     level,
+                    level_vk,
                     caps.max_level_idc,
                     sets.len(),
                     params.params()
@@ -758,6 +819,17 @@ mod tests {
                     h264_feedback.has_std_pps_overrides != 0,
                     bytes.len()
                 );
+                if h264_feedback.has_std_sps_overrides == 0 {
+                    let sps_level = bytes
+                        .windows(5)
+                        .position(|w| w == [0, 0, 0, 1, 0x67])
+                        .map(|i| bytes[i + 7]);
+                    assert_eq!(
+                        sps_level,
+                        Some(0x2A),
+                        "SPS 第 4 个字节是 level_idc，4.2 应写成 0x2A（不是 0x5F）"
+                    );
+                }
             }
             Err(e) => println!("会话参数对象创建失败: {e}"),
         }
@@ -793,7 +865,10 @@ mod tests {
             }
         };
         // 分阶段打印：SIGSEGV 时靠最后一条标记定位崩在哪一步
-        println!("编码器就绪, 开始造帧");
+        println!(
+            "编码器就绪, 开始造帧 (HAS_OVERRIDES={})",
+            encoder.feedback_has_overrides
+        );
 
         let extent = encoder.extent();
         let pixels = extent.width as usize * extent.height as usize;
@@ -886,6 +961,59 @@ mod tests {
             low_total < high_total,
             "降码率后同样 8 帧的总字节数应下降（8Mbps {high_total} vs 2Mbps {low_total}）"
         );
+    }
+
+    /// GOP 剩余帧数：即使驱动没有声明 requires/prefers，begin 带上该结构也必须被接受
+    ///
+    /// 本机 caps 两项都是 false，正常路径不会挂这个结构。这里手动把 prefers 置真，
+    /// 覆盖 `record_and_submit` 的 pNext 链与 I/P 计数字段。
+    #[test]
+    #[ignore = "requires GPU"]
+    fn test_vulkan_video_h264_gop_remaining_frames() {
+        let Ok(ctx) = VulkanInstance::new("Vistrel-S1e") else {
+            println!("Vulkan 不可用，跳过");
+            return;
+        };
+        let mut caps = match caps::probe_codec(&ctx, VideoCodec::H264) {
+            Ok(caps) => caps,
+            Err(e) => {
+                println!("H.264 能力探测失败，跳过: {e}");
+                return;
+            }
+        };
+        caps.prefers_gop_remaining_frames = true;
+        let device = match VideoDevice::new(&ctx, VideoCodec::H264) {
+            Ok(device) => device,
+            Err(e) => {
+                println!("设备创建失败，跳过: {e}");
+                return;
+            }
+        };
+        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), caps.codec, 15) {
+            Ok(encoder) => encoder,
+            Err(e) => {
+                println!("编码器初始化失败: {e}");
+                return;
+            }
+        };
+        let extent = encoder.extent();
+        let (_, key) = match encoder.encode_idr(&make_noisy_frame(extent, 1)) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("IDR 编码失败（GOP 剩余帧数结构可能不合法）: {e}");
+                return;
+            }
+        };
+        assert!(key, "首帧必须是关键帧");
+        // 同一 GOP 内的 P 帧，剩余 P 帧数逐帧递减
+        for n in 0..3 {
+            match encoder.encode_frame(&make_noisy_frame(extent, 10 + n), false) {
+                Ok((_, false)) => {}
+                Ok((_, true)) => panic!("第 {n} 个 P 帧不应是关键帧"),
+                Err(e) => panic!("第 {n} 个 P 帧编码失败: {e}"),
+            }
+        }
+        println!("GOP 剩余帧数结构已被驱动接受: IDR + 3 P 帧");
     }
 
     /// Intra-Refresh：长 GOP + 渐进刷新，不产出周期性 IDR

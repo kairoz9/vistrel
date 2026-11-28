@@ -15,7 +15,7 @@
 
 use ash::vk::{self, TaggedStructure};
 
-use super::{CodecRateControl, FrameEncoder, PendingUpload, Scope};
+use super::{CodecGopRemaining, CodecRateControl, FrameEncoder, PendingUpload, Scope};
 use crate::encode::VideoCodec;
 
 /// CBR 虚拟缓冲长度（毫秒）
@@ -23,16 +23,49 @@ const VBV_MS: u32 = 500;
 
 /// `VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR` 的结果布局
 ///
-/// 规范：请求的反馈值在前，带 `VK_QUERY_RESULT_WITH_STATUS_BIT_KHR` 时
-/// `VkQueryResultStatusKHR` 追加在后。两者都是 32 位，`repr(C)` 保证没有 padding，
-/// 因此 stride 就等于结构体大小。
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
+/// 反馈值按 `encodeFeedbackFlags` 的位序排列，`VkQueryResultStatusKHR` 追加在最后：
+/// 只开 `BYTES_WRITTEN` 时是 `[bytes_written, status]`；再开 `HAS_OVERRIDES` 时是
+/// `[bytes_written, has_overrides, status]`。
+#[derive(Clone, Copy)]
 struct EncodeFeedback {
-    /// `VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BYTES_WRITTEN_BIT_KHR` 的结果
-    bytes_written: u32,
-    /// `VkQueryResultStatusKHR`
-    status: u32,
+    /// 至多两个反馈值 + 一个状态
+    values: [u32; 3],
+    /// 查询是否包含 `HAS_OVERRIDES`；决定状态落在 `values[1]` 还是 `values[2]`
+    has_overrides: bool,
+}
+
+impl EncodeFeedback {
+    fn new(has_overrides: bool) -> Self {
+        Self {
+            values: [0; 3],
+            has_overrides,
+        }
+    }
+
+    /// `dataSize` / `stride`：反馈值个数 + 状态
+    fn size(&self) -> usize {
+        (1 + usize::from(self.has_overrides) + 1) * std::mem::size_of::<u32>()
+    }
+
+    fn bytes_written(&self) -> u64 {
+        u64::from(self.values[0])
+    }
+
+    fn overrides(&self) -> u32 {
+        if self.has_overrides {
+            self.values[1]
+        } else {
+            0
+        }
+    }
+
+    fn status(&self) -> u32 {
+        if self.has_overrides {
+            self.values[2]
+        } else {
+            self.values[1]
+        }
+    }
 }
 
 /// `VK_QUERY_RESULT_STATUS_COMPLETE_KHR`
@@ -161,14 +194,15 @@ impl FrameEncoder {
     /// 录制并提交一次编码，返回驱动写入的码流字节数
     ///
     /// 与 codec 无关的部分全在这里：begin/end coding、feedback query、提交等待、回读。
-    /// `rate_control` 由各 codec 构造（码控结构体是 codec 专属的），会被挂进
-    /// `vkCmdBeginVideoCodingKHR` 的 pNext —— 见 [`Self::record_and_submit`] 里的说明。
+    /// `codec_rate_control` 与 `gop_remaining` 都由各 codec 构造（结构体是 codec 专属的），
+    /// 会被挂进 `vkCmdBeginVideoCodingKHR` 的 pNext —— 见 [`Self::record_and_submit`] 里的说明。
     pub(super) fn submit_encode(
         &mut self,
         encode_info: &vk::VideoEncodeInfoKHR<'_>,
         scope: &Scope<'_>,
         layers: &[vk::VideoEncodeRateControlLayerInfoKHR<'_>],
         codec_rate_control: Option<CodecRateControl<'_>>,
+        gop_remaining: Option<CodecGopRemaining<'_>>,
     ) -> Result<u64, String> {
         // 永久毒化短路：等待超时过的编码器带着可能在途的命令缓冲，任何后续录制
         // 都必须先 reset 命令缓冲——对在途命令缓冲 reset 是规范违规
@@ -178,7 +212,13 @@ impl FrameEncoder {
 
         // 录制 + 提交 + 等待。两类失败的善后完全不同：提交未落地才能回滚布局；
         // 在途超时绝不能回滚，并就此毒化编码器
-        match self.record_and_submit(encode_info, scope, layers, codec_rate_control) {
+        match self.record_and_submit(
+            encode_info,
+            scope,
+            layers,
+            codec_rate_control,
+            gop_remaining,
+        ) {
             Ok(()) => {}
             Err(SubmitFailure::NotSubmitted(e)) => {
                 self.pending_upload = None;
@@ -205,14 +245,13 @@ impl FrameEncoder {
         #[cfg(test)]
         self.read_gpu_timings()?;
 
-        // 读 feedback。布局是「先结果、后状态」：请求的反馈值在前，带
-        // VK_QUERY_RESULT_WITH_STATUS_BIT_KHR 时 VkQueryResultStatusKHR 追加在结果之后。
-        let mut feedback = EncodeFeedback::default();
-        let size = std::mem::size_of::<EncodeFeedback>();
+        // 读 feedback：布局见 `EncodeFeedback`
+        let mut feedback = EncodeFeedback::new(self.feedback_has_overrides);
+        let size = feedback.size();
         // 走 `fp_v1_0()` 的原始指针而不是封装：这条命令要带 `WITH_STATUS_KHR` 与显式
         // stride，封装版只收一个 `&mut [T]`，表达不了这两个参数。
         let fp = self.device.device().fp_v1_0();
-        // SAFETY: feedback 是 `#[repr(C)]` 的两个 u32，大小等于 data_size 与 stride；
+        // SAFETY: feedback.values 是栈上 3 个 u32，容量覆盖「两个反馈值 + 状态」；
         // device 句柄由本结构持有且存活
         let res = unsafe {
             (fp.get_query_pool_results)(
@@ -221,7 +260,7 @@ impl FrameEncoder {
                 0,
                 1,
                 size,
-                (&mut feedback as *mut EncodeFeedback).cast(),
+                feedback.values.as_mut_ptr().cast(),
                 size as u64,
                 vk::QueryResultFlags::WAIT | vk::QueryResultFlags::WITH_STATUS_KHR,
             )
@@ -229,11 +268,13 @@ impl FrameEncoder {
         if res != vk::Result::SUCCESS {
             return Err(format!("读取 feedback 查询失败: {res:?}"));
         }
-        let bytes_written = u64::from(feedback.bytes_written);
-        if feedback.status != QUERY_STATUS_COMPLETE {
+        let bytes_written = feedback.bytes_written();
+        let has_overrides = feedback.overrides();
+        let status = feedback.status();
+        if status != QUERY_STATUS_COMPLETE {
             return Err(format!(
                 "编码查询状态非完成: {}（已写 {bytes_written} 字节）",
-                feedback.status
+                status
             ));
         }
         if bytes_written == 0 || bytes_written > self.bitstream.size() {
@@ -241,6 +282,14 @@ impl FrameEncoder {
                 "反馈的码流长度异常: {bytes_written}（缓冲 {}）",
                 self.bitstream.size()
             ));
+        }
+        // 只报一次：逐帧刷同一条日志没有信息量，且会淹没真正的一次性告警
+        if has_overrides != 0 && !self.overrides_seen {
+            self.overrides_seen = true;
+            log::debug!(
+                "{:?} 编码器报告逐帧参数被驱动覆写，应用侧 std 字段与码流可能不一致",
+                self.codec
+            );
         }
         Ok(bytes_written)
     }
@@ -336,6 +385,7 @@ impl FrameEncoder {
         scope: &Scope<'_>,
         layers: &[vk::VideoEncodeRateControlLayerInfoKHR<'_>],
         codec_rate_control: Option<CodecRateControl<'_>>,
+        gop_remaining: Option<CodecGopRemaining<'_>>,
     ) -> Result<(), SubmitFailure> {
         // **begin 作用域必须声明本帧用到的全部槽位，含当前帧的输出槽**——排布规则与
         // 07239 / 08215 两条 VU 的推导见 `begin_scope`：只在 encode 作用域里给槽位会
@@ -393,6 +443,16 @@ impl FrameEncoder {
                 };
             }
         }
+        // `requiresGopRemainingFrames` 时每次 begin 都必须带（VUID 08256 / 10282），
+        // 与码控是否重发无关。按值存进局部，begin 只持有它的地址。
+        let mut gop_for_begin = gop_remaining;
+        if let Some(ref mut gop) = gop_for_begin {
+            begin_info = match gop {
+                CodecGopRemaining::H264(x) => begin_info.push(x),
+                CodecGopRemaining::H265(x) => begin_info.push(x),
+                CodecGopRemaining::Av1(x) => begin_info.push(x),
+            };
+        }
         let end_info = vk::VideoEndCodingInfoKHR::default();
         // 唯一的等待来源：计算队列上的 CSC 产物。主机 NV12 路径没有
         let csc_wait = self.csc.as_ref().ok().and_then(|c| c.pending_semaphore());
@@ -409,8 +469,8 @@ impl FrameEncoder {
         let device = self.device.device();
         // SAFETY: 命令缓冲来自本结构独占的命令池，上一次提交已完成（时间线已等到；
         // 等待超时的帧会毒化编码器，毒化后在 `submit_encode` 顶部短路，绝不会带着
-        // 在途命令缓冲走到这里）；encode_info 及其 pNext 链、begin_info 的码控子链
-        // 由调用方持有，在录制期间均存活
+        // 在途命令缓冲走到这里）；encode_info 及其 pNext 链、begin_info 的 pNext 链
+        // （码控 / GOP 剩余帧数）由调用方与本函数局部持有，在录制期间均存活
         unsafe {
             device
                 .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())

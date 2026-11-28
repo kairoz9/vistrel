@@ -170,9 +170,18 @@ pub struct FrameEncoder {
     ///
     /// intra-refresh 打开时取大值，靠渐进刷新代替周期性 IDR。
     gop_length: u32,
-    /// AV1 码控的量化索引上下限（来自 `CodecCaps`）；H.26x 用标准固定的 QP 范围，不读这里
+    /// AV1 码控的量化索引上下限（来自 `CodecCaps`）；H.26x 用 `min_qp` / `max_qp`
     min_q_index: u32,
     max_q_index: u32,
+    /// H.264/H.265 的 QP 范围（来自 `CodecCaps`）；AV1 不读
+    min_qp: i32,
+    max_qp: i32,
+    /// 驱动要求/偏好 begin 时给出 GOP 剩余帧数（`requires || prefers`）
+    gop_remaining_frames: bool,
+    /// 反馈查询是否包含 `HAS_OVERRIDES`（驱动支持时）
+    feedback_has_overrides: bool,
+    /// 是否已经报告过逐帧覆写，避免每帧刷日志
+    overrides_seen: bool,
     /// 驱动声明的最大 intra-refresh 周期；0 表示不支持
     max_intra_refresh_cycle: u32,
     /// 已启用的 intra-refresh 周期；`None` 表示关闭
@@ -313,6 +322,45 @@ enum CodecRateControl<'a> {
     Av1(vk::VideoEncodeAV1RateControlInfoKHR<'a>),
 }
 
+/// begin 时告诉码控「当前 GOP 还剩多少 I/P/B 帧」
+///
+/// `requiresGopRemainingFrames` 时必须在 begin 的 pNext 里带上（VUID 08256 / 10282），
+/// `prefersGopRemainingFrames` 时能让 CBR 分配更准。三个结构都是
+/// `VideoBeginCodingInfoKHR` 的直接扩展，与码控结构是兄弟。
+///
+/// 按值保存：三处 begin 各拷一份，避开同一结构被同时可变借用。
+#[derive(Clone, Copy)]
+enum CodecGopRemaining<'a> {
+    H264(vk::VideoEncodeH264GopRemainingFrameInfoKHR<'a>),
+    H265(vk::VideoEncodeH265GopRemainingFrameInfoKHR<'a>),
+    Av1(vk::VideoEncodeAV1GopRemainingFrameInfoKHR<'a>),
+}
+
+/// 本帧在 GOP 内的剩余帧数（含当前帧，IDR 为 0）
+///
+/// `gopRemainingI/P/B` 表示「执行本次编码前码控应假设 GOP 还剩多少帧」。本实现
+/// 是 IPPP：IDR 占 I，其余全是 P，B 恒 0；`frame_num` 在 IDR 上为 0，其余落在
+/// 1..=gop_length-1。
+fn gop_remaining_counts(gop_length: u32, frame_num: u32, is_key: bool) -> (u32, u32) {
+    let remaining_i = u32::from(is_key);
+    let remaining_p = gop_length
+        .saturating_sub(frame_num)
+        .saturating_sub(u32::from(is_key));
+    (remaining_i, remaining_p)
+}
+
+/// 把推导出的 level 换算成与 `max_level_idc` 相同的枚举域
+///
+/// H.264/H.265 的 std 字段是枚举，AV1 的 `maxLevel` 与 `seq_level_idx` 同域；
+/// 三个映射在这里收口，`FrameEncoder::new` 不必按 codec 分支。
+fn level_enum(codec: VideoCodec, level: u32) -> Result<u32, String> {
+    match codec {
+        VideoCodec::H264 => h264::level_to_vk(level),
+        VideoCodec::H265 => hevc::level_enum(level),
+        VideoCodec::Av1 => Ok(level),
+    }
+}
+
 impl FrameEncoder {
     /// 帧编码器构造：校验档位与能力快照一致（codec 错位即报错）、请求码率钳进驱动
     /// 声明上限（钳制写回档位，0 视为无上限）、建视频会话与参数对象（level 与
@@ -366,6 +414,22 @@ impl FrameEncoder {
             profile.fps(),
             (bitrate_bps / 1000) as u32,
         );
+        // 推导 level 不能超过驱动上限：低端编码器可能只到 4.1，而 1080p60 + 8 Mbps
+        // 就是 4.2。超限时声明该 level 不合法，明确报错胜过静默降级，由上层换后端
+        // 或降档；SDP 的 level 仍按内容推导，不受这里影响。
+        let level_vk = level_enum(caps.codec, level)?;
+        if level_vk > caps.max_level_idc {
+            return Err(format!(
+                "{:?} 档位 {}x{}@{} 需要 level 枚举 {}（码流值 {}），超过驱动声明的上限 {}",
+                caps.codec,
+                profile.width(),
+                profile.height(),
+                profile.fps(),
+                level_vk,
+                level,
+                caps.max_level_idc
+            ));
+        }
         // SPS 的 frame_num 位宽必须装得下整个 GOP，否则参考链会错乱
         let params = match caps.codec {
             VideoCodec::H264 => VideoSessionParameters::new_h264(
@@ -401,7 +465,47 @@ impl FrameEncoder {
         let mut profile_part = ProfilePart::new(caps.codec);
         let mut video_profile = profile_part.attach(base_profile(caps.codec));
 
-        let image = Nv12Image::new_video(device, extent, &video_profile)?;
+        // 输入图 padding 由 `CodecCaps::input_pad` 决定；编码尺寸仍是 `extent`。
+        let pad = caps.input_pad(extent);
+        let image_extent = pad.extent;
+        if pad.dropped {
+            log::warn!(
+                "{:?} 输入 padding 超出图像上限 maxImageDimension2D={}，\
+                 超限轴退回 coded extent；实际分配 {}x{}",
+                caps.codec,
+                caps.max_image_dimension,
+                pad.extent.width,
+                pad.extent.height
+            );
+        } else if image_extent != extent {
+            log::debug!(
+                "{:?} 输入图按 encodeInputPictureGranularity 补齐: coded {}x{} → 分配 {}x{}",
+                caps.codec,
+                extent.width,
+                extent.height,
+                image_extent.width,
+                image_extent.height
+            );
+        }
+        // 设备级 `maxImageDimension2D` 不保证等于该格式的 `maxExtent`：padding 尺寸
+        // 建图失败时退回 coded extent，避免 advisory 字段把整个后端拒掉。
+        let image = match Nv12Image::new_video(device, extent, image_extent, &video_profile) {
+            Ok(image) => image,
+            Err(first) if image_extent != extent => {
+                log::warn!(
+                    "{:?} padding 尺寸 {}x{} 创建输入图失败（{first}），退回 coded extent {}x{}",
+                    caps.codec,
+                    image_extent.width,
+                    image_extent.height,
+                    extent.width,
+                    extent.height
+                );
+                Nv12Image::new_video(device, extent, extent, &video_profile).map_err(|second| {
+                    format!("输入图创建失败（padding 尺寸: {first}；coded 尺寸仍失败: {second}）")
+                })?
+            }
+            Err(e) => return Err(e),
+        };
         // CSC 是可选能力：不支持 storage image 的机器仍然能走 CPU 上传路径，
         // 因此这里不把构造失败当成整体失败，Err 原样保留
         let csc = ColorConverter::new(device, extent);
@@ -439,8 +543,17 @@ impl FrameEncoder {
         //
         // profile 必须与本次编码的 codec 一致：查询池是按视频 profile 创建的，声明成别的
         // codec 属于参数不符。这里复用上面那份 —— 它已经是本 codec 的 profile。
+        //
+        // `HAS_OVERRIDES` 是可选能力：支持时一并打开，逐帧判断驱动是否改写了帧头参数。
+        let feedback_has_overrides = caps
+            .feedback_flags
+            .contains(vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_HAS_OVERRIDES);
+        let mut feedback_flags = vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN;
+        if feedback_has_overrides {
+            feedback_flags |= vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_HAS_OVERRIDES;
+        }
         let mut feedback_create = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default()
-            .encode_feedback_flags(vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN);
+            .encode_feedback_flags(feedback_flags);
         // feedback_create 是叶子，直接 push；video_profile 已经挂了 h264_profile 子链，
         // push 会因 next.p_next 非空而 panic，必须用 extend 让 ash 找到子链尾节点再拼接。
         //
@@ -529,9 +642,15 @@ impl FrameEncoder {
             profile,
             max_bitrate: caps.max_bitrate,
             gop_length,
-            // AV1 的量化索引范围来自能力查询；H.26x 不读这两个字段
+            // AV1 的量化索引范围与 H.26x 的 QP 范围都来自能力查询
             min_q_index: caps.min_q_index,
             max_q_index: caps.max_q_index,
+            min_qp: caps.min_qp,
+            max_qp: caps.max_qp,
+            gop_remaining_frames: caps.requires_gop_remaining_frames
+                || caps.prefers_gop_remaining_frames,
+            feedback_has_overrides,
+            overrides_seen: false,
             // 准入条件必须两条同时成立：能力查询说支持（模式非空、周期 >= 2）**且**
             // 逻辑设备真的开启了该 feature 位。只看前者会在 feature 未链进 create_info
             // 的机器上下发非法参数
@@ -566,6 +685,56 @@ impl FrameEncoder {
 
     pub fn extent(&self) -> vk::Extent2D {
         self.image.extent()
+    }
+
+    /// 把配置的 QP 地板钳进驱动声明的 `min_qp..=max_qp`，上限再夹到 H.26x 的 51
+    ///
+    /// 返回的 `(min, max)` 保证 `min <= max`；写死范围在窄范围驱动上会违反
+    /// `useMinQp` / `useMaxQp` 的 VUID。
+    fn qp_range(&self, floor: i32) -> (i32, i32) {
+        let lo = self.min_qp.min(self.max_qp);
+        let hi = self.min_qp.max(self.max_qp);
+        let min = floor.clamp(lo, hi);
+        let max = 51.min(hi).max(min);
+        (min, max)
+    }
+
+    /// 本帧要挂进 begin 的 GOP 剩余帧数结构；驱动既不强求也不偏好时返回 `None`
+    ///
+    /// 三个 codec 结构语义相同、只有类型不同，构造集中在这里。
+    fn gop_remaining<'a>(
+        &self,
+        codec: VideoCodec,
+        frame_num: u32,
+        is_key: bool,
+    ) -> Option<CodecGopRemaining<'a>> {
+        if !self.gop_remaining_frames {
+            return None;
+        }
+        let (remaining_i, remaining_p) = gop_remaining_counts(self.gop_length, frame_num, is_key);
+        Some(match codec {
+            VideoCodec::H264 => CodecGopRemaining::H264(
+                vk::VideoEncodeH264GopRemainingFrameInfoKHR::default()
+                    .use_gop_remaining_frames(true)
+                    .gop_remaining_i(remaining_i)
+                    .gop_remaining_p(remaining_p)
+                    .gop_remaining_b(0),
+            ),
+            VideoCodec::H265 => CodecGopRemaining::H265(
+                vk::VideoEncodeH265GopRemainingFrameInfoKHR::default()
+                    .use_gop_remaining_frames(true)
+                    .gop_remaining_i(remaining_i)
+                    .gop_remaining_p(remaining_p)
+                    .gop_remaining_b(0),
+            ),
+            VideoCodec::Av1 => CodecGopRemaining::Av1(
+                vk::VideoEncodeAV1GopRemainingFrameInfoKHR::default()
+                    .use_gop_remaining_frames(true)
+                    .gop_remaining_intra(remaining_i)
+                    .gop_remaining_predictive(remaining_p)
+                    .gop_remaining_bipredictive(0),
+            ),
+        })
     }
 
     /// GPU 色彩转换是否可用
@@ -871,6 +1040,34 @@ pub(super) fn make_noisy_frame(extent: vk::Extent2D, seed: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 推导 level 必须换算到与 `max_level_idc` 相同的枚举域
+    #[test]
+    fn test_level_enum_domains() {
+        // H.264 语法值 42（4.2）在 std 里是枚举 12
+        assert_eq!(level_enum(VideoCodec::H264, 42), Ok(12));
+        // H.265 语法值 123（4.1 × 30）是枚举 6
+        assert_eq!(level_enum(VideoCodec::H265, 123), Ok(6));
+        // AV1 的 seq_level_idx 与 StdVideoAV1Level 同域
+        assert_eq!(level_enum(VideoCodec::Av1, 9), Ok(9));
+        assert!(
+            level_enum(VideoCodec::H264, 43).is_err(),
+            "非法语法值必须拒绝"
+        );
+    }
+
+    /// GOP 剩余帧数：含当前帧，IDR 占 I，其余全是 P，B 恒 0
+    #[test]
+    fn test_gop_remaining_counts() {
+        // 30 帧 GOP：IDR + 29 个 P
+        assert_eq!(gop_remaining_counts(30, 0, true), (1, 29));
+        assert_eq!(gop_remaining_counts(30, 1, false), (0, 29));
+        assert_eq!(gop_remaining_counts(30, 2, false), (0, 28));
+        assert_eq!(gop_remaining_counts(30, 29, false), (0, 1));
+        // 最短 GOP：IDR + 1 个 P
+        assert_eq!(gop_remaining_counts(2, 0, true), (1, 1));
+        assert_eq!(gop_remaining_counts(2, 1, false), (0, 1));
+    }
 
     /// `frame_num` 位宽换算：装得下 `gop_length + 1` 个不重复值
     ///

@@ -207,53 +207,73 @@ impl Drop for OwnedImage {
     }
 }
 
-/// NV12 编码输入图与其暂存缓冲
+/// NV12 编码输入图与其暂存缓冲；分配尺寸（`image_extent`）可以大于编码尺寸
 pub struct Nv12Image {
     device: VideoDevice,
     /// 设备本地 NV12 图与它的视图
     image: OwnedImage,
     /// 主机可见暂存缓冲：上传与读回共用，构造时映射一次
     staging: HostBuffer,
+    /// 编码尺寸：上传/读回与 `VkVideoPictureResourceInfoKHR::codedExtent` 的唯一依据
+    coded_extent: vk::Extent2D,
     /// 布局状态：首次上传前 `UNDEFINED`，之后已确认值固定为 `VIDEO_ENCODE_SRC_KHR`
     layout: TrackedLayout,
 }
 
 impl Nv12Image {
-    /// 测试构造：不带视频 profile 的编码输入图
+    /// 测试构造：不带视频 profile 的编码输入图，分配尺寸等于编码尺寸
     ///
     /// usage 里保留 `TRANSFER_SRC` 供自校验读回；生产路径必须走
     /// [`Self::new_video`] 声明 profile，否则驱动不把图当编码资源
     #[cfg(test)]
     pub fn new(device: &VideoDevice, extent: vk::Extent2D) -> Result<Self, String> {
-        Self::new_inner(device, extent, None)
+        Self::new_inner(device, extent, extent, None)
     }
 
     /// 视频编码用的输入图：创建时必须声明所属 profile
     ///
     /// 否则驱动不把它当视频资源（`VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08206`）。
-    /// `profile` 只存指针链，必须活过本次 create 调用。
+    /// `image_extent` 必须逐轴不小于 `coded_extent`；`profile` 只存指针链，必须活过
+    /// 本次 create 调用。
     pub fn new_video(
         device: &VideoDevice,
-        extent: vk::Extent2D,
+        coded_extent: vk::Extent2D,
+        image_extent: vk::Extent2D,
         profile: &vk::VideoProfileInfoKHR<'_>,
     ) -> Result<Self, String> {
-        Self::new_inner(device, extent, Some(profile))
+        Self::new_inner(device, coded_extent, image_extent, Some(profile))
     }
 
     fn new_inner(
         device: &VideoDevice,
-        extent: vk::Extent2D,
+        coded_extent: vk::Extent2D,
+        image_extent: vk::Extent2D,
         video_profile: Option<&vk::VideoProfileInfoKHR<'_>>,
     ) -> Result<Self, String> {
-        if extent.width == 0 || extent.height == 0 {
-            return Err("编码输入图几何不能为零".to_string());
+        // NV12 的两平面布局按 width*height*3/2 与 w/2、h/2 计算，宽高必须为偶数；
+        // 分配尺寸也必须满足，否则平面拷贝的区域会与图像子资源的取样方式错位。
+        let even = |v: u32| v.is_multiple_of(2);
+        if coded_extent.width == 0
+            || coded_extent.height == 0
+            || !even(coded_extent.width)
+            || !even(coded_extent.height)
+            || !even(image_extent.width)
+            || !even(image_extent.height)
+            || image_extent.width < coded_extent.width
+            || image_extent.height < coded_extent.height
+        {
+            return Err(format!(
+                "编码输入图几何非法: 编码 {}x{} / 分配 {}x{}（NV12 宽高必须为偶数）",
+                coded_extent.width, coded_extent.height, image_extent.width, image_extent.height
+            ));
         }
-        let size = frame_bytes(extent) as u64;
+        // 主机暂存缓冲只承载编码尺寸：padding 区不参与上传与读回
+        let size = frame_bytes(coded_extent) as u64;
 
         // 1. 设备本地图像：编码输入 + 传输源/目标（传输目标是为了上传，传输源是为了自校验）
         let mut spec = ImageSpec::new(
             vk::Format::G8_B8R8_2PLANE_420_UNORM,
-            extent,
+            image_extent,
             vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR
                 | vk::ImageUsageFlags::TRANSFER_DST
                 | vk::ImageUsageFlags::TRANSFER_SRC,
@@ -278,6 +298,7 @@ impl Nv12Image {
             device: device.clone(),
             image,
             staging,
+            coded_extent,
             layout: TrackedLayout::new(),
         })
     }
@@ -310,7 +331,7 @@ impl Nv12Image {
     /// 主机写暂存缓冲与上一帧的 GPU 读不能重叠。这一点由 `FrameEncoder` 保证——
     /// 它每帧提交后都等到栅栏，调用 `stage` 时上一帧的拷贝早已完成。
     pub fn stage(&mut self, nv12: &[u8]) -> Result<(), String> {
-        let extent = self.image.extent();
+        let extent = self.coded_extent;
         let expected = frame_bytes(extent);
         if nv12.len() < expected {
             return Err(format!(
@@ -336,7 +357,7 @@ impl Nv12Image {
     /// 函数体内逐语句的 SAFETY 论证依赖上述前置条件。
     // SAFETY: `cmd` 必须处于录制状态，且属于视频编码队列族（本图是 `EXCLUSIVE` 共享）。
     pub(super) unsafe fn record_upload(&mut self, cmd: vk::CommandBuffer) {
-        let regions = plane_copy_regions(self.image.extent());
+        let regions = plane_copy_regions(self.coded_extent);
 
         // SAFETY: cmd 由调用方保证可录制；regions 在调用期间存活
         unsafe {
@@ -370,9 +391,9 @@ impl Nv12Image {
         self.layout.record(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR);
     }
 
-    /// 建图时的 extent
+    /// 编码尺寸（不是分配尺寸）；上传、读回与 `codedExtent` 都用它
     pub fn extent(&self) -> vk::Extent2D {
-        self.image.extent()
+        self.coded_extent
     }
 
     /// 录制「两张平面图 → NV12 两个平面」的拷贝与布局转换
@@ -398,7 +419,7 @@ impl Nv12Image {
         y: vk::Image,
         uv: vk::Image,
     ) {
-        let extent = self.image.extent();
+        let extent = self.coded_extent;
         let plane_layers = |aspect: vk::ImageAspectFlags| vk::ImageSubresourceLayers {
             aspect_mask: aspect,
             mip_level: 0,
@@ -472,7 +493,7 @@ impl Nv12Image {
     // SAFETY: `cmd` 必须处于录制状态，且属于视频编码队列族。
     #[cfg(test)]
     unsafe fn record_readback(&mut self, cmd: vk::CommandBuffer) {
-        let regions = plane_copy_regions(self.image.extent());
+        let regions = plane_copy_regions(self.coded_extent);
 
         // SAFETY: cmd 由调用方保证可录制；regions 在调用期间存活
         unsafe {
@@ -518,7 +539,7 @@ impl Nv12Image {
     /// 比对会「一致」——测试永远绿。读回前先污染，没被真正拷贝的平面就会暴露。
     #[cfg(test)]
     fn poison_staging(&mut self) -> Result<(), String> {
-        self.staging.fill(0xFF, frame_bytes(self.image.extent()))
+        self.staging.fill(0xFF, frame_bytes(self.coded_extent))
     }
 
     /// 测试专用：把暂存缓冲前 `size` 字节读出来
@@ -527,7 +548,7 @@ impl Nv12Image {
     #[cfg(test)]
     fn staging_bytes(&self) -> Result<Vec<u8>, String> {
         // 调用方保证前 size 字节已由拷贝命令写入并等到了提交完成
-        self.staging.read(frame_bytes(self.image.extent()))
+        self.staging.read(frame_bytes(self.coded_extent))
     }
 }
 
@@ -863,5 +884,75 @@ mod tests {
             );
             println!("NV12 原样上传一致: 编码 {}x{}", extent.width, extent.height);
         }
+    }
+
+    /// 图像分配尺寸大于编码尺寸时，上传/读回只覆盖 coded extent，padding 不参与
+    ///
+    /// 这条覆盖 `encodeInputPictureGranularity` 比 coded 对齐更粗的驱动：
+    /// 驱动可能读取 padding，但主机帧长度与码流分辨率必须仍按 coded extent。
+    #[test]
+    #[ignore = "requires GPU"]
+    fn test_vulkan_video_nv12_image_padding_is_not_part_of_frame() {
+        let Ok(ctx) = VulkanInstance::new("Vistrel-S1c-pad2") else {
+            println!("Vulkan 不可用，跳过");
+            return;
+        };
+        let device = match VideoDevice::new(&ctx, VideoCodec::H264) {
+            Ok(device) => device,
+            Err(e) => {
+                println!("设备创建失败，跳过: {e}");
+                return;
+            }
+        };
+        // 1366x768 不是 64 的倍数：分配尺寸补到 1408x768，编码尺寸保持 1366x768
+        let coded = vk::Extent2D {
+            width: 1366,
+            height: 768,
+        };
+        let image_extent = vk::Extent2D {
+            width: 1408,
+            height: 768,
+        };
+        let mut image = match Nv12Image::new_inner(&device, coded, image_extent, None) {
+            Ok(image) => image,
+            Err(e) => {
+                println!("输入图创建失败: {e}");
+                return;
+            }
+        };
+        assert_eq!(image.extent(), coded, "对外只暴露编码尺寸");
+
+        let mut src = vec![0u8; frame_bytes(coded)];
+        for (i, byte) in src.iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+        if let Err(e) = image.upload_blocking(&src) {
+            println!("上传失败: {e}");
+            return;
+        }
+        if let Err(e) = image.poison_staging() {
+            println!("暂存缓冲污染失败: {e}");
+            return;
+        }
+        let back = match image.readback_blocking() {
+            Ok(back) => back,
+            Err(e) => {
+                println!("读回失败: {e}");
+                return;
+            }
+        };
+        assert_eq!(
+            back.len(),
+            frame_bytes(coded),
+            "读回长度必须按编码尺寸，而不是分配尺寸"
+        );
+        assert_eq!(
+            back, src,
+            "padding 不得进入读回区域，coded 区域必须逐字节一致"
+        );
+        println!(
+            "padding 不影响帧数据: 编码 {}x{} / 分配 {}x{}",
+            coded.width, coded.height, image_extent.width, image_extent.height
+        );
     }
 }
