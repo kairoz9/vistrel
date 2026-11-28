@@ -126,6 +126,29 @@ enum PendingUpload {
     Planes { y: vk::Image, uv: vk::Image },
 }
 
+/// 码控的量化范围：H.26x 用 QP，AV1 用量化索引，两者数值域不同
+#[derive(Debug, Clone, Copy)]
+enum QuantCaps {
+    Qp { min: i32, max: i32 },
+    QIndex { min: u32, max: u32 },
+}
+
+impl QuantCaps {
+    /// 从能力快照取出当前 codec 的量化范围
+    fn from_caps(caps: &CodecCaps) -> Self {
+        match &caps.specific {
+            CodecSpecific::H264(specific) | CodecSpecific::H265(specific) => Self::Qp {
+                min: specific.min_qp,
+                max: specific.max_qp,
+            },
+            CodecSpecific::Av1(specific) => Self::QIndex {
+                min: specific.min_q_index,
+                max: specific.max_q_index,
+            },
+        }
+    }
+}
+
 /// 一帧编码所需的全部常驻资源
 pub struct FrameEncoder {
     device: VideoDevice,
@@ -170,12 +193,8 @@ pub struct FrameEncoder {
     ///
     /// intra-refresh 打开时取大值，靠渐进刷新代替周期性 IDR。
     gop_length: u32,
-    /// AV1 码控的量化索引上下限（来自能力快照）；H.26x 用 `min_qp` / `max_qp`
-    min_q_index: u32,
-    max_q_index: u32,
-    /// H.264/H.265 的 QP 范围（来自能力快照）；AV1 不读
-    min_qp: i32,
-    max_qp: i32,
+    /// AV1 码控的量化索引范围 / H.26x 的 QP 范围（来自能力快照）
+    quant: QuantCaps,
     /// 驱动要求/偏好 begin 时给出 GOP 剩余帧数（`requires || prefers`）
     gop_remaining_frames: bool,
     /// 反馈查询是否包含 `HAS_OVERRIDES`（驱动支持时）
@@ -619,14 +638,6 @@ impl FrameEncoder {
         );
         let res = res.finish();
 
-        // AV1 的量化索引范围与 H.26x 的 QP 范围都来自能力快照；互斥字段按变体取
-        let (min_q_index, max_q_index, min_qp, max_qp) = match &caps.specific {
-            CodecSpecific::H264(specific) | CodecSpecific::H265(specific) => {
-                (0, 0, specific.min_qp, specific.max_qp)
-            }
-            CodecSpecific::Av1(specific) => (specific.min_q_index, specific.max_q_index, 0, 0),
-        };
-
         Ok(Self {
             device: device.clone(),
             codec,
@@ -647,11 +658,7 @@ impl FrameEncoder {
             profile,
             max_bitrate: caps.max_bitrate,
             gop_length,
-            // AV1 的量化索引范围与 H.26x 的 QP 范围都来自能力查询
-            min_q_index,
-            max_q_index,
-            min_qp,
-            max_qp,
+            quant: QuantCaps::from_caps(caps),
             gop_remaining_frames: caps.requires_gop_remaining_frames
                 || caps.prefers_gop_remaining_frames,
             feedback_has_overrides,
@@ -694,13 +701,25 @@ impl FrameEncoder {
 
     /// 把配置的 QP 地板钳进驱动声明的 `min_qp..=max_qp`，上限再夹到 H.26x 的 51
     ///
+    /// 只由 H.264/H.265 路径调用：码控分派按 `self.codec` 走，AV1 不进这里。
     /// 返回的 `(min, max)` 保证 `min <= max`；写死范围在窄范围驱动上会违反
     /// `useMinQp` / `useMaxQp` 的 VUID。
     fn qp_range(&self, floor: i32) -> (i32, i32) {
-        let lo = self.min_qp.min(self.max_qp);
-        let hi = self.min_qp.max(self.max_qp);
+        let QuantCaps::Qp { min, max } = self.quant else {
+            unreachable!("AV1 的量化索引范围不适用 QP 门禁");
+        };
+        let lo = min.min(max);
+        let hi = min.max(max);
         let min = floor.clamp(lo, hi);
         let max = 51.min(hi).max(min);
+        (min, max)
+    }
+
+    /// AV1 码控的量化索引范围；只由 AV1 路径调用
+    fn q_index_range(&self) -> (u32, u32) {
+        let QuantCaps::QIndex { min, max } = self.quant else {
+            unreachable!("H.26x 的 QP 范围不适用 AV1 量化索引");
+        };
         (min, max)
     }
 
