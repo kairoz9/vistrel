@@ -99,8 +99,17 @@ pub struct CodecCaps {
     /// 该 codec 的编码队列族（按 codec 分别查询，不同 codec 可能落在不同族）
     pub queue_family: Option<u32>,
     pub max_coded_extent: vk::Extent2D,
-    /// 图片访问粒度：编码输入图的长宽必须对齐到它
+    /// 图像分配上限（`VkPhysicalDeviceLimits::maxImageDimension2D`），两轴相同
+    ///
+    /// `max_coded_extent` 只约束 picture resource 的 `codedExtent`，图像本身可以更大；
+    /// 0 表示未探测，`input_pad` 退回 `max_coded_extent`。
+    pub max_image_dimension: u32,
+    /// 图片访问粒度：图像布局的最小对齐
     pub picture_access_granularity: vk::Extent2D,
+    /// 编码器实际读取输入的粒度；规范明确不产生 VU，只用于 [`Self::input_pad`]
+    pub encode_input_picture_granularity: vk::Extent2D,
+    /// AV1 的 coded picture 对齐；H.26x 保持 0，由 [`Self::coded_granularity`] 忽略
+    pub coded_picture_alignment: vk::Extent2D,
     /// 码流缓冲的大小对齐，分配时按它向上取整（偏移固定为 0，不需要另一份偏移对齐）
     pub min_bitstream_size_alignment: u64,
     pub max_dpb_slots: u32,
@@ -108,15 +117,33 @@ pub struct CodecCaps {
     /// 驱动声明的码率上限；请求超出属于非法用法，`FrameEncoder` 按它钳制
     pub max_bitrate: u64,
     pub rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR,
-    /// 驱动支持的最高 level（枚举值，排障用；码流实际声明的 level 按档位推导，不读它）
+    /// 驱动支持的最高 level（枚举值）；码流 level 按档位推导，换算后不得高于它
     pub max_level_idc: u32,
-    /// AV1 码控的量化索引上下限（`minQIndex` / `maxQIndex`）
+    /// H.264/H.265 的 QP 范围；AV1 不适用
+    pub min_qp: i32,
+    pub max_qp: i32,
+    /// AV1 码控的量化索引上下限（`minQIndex` / `maxQIndex`）；H.26x 用 `min_qp` / `max_qp`
     ///
-    /// 只在 AV1 上被填写；H.26x 的 QP 范围是标准固定值（0..51），不走这两个字段。
-    /// CBR 下驱动自己算量化步长，若给的夹取范围与驱动声明不符，驱动会判参数非法。
+    /// CBR 下驱动自己算量化步长，夹取范围与驱动声明不符会被判参数非法。
     pub min_q_index: u32,
     pub max_q_index: u32,
     pub feedback_flags: vk::VideoEncodeFeedbackFlagsKHR,
+    /// H.264/H.265 P 帧 L0 参考上限；0 表示不能编 P 帧
+    pub max_p_picture_l0_references: u32,
+    /// 单帧最大 slice/segment 数（AV1 不适用，保持 0）
+    pub max_slice_count: u32,
+    /// 驱动是否要求 begin 时给出 GOP 剩余帧数
+    pub requires_gop_remaining_frames: bool,
+    /// 驱动是否偏好 begin 时给出 GOP 剩余帧数
+    pub prefers_gop_remaining_frames: bool,
+    /// AV1 单参考上限
+    pub max_single_reference_count: u32,
+    /// AV1 允许的单参考名掩码
+    pub single_reference_name_mask: u32,
+    /// AV1 operating point 上限
+    pub max_operating_points: u32,
+    /// AV1 超级块能力
+    pub superblock_sizes: vk::VideoEncodeAV1SuperblockSizeFlagsKHR,
     /// 会话创建必须原样回传的 std 头版本
     pub std_header_version: vk::ExtensionProperties,
     /// Intra-Refresh 模式（`Debug` 文本，排障用）
@@ -135,6 +162,15 @@ pub struct CodecCaps {
     pub raw: String,
 }
 
+/// 输入图 padding 的结果
+///
+/// `extent` 是实际分配尺寸；`dropped` 表示至少一个轴的 padding 因超过图像上限被放弃。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputPad {
+    pub extent: vk::Extent2D,
+    pub dropped: bool,
+}
+
 impl CodecCaps {
     fn read_video(&mut self, caps: &vk::VideoCapabilitiesKHR<'_>) {
         self.max_coded_extent = caps.max_coded_extent;
@@ -149,14 +185,15 @@ impl CodecCaps {
         self.max_bitrate = caps.max_bitrate;
         self.rate_control_modes = caps.rate_control_modes;
         self.feedback_flags = caps.supported_encode_feedback_flags;
+        self.encode_input_picture_granularity = caps.encode_input_picture_granularity;
     }
 
     /// 建会话前的准入校验：不满足就 fail-closed
     ///
-    /// 这些是「不同机器真的会不一样」的项，缺任何一项都会在别人的卡上变成运行时故障：
-    /// - 没有 CBR：Followed Bitrate 无处落地
-    /// - 没有 `BITSTREAM_BYTES_WRITTEN`：无法得知编码器写了多少字节
-    /// - DPB 槽位 < 2 或活动参考帧 < 1：只能全 IDR，等于没有帧间压缩
+    /// 校验 CBR、`BITSTREAM_BYTES_WRITTEN`、DPB/参考帧、H.26x 的 P 帧与 slice、
+    /// AV1 单参考与超级块——缺任何一项都会在别人的卡上变成运行时故障。
+    /// `requiresGopRemainingFrames`、`maxOperatingPoints=0` 不在这里拒绝：前者由
+    /// begin 的 pNext 结构满足，后者按 VUID 10280 以 count=0 表达。
     pub fn validate(&self) -> Result<(), String> {
         if self.queue_family.is_none() {
             return Err(format!("{:?} 没有可用的编码队列族", self.codec));
@@ -188,6 +225,37 @@ impl CodecCaps {
         if self.max_active_reference_pictures < 1 {
             return Err(format!("{:?} 最大活动参考帧为 0", self.codec));
         }
+        // 本实现只发 IPPP：P 帧必须有 L0 参考，单 slice 必须被驱动接受
+        if matches!(self.codec, VideoCodec::H264 | VideoCodec::H265) {
+            if self.max_p_picture_l0_references == 0 {
+                return Err(format!(
+                    "{:?} 驱动不支持 P 帧 L0 参考（maxPPictureL0ReferenceCount=0）",
+                    self.codec
+                ));
+            }
+            if self.max_slice_count == 0 {
+                return Err(format!("{:?} 驱动不支持任何 slice", self.codec));
+            }
+        }
+        // AV1：单参考名必须落在掩码里（VUID 10328/10329），超级块 64/128 至少有一个。
+        // `maxOperatingPoints == 0` 不是拒绝条件（VUID 10280），见 `new_av1`。
+        if matches!(self.codec, VideoCodec::Av1) {
+            if self.max_single_reference_count == 0 || self.single_reference_name_mask == 0 {
+                return Err(format!(
+                    "{:?} 驱动不支持单参考预测（maxSingleReferenceCount={}，掩码={:#x}）",
+                    self.codec, self.max_single_reference_count, self.single_reference_name_mask
+                ));
+            }
+            if !self.superblock_sizes.intersects(
+                vk::VideoEncodeAV1SuperblockSizeFlagsKHR::TYPE_64
+                    | vk::VideoEncodeAV1SuperblockSizeFlagsKHR::TYPE_128,
+            ) {
+                return Err(format!(
+                    "{:?} 驱动未声明任何超级块尺寸（64x64 / 128x128 均不可用）",
+                    self.codec
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -208,15 +276,42 @@ impl CodecCaps {
             && self.max_intra_refresh_active_reference_pictures != 0
     }
 
-    /// 把请求的几何对齐到该 codec 的图片访问粒度
+    /// coded extent 的硬对齐粒度
     ///
-    /// 粒度由驱动声明，**不是固定 16**：1080p 在 16 粒度下是 1920x1088，
-    /// 而 1440p 在 NVIDIA 的 64 粒度下是 2560x1472（1440 能整除 16 却整除不了 64）。
-    /// 不补齐的话编码会话创建会直接失败；对齐结果还必须与采集侧算的一致，
-    /// 见 `encode::hardware::coded_align`。
+    /// 取 `pictureAccessGranularity`（图像布局）与 AV1 `codedPictureAlignment`
+    /// （驱动据此改写码流分辨率）的逐轴最大值；不满足会导致会话创建失败或
+    /// 码流分辨率与声明不一致。
+    pub fn coded_granularity(&self) -> (u32, u32) {
+        (
+            self.picture_access_granularity
+                .width
+                .max(1)
+                .max(self.coded_picture_alignment.width),
+            self.picture_access_granularity
+                .height
+                .max(1)
+                .max(self.coded_picture_alignment.height),
+        )
+    }
+
+    /// 编码输入图的分配粒度：coded 粒度与 `encodeInputPictureGranularity` 取大
+    ///
+    /// 只用于 [`Self::input_pad`]，不改变 coded extent 的硬对齐。
+    pub fn input_granularity(&self) -> (u32, u32) {
+        let (cw, ch) = self.coded_granularity();
+        (
+            cw.max(self.encode_input_picture_granularity.width.max(1)),
+            ch.max(self.encode_input_picture_granularity.height.max(1)),
+        )
+    }
+
+    /// 把请求的几何按 [`Self::coded_granularity`] 对齐
+    ///
+    /// 粒度由驱动声明，**不是固定 16**：1080p 在 16 粒度下是 1920x1088，1440p 在
+    /// NVIDIA 的 64 粒度下是 2560x1472。不补齐会话创建直接失败；结果还必须与采集侧
+    /// 算的一致，见 `encode::hardware::coded_align`。
     pub fn align_extent(&self, width: u32, height: u32) -> Result<vk::Extent2D, String> {
-        let gw = self.picture_access_granularity.width.max(1);
-        let gh = self.picture_access_granularity.height.max(1);
+        let (gw, gh) = self.coded_granularity();
         let aligned = vk::Extent2D {
             width: width.next_multiple_of(gw),
             height: height.next_multiple_of(gh),
@@ -236,6 +331,50 @@ impl CodecCaps {
             ));
         }
         Ok(aligned)
+    }
+
+    /// 输入图分配尺寸：coded extent 再按 [`Self::input_granularity`] 补齐
+    ///
+    /// 该粒度是 advisory（不产生 VU）；超过图像上限的轴退回 coded extent，
+    /// 不让整个后端起不来。
+    pub fn input_pad(&self, coded: vk::Extent2D) -> InputPad {
+        let (gw, gh) = self.input_granularity();
+        let padded = vk::Extent2D {
+            width: coded.width.next_multiple_of(gw),
+            height: coded.height.next_multiple_of(gh),
+        };
+        // 未探测到 `maxImageDimension2D` 时退回 coded 上限，两轴分别比较
+        let (limit_width, limit_height) = if self.max_image_dimension == 0 {
+            (self.max_coded_extent.width, self.max_coded_extent.height)
+        } else {
+            (self.max_image_dimension, self.max_image_dimension)
+        };
+        let width_dropped = padded.width != coded.width && padded.width > limit_width;
+        let height_dropped = padded.height != coded.height && padded.height > limit_height;
+        InputPad {
+            extent: vk::Extent2D {
+                width: if width_dropped {
+                    coded.width
+                } else {
+                    padded.width
+                },
+                height: if height_dropped {
+                    coded.height
+                } else {
+                    padded.height
+                },
+            },
+            dropped: width_dropped || height_dropped,
+        }
+    }
+
+    /// AV1 序列头是否用 128x128 超级块：驱动支持 128 时用 128，否则用 64
+    ///
+    /// 与 FFmpeg `vulkan_encode_av1.c` 的 `use_128x128_superblock` 取法一致；
+    /// 两个都支持时选 128（更大的块减少分区开销）。
+    pub fn av1_use_128x128_superblock(&self) -> bool {
+        self.superblock_sizes
+            .contains(vk::VideoEncodeAV1SuperblockSizeFlagsKHR::TYPE_128)
     }
 }
 
@@ -262,6 +401,7 @@ pub(crate) fn probe_codec(ctx: &VulkanInstance, codec: VideoCodec) -> Result<Cod
     }?;
     caps.codec = codec;
     caps.queue_family = family;
+    caps.max_image_dimension = ctx.properties().limits.max_image_dimension2_d;
     Ok(caps)
 }
 
@@ -315,6 +455,12 @@ fn probe_h264(
     out.read_video(&caps);
     collect_caps(&mut out, &encode_caps, &intra_caps, &codec_caps);
     out.max_level_idc = codec_caps.max_level_idc;
+    out.min_qp = codec_caps.min_qp;
+    out.max_qp = codec_caps.max_qp;
+    out.max_p_picture_l0_references = codec_caps.max_p_picture_l0_reference_count;
+    out.max_slice_count = codec_caps.max_slice_count;
+    out.requires_gop_remaining_frames = codec_caps.requires_gop_remaining_frames != 0;
+    out.prefers_gop_remaining_frames = codec_caps.prefers_gop_remaining_frames != 0;
     Ok(out)
 }
 
@@ -343,6 +489,12 @@ fn probe_h265(
     out.read_video(&caps);
     collect_caps(&mut out, &encode_caps, &intra_caps, &codec_caps);
     out.max_level_idc = codec_caps.max_level_idc;
+    out.min_qp = codec_caps.min_qp;
+    out.max_qp = codec_caps.max_qp;
+    out.max_p_picture_l0_references = codec_caps.max_p_picture_l0_reference_count;
+    out.max_slice_count = codec_caps.max_slice_segment_count;
+    out.requires_gop_remaining_frames = codec_caps.requires_gop_remaining_frames != 0;
+    out.prefers_gop_remaining_frames = codec_caps.prefers_gop_remaining_frames != 0;
     Ok(out)
 }
 
@@ -375,6 +527,13 @@ fn probe_av1(
     out.max_level_idc = codec_caps.max_level;
     out.min_q_index = codec_caps.min_q_index;
     out.max_q_index = codec_caps.max_q_index;
+    out.coded_picture_alignment = codec_caps.coded_picture_alignment;
+    out.max_single_reference_count = codec_caps.max_single_reference_count;
+    out.single_reference_name_mask = codec_caps.single_reference_name_mask;
+    out.max_operating_points = codec_caps.max_operating_points;
+    out.superblock_sizes = codec_caps.superblock_sizes;
+    out.requires_gop_remaining_frames = codec_caps.requires_gop_remaining_frames != 0;
+    out.prefers_gop_remaining_frames = codec_caps.prefers_gop_remaining_frames != 0;
     Ok(out)
 }
 
@@ -399,4 +558,134 @@ fn read_intra_refresh(out: &mut CodecCaps, caps: &vk::VideoEncodeIntraRefreshCap
 /// 而到那时对应的扩展必然已启用。
 fn video_capabilities_fn(ctx: &VulkanInstance) -> ash::khr::video_queue::Instance {
     ash::khr::video_queue::Instance::load(ctx.entry(), ctx.instance())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extent(width: u32, height: u32) -> vk::Extent2D {
+        vk::Extent2D { width, height }
+    }
+
+    fn av1_caps() -> CodecCaps {
+        CodecCaps {
+            codec: VideoCodec::Av1,
+            queue_family: Some(0),
+            rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR::CBR,
+            feedback_flags: vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
+            max_dpb_slots: 8,
+            max_active_reference_pictures: 1,
+            max_single_reference_count: 7,
+            single_reference_name_mask: 0x7f,
+            ..Default::default()
+        }
+    }
+
+    /// coded 对齐只取访问/coded 两项；输入读取粒度只影响图像分配
+    #[test]
+    fn test_coded_and_input_granularity() {
+        let caps = CodecCaps {
+            picture_access_granularity: extent(2, 4),
+            encode_input_picture_granularity: extent(16, 8),
+            coded_picture_alignment: extent(8, 32),
+            ..Default::default()
+        };
+        assert_eq!(caps.coded_granularity(), (8, 32));
+        assert_eq!(caps.input_granularity(), (16, 32));
+    }
+
+    /// 输入 padding 是 advisory：补齐超过图像分配上限时逐轴退回，
+    /// 不把合法分辨率拒掉
+    #[test]
+    fn test_input_pad_falls_back_when_over_limit() {
+        let caps = CodecCaps {
+            picture_access_granularity: extent(2, 2),
+            encode_input_picture_granularity: extent(64, 64),
+            max_coded_extent: extent(1920, 1088),
+            ..Default::default()
+        };
+        let coded = extent(1920, 1088);
+        let exact = caps.input_pad(coded);
+        assert_eq!(
+            exact.extent, coded,
+            "1088 已整除 64 时 padding 与 coded 相同"
+        );
+        assert!(!exact.dropped);
+
+        let tight = extent(1366, 768);
+        let pad_caps = CodecCaps {
+            max_coded_extent: tight,
+            ..caps.clone()
+        };
+        let pad = pad_caps.input_pad(tight);
+        assert_eq!(
+            pad.extent, tight,
+            "padding 超过图像上限时必须退回 coded，而不是报错"
+        );
+        assert!(pad.dropped, "宽轴 1408 > 1366，应报告 padding 被放弃");
+
+        let roomy = CodecCaps {
+            max_coded_extent: extent(1408, 768),
+            ..pad_caps
+        };
+        assert_eq!(
+            roomy.input_pad(tight).extent,
+            extent(1408, 768),
+            "有空间时按 encodeInputPictureGranularity 补齐"
+        );
+
+        // 图像分配上限优先于 maxCodedExtent：后者只约束 codedExtent
+        let image_limited = CodecCaps {
+            max_image_dimension: 768,
+            ..caps
+        };
+        let limited = image_limited.input_pad(tight);
+        assert_eq!(limited.extent, tight);
+        assert!(limited.dropped);
+    }
+
+    /// AV1 超级块：64-only、128-only、两者都有都要通过；一个都没有才拒绝
+    #[test]
+    fn test_av1_superblock_accepts_64_or_128() {
+        let both = CodecCaps {
+            superblock_sizes: vk::VideoEncodeAV1SuperblockSizeFlagsKHR::TYPE_64
+                | vk::VideoEncodeAV1SuperblockSizeFlagsKHR::TYPE_128,
+            ..av1_caps()
+        };
+        assert!(both.validate().is_ok());
+        assert!(both.av1_use_128x128_superblock(), "两者都支持时选 128");
+
+        let only_64 = CodecCaps {
+            superblock_sizes: vk::VideoEncodeAV1SuperblockSizeFlagsKHR::TYPE_64,
+            ..av1_caps()
+        };
+        assert!(only_64.validate().is_ok());
+        assert!(!only_64.av1_use_128x128_superblock());
+
+        let only_128 = CodecCaps {
+            superblock_sizes: vk::VideoEncodeAV1SuperblockSizeFlagsKHR::TYPE_128,
+            ..av1_caps()
+        };
+        assert!(only_128.validate().is_ok(), "128-only 驱动必须可用");
+        assert!(only_128.av1_use_128x128_superblock());
+
+        let none = CodecCaps {
+            superblock_sizes: vk::VideoEncodeAV1SuperblockSizeFlagsKHR::empty(),
+            ..av1_caps()
+        };
+        assert!(none.validate().is_err());
+    }
+
+    /// maxOperatingPoints=0 是合法状态：VUID 10280 允许 count=0，
+    /// 此时由调用方省略操作点数组
+    #[test]
+    fn test_av1_zero_operating_points_is_not_rejected() {
+        let caps = CodecCaps {
+            max_operating_points: 0,
+            superblock_sizes: vk::VideoEncodeAV1SuperblockSizeFlagsKHR::TYPE_64,
+            ..av1_caps()
+        };
+        assert!(caps.validate().is_ok());
+    }
 }
