@@ -73,22 +73,22 @@ impl VideoSession {
         // `referenceNameSlotIndices` / `refresh_frame_flags` 对齐。
         // 声明值取 min(驱动上限, 8)，下限由 `caps.validate()` 拒绝；代价是最多
         // 多占 6 层显存（1080p 约 19 MB）。
-        let is_av1 = matches!(caps.codec, crate::encode::VideoCodec::Av1);
+        let is_av1 = matches!(caps.codec(), crate::encode::VideoCodec::Av1);
         let dpb_slots = caps.max_dpb_slots.min(if is_av1 { 8 } else { 2 });
         let active_references =
             caps.max_active_reference_pictures
                 .min(if is_av1 { dpb_slots } else { 1 });
         log::info!(
             "视频会话 {:?}: DPB 槽={dpb_slots}（驱动上限 {}）活跃参考={active_references}（驱动上限 {}）",
-            caps.codec,
+            caps.codec(),
             caps.max_dpb_slots,
             caps.max_active_reference_pictures,
         );
 
         // codec 专属的 profile 子结构先落位，再把它的地址挂进 profile 链。
         // `profile_part` 必须先于 `video_profile` 声明：后者只存前者的地址，不拥有它。
-        let mut profile_part = super::caps::ProfilePart::new(caps.codec);
-        let video_profile = profile_part.attach(super::caps::base_profile(caps.codec));
+        let mut profile_part = super::caps::ProfilePart::new(caps.codec());
+        let video_profile = profile_part.attach(super::caps::base_profile(caps.codec()));
 
         let create_info = vk::VideoSessionCreateInfoKHR::default()
             .queue_family_index(device.video_queue_family())

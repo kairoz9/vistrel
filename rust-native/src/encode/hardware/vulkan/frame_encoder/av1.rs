@@ -41,7 +41,7 @@ use ash::vk::{self, TaggedStructure};
 
 use super::{CodecRateControl, FrameEncoder, begin_scope, intra_refresh_info, picture_resource};
 use crate::encode::VideoCodec;
-use crate::encode::hardware::vulkan::caps::CodecCaps;
+use crate::encode::hardware::vulkan::caps::Av1Caps;
 use crate::encode::hardware::vulkan::device::VideoDevice;
 use crate::encode::hardware::vulkan::session::{VideoSession, VideoSessionParameters};
 
@@ -507,12 +507,9 @@ impl VideoSessionParameters {
     pub(super) fn new_av1(
         device: &VideoDevice,
         session: &VideoSession,
-        caps: &CodecCaps,
+        caps: &Av1Caps,
         level_idx: u32,
     ) -> Result<Self, String> {
-        if caps.codec != VideoCodec::Av1 {
-            return Err(format!("AV1 会话参数收到 {:?}", caps.codec));
-        }
         let extent = session.coded_extent();
         // 两个局部都必须活到 create 调用结束：序列头只存它们的地址，不拥有它们
         let color = color_config();
@@ -684,8 +681,9 @@ impl FrameEncoder {
         // CBR 码控：量化索引范围来自能力查询。CBR 下驱动自己算量化步长，缺省范围
         // 会让算出的 Q 越界（INVALID_VIDEO_STD_PARAMETERS）；地板还不能超过
         // `maxQIndex`（VUID 10300 / 10304）。
-        let max_q_index = self.max_q_index.max(self.min_q_index);
-        let floor = self.min_q_index.max(MIN_Q_INDEX_AV1).min(max_q_index);
+        let (min_q_index, max_q_index) = self.q_index_range();
+        let max_q_index = max_q_index.max(min_q_index);
+        let floor = min_q_index.max(MIN_Q_INDEX_AV1).min(max_q_index);
         let min_q = vk::VideoEncodeAV1QIndexKHR::default()
             .intra_q_index(floor)
             .predictive_q_index(floor)
@@ -1117,7 +1115,11 @@ mod tests {
         };
         // 与生产路径同源：按内容推导 level，而不是驱动声明的最高 level
         let level_idx = u32::from(crate::encode::av1_level_idx(1920, 1080, 60, 8_000));
-        match VideoSessionParameters::new_av1(&device, &session, &caps, level_idx) {
+        let av1_caps = match &caps.specific {
+            crate::encode::hardware::vulkan::caps::CodecSpecific::Av1(specific) => specific,
+            _ => unreachable!("probe_codec(Av1) 必然返回 Av1 变体"),
+        };
+        match VideoSessionParameters::new_av1(&device, &session, av1_caps, level_idx) {
             Ok(params) => {
                 let obu = params.parameter_sets();
                 println!(
@@ -1126,7 +1128,7 @@ mod tests {
                     session.coded_extent().width,
                     session.coded_extent().height,
                     level_idx,
-                    caps.max_level_idc,
+                    caps.max_level(),
                     params.params()
                 );
                 println!("OBU 前 16 字节: {:02x?}", &obu[..16.min(obu.len())]);
@@ -1173,7 +1175,7 @@ mod tests {
                 return;
             }
         };
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), caps.codec, 15) {
+        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), 15) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("AV1 编码器初始化失败: {e}");
@@ -1249,13 +1251,8 @@ mod tests {
         if let (Ok(h264_caps), Ok(h264_device)) = (
             caps::probe_codec(&ctx, VideoCodec::H264),
             VideoDevice::new(&ctx, VideoCodec::H264),
-        ) && let Ok(mut h264) = FrameEncoder::new(
-            &h264_device,
-            &h264_caps,
-            test_profile(),
-            h264_caps.codec,
-            15,
-        ) {
+        ) && let Ok(mut h264) = FrameEncoder::new(&h264_device, &h264_caps, test_profile(), 15)
+        {
             let h264_extent = h264.extent();
             let h264_key = match h264.encode_idr(&make_noisy_frame(h264_extent, 11)) {
                 Ok((bytes, _)) => bytes.len(),
@@ -1376,7 +1373,7 @@ mod tests {
             Some(_) => 4095,
             None => 60,
         };
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), caps.codec, gop) {
+        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), gop) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("AV1 编码器初始化失败: {e}");
