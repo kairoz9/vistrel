@@ -1,12 +1,20 @@
 //! AV1 编码模块
+//!
+//! - `caps` / `device`：能力探测与 `videoEncodeAV1` 设备特性
+//! - `sequence`：序列头与会话参数装配
+//! - `frame`：每帧参数与编码命令装配
+//! - `ivf`：IVF 落盘
 
 use ash::vk;
 
 use self::caps::Av1Caps;
 pub(in crate::encode::hardware::vulkan) mod caps;
 pub(in crate::encode::hardware::vulkan) mod device;
-pub(in crate::encode::hardware::vulkan) mod encoder;
+mod frame;
 pub(in crate::encode::hardware::vulkan) mod ivf;
+mod sequence;
+#[cfg(test)]
+mod tests;
 
 /// AV1 的静态序列头参数
 #[derive(Debug, Clone, Copy)]

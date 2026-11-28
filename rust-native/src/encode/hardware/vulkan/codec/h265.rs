@@ -1,9 +1,18 @@
 //! H.265 编码模块
+//!
+//! - `caps`：能力探测与校验
+//! - `params`：VPS / SPS / PPS / VUI 与会话参数装配
+//! - `frame`：每帧参数与编码命令装配
 
 use ash::vk;
 
 pub(in crate::encode::hardware::vulkan) mod caps;
-pub(in crate::encode::hardware::vulkan) mod encoder;
+mod frame;
+mod params;
+#[cfg(test)]
+mod tests;
+
+pub(in crate::encode::hardware::vulkan) use self::params::level_enum;
 
 /// H.265 的静态序列头参数
 #[derive(Debug, Clone, Copy)]

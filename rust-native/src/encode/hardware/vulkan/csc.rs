@@ -488,7 +488,7 @@ impl ColorConverter {
         // 管线布局按 `PUSH_DESCRIPTOR` 标志创建，推送的绑定数与布局声明的绑定数一致。
         //
         // 走 1.4 核心命令还是 `VK_KHR_push_descriptor` 由设备决定，这里不判断——
-        // 两条通路的参数完全一致，分支只写在 `device.rs::plan_push_descriptor` 一处。
+        // 两条通路的参数完全一致，分支只写在 `device/features.rs::plan_push_descriptor` 一处。
         unsafe {
             self.device.push_descriptor_set(
                 self.cmd,

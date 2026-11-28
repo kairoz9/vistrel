@@ -1,12 +1,9 @@
-//! 一帧编码的执行管线 (Frame Execution Pipeline)
+//! 一帧编码的执行管线：录制、提交、读回与状态推进
 //!
-//! 编码命令描述好之后，从这里走到「码流到手、状态推进」：[`FrameEncoder::record_and_submit`]
-//! 录制全部命令（上传拷贝 → DPB 布局 → begin → 码控 → encode → end）并提交等待，
-//! [`FrameEncoder::submit_encode`] 做失败分诊（提交未落地才回滚布局；在途超时永久毒化）
-//! 与 feedback 读取，[`FrameEncoder::finish_frame`] 读回码流、推进逐帧状态、给 IDR 拼参数集。
-//!
-//! 三个 codec 的差别只在「怎么构造编码命令」（见 `codec/` 下的 `h264` / `h265` / `av1`），
-//! 这条管线对它们完全一致。
+//! 从编码命令描述好之后开始：[`FrameEncoder::record_and_submit`] 录制全部命令
+//! （上传拷贝 → DPB 布局 → begin → 码控 → encode → end）并提交等待，
+//! [`FrameEncoder::submit_encode`] 做失败分诊与 feedback 读取，
+//! [`FrameEncoder::finish_frame`] 读回码流、推进逐帧状态、给 IDR 拼参数集。
 //!
 //! **等待超时与永久毒化**：提交已落地但时间线等待超时（`InFlight`）时，命令缓冲
 //! 仍在途且绝不可复用——对在途命令缓冲 reset 是规范违规。编码器自此永久毒化：
@@ -17,6 +14,8 @@ use ash::vk::{self, TaggedStructure};
 
 use super::{FrameEncoder, PendingUpload, Scope};
 use crate::encode::hardware::vulkan::codec::{CodecGopRemaining, CodecRateControl};
+
+// ---- 执行管线：录制、提交、读回 ----
 
 /// `VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR` 的结果布局
 ///

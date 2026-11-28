@@ -9,8 +9,6 @@ use ash::vk::{self, TaggedStructure};
 
 use self::av1::caps::Av1Caps;
 use self::h26x::H26xCaps;
-use self::h264::encoder as h264_encoder;
-use self::h265::encoder as h265_encoder;
 use crate::encode::VideoCodec;
 
 pub(in crate::encode::hardware::vulkan) mod av1;
@@ -273,8 +271,8 @@ impl CodecSpecific {
 /// 三个映射在这里收口，`SessionConfig::build` 不必按 codec 分支。
 pub(super) fn level_enum(codec: VideoCodec, level: u32) -> Result<u32, String> {
     match codec {
-        VideoCodec::H264 => h264_encoder::level_to_vk(level),
-        VideoCodec::H265 => h265_encoder::level_enum(level),
+        VideoCodec::H264 => self::h264::level_to_vk(level),
+        VideoCodec::H265 => self::h265::level_enum(level),
         VideoCodec::Av1 => Ok(level),
     }
 }
