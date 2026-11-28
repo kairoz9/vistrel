@@ -975,7 +975,11 @@ mod tests {
                 return;
             }
         };
-        caps.prefers_gop_remaining_frames = true;
+        if let crate::encode::hardware::vulkan::caps::CodecSpecific::H264(specific) =
+            &mut caps.specific
+        {
+            specific.prefers_gop_remaining_frames = true;
+        }
         let device = match VideoDevice::new(&ctx, VideoCodec::H264) {
             Ok(device) => device,
             Err(e) => {
@@ -1030,8 +1034,8 @@ mod tests {
         };
         if !caps.supports_intra_refresh() {
             println!(
-                "驱动未声明 intra-refresh 能力，跳过: 模式 [{}] / 最大周期 {}",
-                caps.intra_refresh_modes, caps.max_intra_refresh_cycle_duration
+                "驱动未声明 intra-refresh 能力，跳过: 模式 [{:?}] / 最大周期 {}",
+                caps.intra_refresh.modes, caps.intra_refresh.max_cycle_duration
             );
             return;
         }
@@ -1057,7 +1061,7 @@ mod tests {
             }
         };
 
-        let max_cycle = caps.max_intra_refresh_cycle_duration;
+        let max_cycle = caps.intra_refresh.max_cycle_duration;
         let cycle = max_cycle.clamp(2, 60);
         if let Err(e) = encoder.set_intra_refresh(cycle) {
             println!("启用 intra-refresh 失败: {e}");

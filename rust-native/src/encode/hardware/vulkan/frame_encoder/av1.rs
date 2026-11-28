@@ -1365,7 +1365,7 @@ mod tests {
 
         // 与生产路径同一套准入：能力三项 + 设备 feature 位
         let cycle = if caps.supports_intra_refresh() && device.supports_intra_refresh() {
-            Some((60 / 2).min(caps.max_intra_refresh_cycle_duration))
+            Some((60 / 2).min(caps.intra_refresh.max_cycle_duration))
         } else {
             None
         };

@@ -209,11 +209,11 @@ impl VulkanVideoBackend {
         //    与 NVENC 的 `intra_refresh_timing` 同一口径。
         //
         //    准入条件必须同时满足三项（见 `CodecCaps::supports_intra_refresh`），
-        //    其中 `max_intra_refresh_active_reference_pictures != 0` 最容易漏 ——
+        //    其中 `intra_refresh.max_active_reference_pictures != 0` 最容易漏 ——
         //    漏了会对不支持的驱动照常下发，驱动静默忽略，每帧退化成普通 P 帧，
         //    而 GOP 是按「有渐进刷新」选的超长值，于是任何一次解码错误都永不恢复。
         let intra_cycle = if caps.supports_intra_refresh() && device.supports_intra_refresh() {
-            Some((fps / 2).max(2).min(caps.max_intra_refresh_cycle_duration))
+            Some((fps / 2).max(2).min(caps.intra_refresh.max_cycle_duration))
         } else {
             None
         };
@@ -228,13 +228,13 @@ impl VulkanVideoBackend {
         }
 
         log::info!(
-            "Vulkan {:?} {width}x{height}@{fps}: intra-refresh 模式 [{}] present={} \
+            "Vulkan {:?} {width}x{height}@{fps}: intra-refresh 模式 [{:?}] present={} \
                      max_cycle={} 驱动 active_ref={} 设备 feature={} ⇒ 会话 cycle={:?} gop={gop}",
             caps.codec(),
-            caps.intra_refresh_modes,
-            caps.intra_refresh_modes_present,
-            caps.max_intra_refresh_cycle_duration,
-            caps.max_intra_refresh_active_reference_pictures,
+            caps.intra_refresh.modes,
+            !caps.intra_refresh.modes.is_empty(),
+            caps.intra_refresh.max_cycle_duration,
+            caps.intra_refresh.max_active_reference_pictures,
             device.supports_intra_refresh(),
             intra_cycle,
         );

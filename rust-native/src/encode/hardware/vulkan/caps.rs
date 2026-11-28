@@ -117,23 +117,10 @@ pub struct CodecCaps {
     /// codec 专属能力：同一时刻只有当前 codec 的字段存在
     pub specific: CodecSpecific,
     pub feedback_flags: vk::VideoEncodeFeedbackFlagsKHR,
-    /// 驱动是否要求 begin 时给出 GOP 剩余帧数
-    pub requires_gop_remaining_frames: bool,
-    /// 驱动是否偏好 begin 时给出 GOP 剩余帧数
-    pub prefers_gop_remaining_frames: bool,
     /// 会话创建必须原样回传的 std 头版本
     pub std_header_version: vk::ExtensionProperties,
-    /// Intra-Refresh 模式（`Debug` 文本，排障用）
-    ///
-    /// 不存数值：这个 flags 类型在本 ash rev 上没有 `bits()`，而具体类型名随版本变动，
-    /// 用 `Debug` 文本既能打印又不绑死类型。
-    pub intra_refresh_modes: String,
-    /// 驱动是否声明了至少一种 intra-refresh 模式
-    pub intra_refresh_modes_present: bool,
-    /// 支持的最大刷新周期（帧）。0 表示不支持
-    pub max_intra_refresh_cycle_duration: u32,
-    /// 刷新期间允许的最大活跃参考帧数
-    pub max_intra_refresh_active_reference_pictures: u32,
+    /// intra-refresh 能力
+    pub intra_refresh: IntraRefreshCaps,
     /// 驱动返回的原始字段转储，仅测试报告消费；生产探测不为此 format 大字符串
     #[cfg(test)]
     pub raw: String,
@@ -162,6 +149,18 @@ impl CodecSpecific {
             Self::Av1(caps) => caps.validate(),
         }
     }
+
+    /// 驱动是否要求或偏好 begin 时给出 GOP 剩余帧数
+    fn wants_gop_remaining_frames(&self) -> bool {
+        match self {
+            Self::H264(caps) | Self::H265(caps) => {
+                caps.requires_gop_remaining_frames || caps.prefers_gop_remaining_frames
+            }
+            Self::Av1(caps) => {
+                caps.requires_gop_remaining_frames || caps.prefers_gop_remaining_frames
+            }
+        }
+    }
 }
 
 /// H.264 / H.265 共用的专属能力
@@ -176,6 +175,10 @@ pub struct H26xCaps {
     pub max_p_picture_l0_references: u32,
     /// 单帧最大 slice 数
     pub max_slice_count: u32,
+    /// 驱动是否要求 begin 时给出 GOP 剩余帧数
+    pub requires_gop_remaining_frames: bool,
+    /// 驱动是否偏好 begin 时给出 GOP 剩余帧数
+    pub prefers_gop_remaining_frames: bool,
 }
 
 impl H26xCaps {
@@ -213,6 +216,10 @@ pub struct Av1Caps {
     pub max_operating_points: u32,
     /// 超级块能力
     pub superblock_sizes: vk::VideoEncodeAV1SuperblockSizeFlagsKHR,
+    /// 驱动是否要求 begin 时给出 GOP 剩余帧数
+    pub requires_gop_remaining_frames: bool,
+    /// 驱动是否偏好 begin 时给出 GOP 剩余帧数
+    pub prefers_gop_remaining_frames: bool,
 }
 
 impl Av1Caps {
@@ -247,6 +254,36 @@ impl Av1Caps {
     pub fn av1_use_128x128_superblock(&self) -> bool {
         self.superblock_sizes
             .contains(vk::VideoEncodeAV1SuperblockSizeFlagsKHR::TYPE_128)
+    }
+}
+
+/// intra-refresh 能力
+#[derive(Debug, Clone, Default)]
+pub struct IntraRefreshCaps {
+    /// 驱动声明的刷新模式；空表示扩展可用但驱动未声明任何模式
+    pub modes: vk::VideoEncodeIntraRefreshModeFlagsKHR,
+    /// 支持的最大刷新周期（帧）。0 表示不支持
+    pub max_cycle_duration: u32,
+    /// 刷新期间允许的最大活跃参考帧数
+    pub max_active_reference_pictures: u32,
+}
+
+impl IntraRefreshCaps {
+    /// 三项同时成立才真正可用
+    ///
+    /// 依据不是扩展名，而是能力查询给出的三项：
+    ///
+    /// - `modes` 非空：驱动声明了至少一种刷新模式；
+    /// - `max_cycle_duration >= 2`：周期小于 2 构不成渐进刷新；
+    /// - **`max_active_reference_pictures != 0`**：按规范，该字段为 0 表示实现
+    ///   **不支持** intra refresh。只查前两项会漏掉这一档，于是对一个不支持的驱动
+    ///   照常下发 `VkVideoEncodeIntraRefreshInfoKHR`——驱动静默忽略，每帧退化成普通
+    ///   P 帧，而 GOP 又是按「有渐进刷新」选的超长值，结果是任何一次解码错误都长期
+    ///   不恢复（花屏）。
+    pub fn supported(&self) -> bool {
+        !self.modes.is_empty()
+            && self.max_cycle_duration >= 2
+            && self.max_active_reference_pictures != 0
     }
 }
 
@@ -336,21 +373,14 @@ impl CodecCaps {
         self.specific.validate()
     }
 
-    /// Intra-Refresh 是否真的可用
-    ///
-    /// 依据不是扩展名，而是能力查询给出的三项：
-    ///
-    /// - `intra_refresh_modes` 非空：驱动声明了至少一种刷新模式；
-    /// - `max_intra_refresh_cycle_duration >= 2`：周期小于 2 构不成渐进刷新；
-    /// - **`max_intra_refresh_active_reference_pictures != 0`**：按规范，该字段为 0
-    ///   表示实现**不支持** intra refresh。只查前两项会漏掉这一档，于是对一个不支持
-    ///   的驱动照常下发 `VkVideoEncodeIntraRefreshInfoKHR`——驱动静默忽略，每帧退化成
-    ///   普通 P 帧，而 GOP 又是按「有渐进刷新」选的超长值，结果是任何一次解码错误都
-    ///   长期不恢复（花屏）。
+    /// 驱动是否要求或偏好 begin 时给出 GOP 剩余帧数
+    pub fn wants_gop_remaining_frames(&self) -> bool {
+        self.specific.wants_gop_remaining_frames()
+    }
+
+    /// Intra-Refresh 是否真的可用，判定见 [`IntraRefreshCaps::supported`]
     pub fn supports_intra_refresh(&self) -> bool {
-        self.intra_refresh_modes_present
-            && self.max_intra_refresh_cycle_duration >= 2
-            && self.max_intra_refresh_active_reference_pictures != 0
+        self.intra_refresh.supported()
     }
 
     /// coded extent 的硬对齐粒度
@@ -526,9 +556,9 @@ fn probe_h264(
         max_qp: codec_caps.max_qp,
         max_p_picture_l0_references: codec_caps.max_p_picture_l0_reference_count,
         max_slice_count: codec_caps.max_slice_count,
+        requires_gop_remaining_frames: codec_caps.requires_gop_remaining_frames != 0,
+        prefers_gop_remaining_frames: codec_caps.prefers_gop_remaining_frames != 0,
     });
-    out.requires_gop_remaining_frames = codec_caps.requires_gop_remaining_frames != 0;
-    out.prefers_gop_remaining_frames = codec_caps.prefers_gop_remaining_frames != 0;
     Ok(out)
 }
 
@@ -562,9 +592,9 @@ fn probe_h265(
         max_qp: codec_caps.max_qp,
         max_p_picture_l0_references: codec_caps.max_p_picture_l0_reference_count,
         max_slice_count: codec_caps.max_slice_segment_count,
+        requires_gop_remaining_frames: codec_caps.requires_gop_remaining_frames != 0,
+        prefers_gop_remaining_frames: codec_caps.prefers_gop_remaining_frames != 0,
     });
-    out.requires_gop_remaining_frames = codec_caps.requires_gop_remaining_frames != 0;
-    out.prefers_gop_remaining_frames = codec_caps.prefers_gop_remaining_frames != 0;
     Ok(out)
 }
 
@@ -603,24 +633,22 @@ fn probe_av1(
         single_reference_name_mask: codec_caps.single_reference_name_mask,
         max_operating_points: codec_caps.max_operating_points,
         superblock_sizes: codec_caps.superblock_sizes,
+        requires_gop_remaining_frames: codec_caps.requires_gop_remaining_frames != 0,
+        prefers_gop_remaining_frames: codec_caps.prefers_gop_remaining_frames != 0,
     });
-    out.requires_gop_remaining_frames = codec_caps.requires_gop_remaining_frames != 0;
-    out.prefers_gop_remaining_frames = codec_caps.prefers_gop_remaining_frames != 0;
     Ok(out)
 }
 
 /// 把 intra-refresh 能力抄进结构化快照
 ///
 /// 只在扩展可用时才会被驱动填写；否则结构体保持默认零值，
-/// `supports_intra_refresh()` 据此返回 false。
+/// [`CodecCaps::supports_intra_refresh`] 据此返回 false。
 fn read_intra_refresh(out: &mut CodecCaps, caps: &vk::VideoEncodeIntraRefreshCapabilitiesKHR<'_>) {
-    // 这个 flags 类型在本 ash rev 上没有 `bits()`，也不去猜它的访问器：
-    // 「与空值比较」+ `Debug` 文本足以表达「有没有能力」和「排障看什么」
-    out.intra_refresh_modes_present = caps.intra_refresh_modes != Default::default();
-    out.intra_refresh_modes = format!("{:?}", caps.intra_refresh_modes);
-    out.max_intra_refresh_cycle_duration = caps.max_intra_refresh_cycle_duration;
-    out.max_intra_refresh_active_reference_pictures =
-        caps.max_intra_refresh_active_reference_pictures;
+    out.intra_refresh = IntraRefreshCaps {
+        modes: caps.intra_refresh_modes,
+        max_cycle_duration: caps.max_intra_refresh_cycle_duration,
+        max_active_reference_pictures: caps.max_intra_refresh_active_reference_pictures,
+    };
 }
 
 /// `VK_KHR_video_queue` 的实例级命令表
@@ -789,5 +817,34 @@ mod tests {
             ..av1_caps()
         };
         assert!(caps.validate().is_ok());
+    }
+
+    /// intra-refresh 三项缺一不可：模式为空、周期 < 2、活跃参考为 0 都要拒绝
+    #[test]
+    fn test_intra_refresh_requires_all_three_capabilities() {
+        let ok = IntraRefreshCaps {
+            modes: vk::VideoEncodeIntraRefreshModeFlagsKHR::PER_PICTURE_PARTITION,
+            max_cycle_duration: 2,
+            max_active_reference_pictures: 1,
+        };
+        assert!(ok.supported());
+
+        let no_modes = IntraRefreshCaps {
+            modes: vk::VideoEncodeIntraRefreshModeFlagsKHR::empty(),
+            ..ok.clone()
+        };
+        assert!(!no_modes.supported());
+
+        let short_cycle = IntraRefreshCaps {
+            max_cycle_duration: 1,
+            ..ok.clone()
+        };
+        assert!(!short_cycle.supported());
+
+        let no_active_refs = IntraRefreshCaps {
+            max_active_reference_pictures: 0,
+            ..ok
+        };
+        assert!(!no_active_refs.supported());
     }
 }

@@ -659,8 +659,7 @@ impl FrameEncoder {
             max_bitrate: caps.max_bitrate,
             gop_length,
             quant: QuantCaps::from_caps(caps),
-            gop_remaining_frames: caps.requires_gop_remaining_frames
-                || caps.prefers_gop_remaining_frames,
+            gop_remaining_frames: caps.wants_gop_remaining_frames(),
             feedback_has_overrides,
             overrides_seen: false,
             // 准入条件必须两条同时成立：能力查询说支持（模式非空、周期 >= 2）**且**
@@ -669,7 +668,7 @@ impl FrameEncoder {
             max_intra_refresh_cycle: if caps.supports_intra_refresh()
                 && device.supports_intra_refresh()
             {
-                caps.max_intra_refresh_cycle_duration
+                caps.intra_refresh.max_cycle_duration
             } else {
                 0
             },
