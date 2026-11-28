@@ -11,7 +11,7 @@ mod codec;
 pub(crate) mod context;
 mod csc;
 mod device;
-mod frame_encoder;
+mod encoder;
 mod image;
 mod session;
 mod sync;
@@ -35,7 +35,7 @@ use bytes::Bytes;
 use codec::caps::CodecCaps;
 use codec::config::{EncodePolicy, SessionConfig};
 use context::VulkanInstance;
-use frame_encoder::FrameEncoder;
+use encoder::VulkanEncoder;
 use vram_slot::VramSlot;
 
 /// 探测单个 codec 的能力；供 `hardware` 汇总各后端时调用
@@ -155,7 +155,7 @@ fn rgba_to_nv12(
 /// Vulkan Video 硬件编码器后端
 pub(crate) struct VulkanVideoBackend {
     device: VideoDevice,
-    encoder: FrameEncoder,
+    encoder: VulkanEncoder,
     /// 当前档位。`reconfigure` 靠它判断「几何是否真的变了」——
     /// 只有 fps / 码率变化时绝不能重建会话（会清空显存槽位表）
     profile: StreamingProfile,
@@ -205,7 +205,7 @@ impl VulkanVideoBackend {
         let intra_cycle = config.intra_refresh_cycle();
         let gop = config.gop_length();
         let coding = config.coding_control(fps);
-        let encoder = FrameEncoder::new(&device, config, coding)?;
+        let encoder = VulkanEncoder::new(&device, config, coding)?;
 
         log::info!(
             "Vulkan {:?} {width}x{height}@{fps}: intra-refresh 模式 [{:?}] present={} \
@@ -459,7 +459,7 @@ mod test_support {
 
     /// 测试专用的一次性提交
     ///
-    /// 生产路径的提交全在 `FrameEncoder` 里，`Nv12Image` 不持有命令池。测试要单独验证
+    /// 生产路径的提交全在 `VulkanEncoder` 里，`Nv12Image` 不持有命令池。测试要单独验证
     /// 上传与读回，就得自己搭一套最小设施——放在 `#[cfg(test)]` 下，生产代码为零。
     ///
     /// `wait` 是跨队列依赖要等的信号量（CSC 的完成信号），没有就传 `None`。

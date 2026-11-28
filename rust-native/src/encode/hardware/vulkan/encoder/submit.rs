@@ -1,9 +1,9 @@
 //! 一帧编码的执行管线：录制、提交、读回与状态推进
 //!
-//! 从编码命令描述好之后开始：[`FrameEncoder::record_and_submit`] 录制全部命令
+//! 从编码命令描述好之后开始：[`VulkanEncoder::record_and_submit`] 录制全部命令
 //! （上传拷贝 → DPB 布局 → begin → 码控 → encode → end）并提交等待，
-//! [`FrameEncoder::submit_encode`] 做失败分诊与 feedback 读取，
-//! [`FrameEncoder::finish_frame`] 读回码流、推进逐帧状态、给 IDR 拼参数集。
+//! [`VulkanEncoder::submit_encode`] 做失败分诊与 feedback 读取，
+//! [`VulkanEncoder::finish_frame`] 读回码流、推进逐帧状态、给 IDR 拼参数集。
 //!
 //! **等待超时与永久毒化**：提交已落地但时间线等待超时（`InFlight`）时，命令缓冲
 //! 仍在途且绝不可复用——对在途命令缓冲 reset 是规范违规。编码器自此永久毒化：
@@ -12,7 +12,7 @@
 
 use ash::vk::{self, TaggedStructure};
 
-use super::{FrameEncoder, PendingUpload, Scope};
+use super::{PendingUpload, Scope, VulkanEncoder};
 use crate::encode::hardware::vulkan::codec::{CodecGopRemaining, CodecRateControl};
 
 // ---- 执行管线：录制、提交、读回 ----
@@ -131,7 +131,7 @@ fn dump_path() -> Option<&'static str> {
     PATH.as_deref()
 }
 
-impl FrameEncoder {
+impl VulkanEncoder {
     /// 编码一帧之后的公共收尾：读码流、推进状态、IDR 拼参数集
     ///
     /// 各 codec 的差别只在「怎么构造编码命令」，收尾完全一致，因此抽出来共用。

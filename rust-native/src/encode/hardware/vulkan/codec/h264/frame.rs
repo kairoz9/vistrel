@@ -10,8 +10,8 @@ use ash::vk::native::{
 use ash::vk::{self, TaggedStructure};
 
 use crate::encode::hardware::vulkan::codec::CodecRateControl;
-use crate::encode::hardware::vulkan::frame_encoder::{
-    FrameEncoder, begin_scope, intra_refresh_info, picture_resource,
+use crate::encode::hardware::vulkan::encoder::{
+    VulkanEncoder, begin_scope, intra_refresh_info, picture_resource,
 };
 
 /// CBR 的 QP 地板：只约束「画质过好」的一侧，不参与码率上限。
@@ -172,7 +172,7 @@ fn reference_info_of(frame_num: u32, primary_pic_type: u32) -> StdVideoEncodeH26
 
 // ---- 编码命令装配 ----
 
-impl FrameEncoder {
+impl VulkanEncoder {
     /// H.264 一帧
     pub(in crate::encode::hardware::vulkan) fn encode_prepared_h264(
         &mut self,

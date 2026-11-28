@@ -6,7 +6,7 @@ use super::*;
 
 use crate::encode::hardware::vulkan::codec::VideoSessionParameters;
 use crate::encode::hardware::vulkan::device::VideoDevice;
-use crate::encode::hardware::vulkan::frame_encoder::FrameEncoder;
+use crate::encode::hardware::vulkan::encoder::VulkanEncoder;
 use crate::encode::hardware::vulkan::session::VideoSession;
 use ash::vk::TaggedStructure;
 use ash::vk::native::{StdVideoEncodeH264ReferenceListsInfo, StdVideoH264SequenceParameterSetVui};
@@ -17,9 +17,9 @@ use crate::encode::hardware::vulkan::codec::config::{
 };
 use crate::encode::hardware::vulkan::codec::{H264SequenceConfig, SequenceConfig};
 use crate::encode::hardware::vulkan::context::VulkanInstance;
-use crate::encode::hardware::vulkan::frame_encoder::test_session_config_with;
-use crate::encode::hardware::vulkan::frame_encoder::{
-    make_noisy_frame, test_frame_encoder, test_profile, test_session_config,
+use crate::encode::hardware::vulkan::encoder::test_session_config_with;
+use crate::encode::hardware::vulkan::encoder::{
+    make_noisy_frame, test_profile, test_session_config, test_vulkan_encoder,
 };
 use crate::encode::hardware::vulkan::{codec::caps, test_support};
 
@@ -283,7 +283,7 @@ fn test_vulkan_video_h264_encode_idr() {
             return;
         }
     };
-    let mut encoder = match test_frame_encoder(&device, &caps, 15) {
+    let mut encoder = match test_vulkan_encoder(&device, &caps, 15) {
         Ok(encoder) => encoder,
         Err(e) => {
             println!("编码器初始化失败: {e}");
@@ -419,7 +419,7 @@ fn test_vulkan_video_h264_gop_remaining_frames() {
             return;
         }
     };
-    let mut encoder = match test_frame_encoder(&device, &caps, 15) {
+    let mut encoder = match test_vulkan_encoder(&device, &caps, 15) {
         Ok(encoder) => encoder,
         Err(e) => {
             println!("编码器初始化失败: {e}");
@@ -521,7 +521,7 @@ fn test_vulkan_video_h264_intra_refresh() {
         .intra_refresh_cycle()
         .expect("能力与 feature 位都成立时必须启用 intra-refresh");
     let coding = config.coding_control(60);
-    let mut encoder = match FrameEncoder::new(&device, config, coding) {
+    let mut encoder = match VulkanEncoder::new(&device, config, coding) {
         Ok(encoder) => encoder,
         Err(e) => {
             println!("编码器初始化失败: {e}");

@@ -14,8 +14,8 @@ use ash::vk::native::{
 use crate::encode::VideoCodec;
 use crate::encode::hardware::vulkan::codec::{H265SequenceConfig, SequenceConfig};
 use crate::encode::hardware::vulkan::context::VulkanInstance;
-use crate::encode::hardware::vulkan::frame_encoder::{
-    make_noisy_frame, test_frame_encoder, test_session_config,
+use crate::encode::hardware::vulkan::encoder::{
+    make_noisy_frame, test_session_config, test_vulkan_encoder,
 };
 use crate::encode::hardware::vulkan::{codec::caps, test_support};
 
@@ -315,7 +315,7 @@ fn test_vulkan_video_h265_encode_idr() {
             return;
         }
     };
-    let mut encoder = match test_frame_encoder(&device, &caps, 15) {
+    let mut encoder = match test_vulkan_encoder(&device, &caps, 15) {
         Ok(encoder) => encoder,
         Err(e) => {
             println!("H.265 编码器初始化失败: {e}");

@@ -12,12 +12,12 @@ use ash::vk::native::{
 use ash::vk::{self, TaggedStructure};
 
 use crate::encode::hardware::vulkan::codec::CodecRateControl;
-use crate::encode::hardware::vulkan::frame_encoder::{
-    FrameEncoder, begin_scope, intra_refresh_info, picture_resource,
+use crate::encode::hardware::vulkan::encoder::{
+    VulkanEncoder, begin_scope, intra_refresh_info, picture_resource,
 };
 
 /// CBR 的 QP 地板：只约束「画质过好」的一侧，不参与码率上限。
-/// 最终取值会钳进驱动声明的 `minQp..maxQp`（`FrameEncoder::qp_range`）。
+/// 最终取值会钳进驱动声明的 `minQp..maxQp`（`VulkanEncoder::qp_range`）。
 const MIN_QP_H265: i32 = 22;
 
 // ---- 每帧参数 ----
@@ -211,7 +211,7 @@ pub fn reference_info(poc: i32, is_idr: bool) -> StdVideoEncodeH265ReferenceInfo
 
 // ---- 编码命令装配 ----
 
-impl FrameEncoder {
+impl VulkanEncoder {
     /// H.265 一帧：构造 std 结构、DPB 槽与码控，然后走公共提交
     pub(in crate::encode::hardware::vulkan) fn encode_prepared_h265(
         &mut self,

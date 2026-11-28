@@ -4,7 +4,7 @@
 //! 不做码流语法解析，序列/图像参数集的每个字段都得由应用填。填错的表现不是编译错误，
 //! 而是 `VK_ERROR_INVALID_VIDEO_STD_PARAMETERS_KHR`，或者产出一段没人能解的码流。
 //!
-//! 参数集构造在 `h264/encoder.rs` / `h265/encoder.rs` / `av1/encoder.rs`；本模块只负责
+//! 参数集构造在 `h264/params.rs` / `h265/params.rs` / `av1/sequence.rs`；本模块只负责
 //! 「创建参数对象 → 取序列化字节 → 读取覆盖反馈」这条共同生命周期。
 //!
 //! **参数集的字节由驱动生成**（`vkGetEncodedVideoSessionParametersKHR`），应用不写码流语法。
@@ -56,7 +56,7 @@ impl VideoSessionParameters {
     /// `feedback` 传 null 时不取反馈；非 null 时必须指向顶层的
     /// `VideoEncodeSessionParametersFeedbackInfoKHR`，codec 专属反馈挂在它的 pNext 链上。
     ///
-    /// 各 codec 的参数集构造在 `codec/{h264,h265,av1}/encoder.rs`，经本方法与
+    /// 各 codec 的参数集构造在 `codec/{h264,h265}/params.rs` 与 `codec/av1/sequence.rs`，经本方法与
     /// [`Self::fetch_encoded`] 收尾——字段不外泄，调用方拿不到「半组装」的对象。
     pub(in crate::encode::hardware::vulkan) fn assemble(
         device: &VideoDevice,

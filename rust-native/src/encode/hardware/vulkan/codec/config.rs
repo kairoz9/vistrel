@@ -5,7 +5,7 @@
 //! [`super::rate_control`]。
 //!
 //! 探测结果 [`CodecCaps`] 只用于构造 [`SessionConfig`]；`VideoSession` 与
-//! `FrameEncoder` 不再直接读驱动能力字段。
+//! `VulkanEncoder` 不再直接读驱动能力字段。
 
 use ash::vk;
 

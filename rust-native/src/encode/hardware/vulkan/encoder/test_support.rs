@@ -1,8 +1,8 @@
-//! 帧编码器的测试夹具与 NV12 测试帧生成
+//! Vulkan 编码引擎的测试夹具与 NV12 测试帧生成
 
 use ash::vk;
 
-use super::FrameEncoder;
+use super::VulkanEncoder;
 use crate::encode::StreamingProfile;
 use crate::encode::hardware::vulkan::codec::caps::CodecCaps;
 use crate::encode::hardware::vulkan::codec::config::{
@@ -41,15 +41,15 @@ pub(in crate::encode::hardware::vulkan) fn test_session_config(
     )
 }
 
-/// 测试用帧编码器：从静态配置派生默认码控
-pub(in crate::encode::hardware::vulkan) fn test_frame_encoder(
+/// 测试用 Vulkan 编码器：从静态配置派生默认码控
+pub(in crate::encode::hardware::vulkan) fn test_vulkan_encoder(
     device: &VideoDevice,
     caps: &CodecCaps,
     gop: u32,
-) -> Result<FrameEncoder, String> {
+) -> Result<VulkanEncoder, String> {
     let config = test_session_config(caps, gop)?;
     let coding = config.coding_control(60);
-    FrameEncoder::new(device, config, coding)
+    VulkanEncoder::new(device, config, coding)
 }
 
 /// 造一帧 NV12：亮度低频渐变、色度四色块

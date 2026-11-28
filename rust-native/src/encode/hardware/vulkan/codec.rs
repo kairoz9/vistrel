@@ -294,7 +294,7 @@ pub(in crate::encode::hardware::vulkan) fn dump_ivf(
 
 /// 按 codec 分派一帧编码
 pub(in crate::encode::hardware::vulkan) fn encode_prepared(
-    encoder: &mut super::frame_encoder::FrameEncoder,
+    encoder: &mut super::encoder::VulkanEncoder,
     force_idr: bool,
 ) -> Result<(Vec<u8>, bool), String> {
     match encoder.codec() {
@@ -306,7 +306,7 @@ pub(in crate::encode::hardware::vulkan) fn encode_prepared(
 
 /// 本帧要挂进 begin 的 GOP 剩余帧数结构
 pub(in crate::encode::hardware::vulkan) fn gop_remaining<'a>(
-    encoder: &super::frame_encoder::FrameEncoder,
+    encoder: &super::encoder::VulkanEncoder,
     frame_num: u32,
     is_key: bool,
 ) -> Option<CodecGopRemaining<'a>> {

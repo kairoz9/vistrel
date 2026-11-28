@@ -271,14 +271,14 @@ mod tests {
                 return;
             }
         };
-        let config =
-            match crate::encode::hardware::vulkan::frame_encoder::test_session_config(&caps, 60) {
-                Ok(config) => config,
-                Err(e) => {
-                    println!("会话配置构造失败，跳过: {e}");
-                    return;
-                }
-            };
+        let config = match crate::encode::hardware::vulkan::encoder::test_session_config(&caps, 60)
+        {
+            Ok(config) => config,
+            Err(e) => {
+                println!("会话配置构造失败，跳过: {e}");
+                return;
+            }
+        };
         match VideoSession::new(&device, &config) {
             Ok(session) => {
                 println!(

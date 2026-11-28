@@ -11,8 +11,8 @@ use ash::vk::native::{
 use ash::vk::{self, TaggedStructure};
 
 use crate::encode::hardware::vulkan::codec::CodecRateControl;
-use crate::encode::hardware::vulkan::frame_encoder::{
-    FrameEncoder, begin_scope, intra_refresh_info, picture_resource,
+use crate::encode::hardware::vulkan::encoder::{
+    VulkanEncoder, begin_scope, intra_refresh_info, picture_resource,
 };
 
 /// `STD_VIDEO_AV1_REFS_PER_FRAME`
@@ -310,7 +310,7 @@ pub fn reference_info(frame_idx: u32, is_key: bool) -> StdVideoEncodeAV1Referenc
 
 // ---- 编码命令装配 ----
 
-impl FrameEncoder {
+impl VulkanEncoder {
     /// AV1 一帧
     ///
     /// 与 H.26x 的三处结构性差异：

@@ -7,9 +7,9 @@ use crate::encode::hardware::vulkan::codec::VideoSessionParameters;
 use crate::encode::hardware::vulkan::codec::config::EncodePolicy;
 use crate::encode::hardware::vulkan::context::VulkanInstance;
 use crate::encode::hardware::vulkan::device::VideoDevice;
-use crate::encode::hardware::vulkan::frame_encoder::FrameEncoder;
-use crate::encode::hardware::vulkan::frame_encoder::{
-    make_noisy_frame, test_frame_encoder, test_session_config, test_session_config_with,
+use crate::encode::hardware::vulkan::encoder::VulkanEncoder;
+use crate::encode::hardware::vulkan::encoder::{
+    make_noisy_frame, test_session_config, test_session_config_with, test_vulkan_encoder,
 };
 use crate::encode::hardware::vulkan::session::VideoSession;
 use crate::encode::hardware::vulkan::{codec::caps, test_support};
@@ -449,7 +449,7 @@ fn test_vulkan_video_av1_encode_key() {
             return;
         }
     };
-    let mut encoder = match test_frame_encoder(&device, &caps, 15) {
+    let mut encoder = match test_vulkan_encoder(&device, &caps, 15) {
         Ok(encoder) => encoder,
         Err(e) => {
             println!("AV1 编码器初始化失败: {e}");
@@ -525,7 +525,7 @@ fn test_vulkan_video_av1_encode_key() {
     if let (Ok(h264_caps), Ok(h264_device)) = (
         caps::probe_codec(&ctx, VideoCodec::H264),
         VideoDevice::new(&ctx, VideoCodec::H264),
-    ) && let Ok(mut h264) = test_frame_encoder(&h264_device, &h264_caps, 15)
+    ) && let Ok(mut h264) = test_vulkan_encoder(&h264_device, &h264_caps, 15)
     {
         let h264_extent = h264.extent();
         let h264_key = match h264.encode_idr(&make_noisy_frame(h264_extent, 11)) {
@@ -652,7 +652,7 @@ fn test_vulkan_video_av1_static_sequence_stability() {
     let cycle = config.intra_refresh_cycle();
     let gop = config.gop_length();
     let coding = config.coding_control(60);
-    let mut encoder = match FrameEncoder::new(&device, config, coding) {
+    let mut encoder = match VulkanEncoder::new(&device, config, coding) {
         Ok(encoder) => encoder,
         Err(e) => {
             println!("AV1 编码器初始化失败: {e}");
