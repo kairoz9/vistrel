@@ -25,7 +25,7 @@
 //! **帧头的自引用已拆开**：`StdVideoEncodeH265PictureInfo::pRefLists` /
 //! `pShortTermRefPicSet` 若指向同一结构体的兄弟字段，就只能等结构体落位后再接，
 //! 「接完之后不能再移动」没有任何编译期保证。因此被指向的部分单独成
-//! [`HevcFrameParts`]，[`build`] 借用它并返回 `HevcFrameStd<'a>`：帧头活着期间，
+//! [`H265FrameParts`]，[`build`] 借用它并返回 `H265FrameStd<'a>`：帧头活着期间，
 //! `parts` 就被借走，移不动 —— 约束交给借用检查器。
 
 use std::marker::PhantomData;
@@ -43,19 +43,26 @@ use ash::vk::native::{
 };
 use ash::vk::{self, TaggedStructure};
 
-use super::{CodecRateControl, FrameEncoder, begin_scope, intra_refresh_info, picture_resource};
+#[cfg(test)]
 use crate::encode::VideoCodec;
+use crate::encode::hardware::vulkan::codec::CodecRateControl;
+use crate::encode::hardware::vulkan::codec::VideoSessionParameters;
 use crate::encode::hardware::vulkan::device::VideoDevice;
-use crate::encode::hardware::vulkan::session::{VideoSession, VideoSessionParameters};
+use crate::encode::hardware::vulkan::frame_encoder::{
+    FrameEncoder, begin_scope, intra_refresh_info, picture_resource,
+};
+use crate::encode::hardware::vulkan::session::VideoSession;
 
 #[cfg(test)]
-use super::{make_noisy_frame, test_frame_encoder, test_session_config};
-#[cfg(test)]
-use crate::encode::hardware::vulkan::config::{H265SequenceConfig, SequenceConfig};
+use crate::encode::hardware::vulkan::codec::{H265SequenceConfig, SequenceConfig};
 #[cfg(test)]
 use crate::encode::hardware::vulkan::context::VulkanInstance;
 #[cfg(test)]
-use crate::encode::hardware::vulkan::{caps, test_support};
+use crate::encode::hardware::vulkan::frame_encoder::{
+    make_noisy_frame, test_frame_encoder, test_session_config,
+};
+#[cfg(test)]
+use crate::encode::hardware::vulkan::{codec::caps, test_support};
 
 /// CBR 的 QP 地板：只约束「画质过好」的一侧，不参与码率上限。
 /// 最终取值会钳进驱动声明的 `minQp..maxQp`（`FrameEncoder::qp_range`）。
@@ -78,7 +85,7 @@ const TILE_ROWS_LIST_SIZE: usize = 21;
 /// 一组参数集
 ///
 /// 内含指向 `dpb` / `ptl` / `vui` 的裸指针，见模块文档的生命周期约束。
-pub struct HevcParameterSets {
+pub struct H265ParameterSets {
     pub vps: StdVideoH265VideoParameterSet,
     pub sps: StdVideoH265SequenceParameterSet,
     pub pps: StdVideoH265PictureParameterSet,
@@ -145,7 +152,9 @@ pub fn vui() -> StdVideoH265SequenceParameterSetVui {
 /// std 字段是枚举（0 = 1.0 … 12 = 6.2），不是语法元素；直接填 123 这类值会被驱动
 /// 当成越界枚举序列化。未知值必须报错——调用方还要拿它和驱动上限比较。
 /// `pub(super)`：`SessionConfig::build` 的 level 门禁复用同一映射。
-pub(super) fn level_enum(general_level_idc: u32) -> Result<u32, String> {
+pub(in crate::encode::hardware::vulkan) fn level_enum(
+    general_level_idc: u32,
+) -> Result<u32, String> {
     match general_level_idc {
         30 => Ok(0),   // 1.0
         60 => Ok(1),   // 2.0
@@ -184,7 +193,7 @@ pub fn profile_tier_level(general_level_idc: u32) -> Result<StdVideoH265ProfileT
 
 /// 构造 VPS / SPS / PPS
 ///
-/// `frame_num_bits` 是 `log2(MaxPocLsb)`，由 GOP 长度决定（HEVC 的 SPS 里不再有 frame_num，
+/// `frame_num_bits` 是 `log2(MaxPocLsb)`，由 GOP 长度决定（H.265 的 SPS 里不再有 frame_num，
 /// 只有 POC LSB 的位宽）。上限 12 与 H.264 一致：`log2_max_pic_order_cnt_lsb_minus4`
 /// 语法元素本身允许 0..=12，但 16 位 POC LSB 在解码器侧兼容性无保证。
 ///
@@ -196,7 +205,7 @@ pub fn parameter_sets(
     dpb: &StdVideoH265DecPicBufMgr,
     ptl: &StdVideoH265ProfileTierLevel,
     vui: &StdVideoH265SequenceParameterSetVui,
-) -> HevcParameterSets {
+) -> H265ParameterSets {
     let bits = frame_num_bits.clamp(4, 12) as u8;
 
     // ---- VPS ----
@@ -226,7 +235,7 @@ pub fn parameter_sets(
     sps_flags.set_sps_temporal_id_nesting_flag(1);
     // VUI 声明 BT.709 + Limited；没有它解码器只能按默认色域猜
     sps_flags.set_vui_parameters_present_flag(1);
-    // 裁剪窗口：编码尺寸按 16 对齐后可能大于显示尺寸（1080 → 1088）。HEVC 的 conf_win
+    // 裁剪窗口：编码尺寸按 16 对齐后可能大于显示尺寸（1080 → 1088）。H.265 的 conf_win
     // 偏移以 4:2:0 的色度样本为单位（SubWidthC / SubHeightC = 2），所以是差值的一半；
     // 只裁右侧与底部，左上角保持原点
     let crop_x = extent.width.saturating_sub(display.width) / 2;
@@ -327,7 +336,7 @@ pub fn parameter_sets(
         pPredictorPaletteEntries: std::ptr::null(),
     };
 
-    HevcParameterSets { vps, sps, pps }
+    H265ParameterSets { vps, sps, pps }
 }
 
 // ---- 每帧参数 ----
@@ -342,21 +351,21 @@ const SLICE_TYPE_P: u32 = 1;
 const SLICE_TYPE_I: u32 = 2;
 /// `STD_VIDEO_H265_MAX_NUM_LIST_REF`（15）里表示「空位」的取值
 const NO_REFERENCE: u8 = 0xFF;
-/// 合并候选上限（HEVC 规范允许 1..=5）
+/// 合并候选上限（H.265 规范允许 1..=5）
 const MAX_NUM_MERGE_CAND: u8 = 5;
 
 /// `pic_info` 指向的两个子结构
 ///
 /// 先让它落到最终位置，再交给 [`build`]。`build` 的返回值借用它，因此在帧头存活期间
 /// 它既不能移动也不能改。
-pub struct HevcFrameParts {
+pub struct H265FrameParts {
     pub ref_lists: StdVideoEncodeH265ReferenceListsInfo,
     /// P 帧的显式短参考集（SPS 里 `num_short_term_ref_pic_sets = 0`，
     /// 所以 slice 头必须自带一份，否则驱动拿到空指针）
     pub st_ref_pic_set: StdVideoH265ShortTermRefPicSet,
 }
 
-impl HevcFrameParts {
+impl H265FrameParts {
     /// `ref_slot` 是 P 帧要引用的 DPB 槽索引；IDR 传 `None`
     pub fn new(ref_slot: Option<u8>) -> Self {
         // SAFETY: `StdVideoEncodeH265ReferenceListsInfoFlags` 是 `#[repr(C)]` 纯位域
@@ -397,15 +406,15 @@ impl HevcFrameParts {
 
 /// 一帧的 H.265 帧头结构
 ///
-/// `pic_info` 的两个指针指向 [`HevcFrameParts`]；`_marker` 以 `PhantomData`
+/// `pic_info` 的两个指针指向 [`H265FrameParts`]；`_marker` 以 `PhantomData`
 /// 把 `'a` 绑在 `pic_info` 上 —— 帧头活着期间，被指向的数据移不动、改不了。
-pub struct HevcFrameStd<'a> {
+pub struct H265FrameStd<'a> {
     pub pic_info: StdVideoEncodeH265PictureInfo,
     pub slice_header: StdVideoEncodeH265SliceSegmentHeader,
     /// 本帧作为参考帧写进 DPB 槽时用的信息
     pub ref_info: StdVideoEncodeH265ReferenceInfo,
     /// 借用锚，不参与编码：见结构体文档
-    _marker: PhantomData<&'a HevcFrameParts>,
+    _marker: PhantomData<&'a H265FrameParts>,
 }
 
 /// 构造一帧的帧头结构
@@ -413,7 +422,7 @@ pub struct HevcFrameStd<'a> {
 /// `poc` 是 `PicOrderCntVal`（本实现里等于 `frame_num`）。
 /// IDR 是全帧内：没有参考列表，也不需要短参考集，两个指针保持 null ——
 /// 此时 `parts` 照样传进来，只是不被引用。
-pub fn build<'a>(parts: &'a HevcFrameParts, is_idr: bool, poc: i32) -> HevcFrameStd<'a> {
+pub fn build<'a>(parts: &'a H265FrameParts, is_idr: bool, poc: i32) -> H265FrameStd<'a> {
     // SAFETY: `StdVideoEncodeH265*Flags` 都是 `#[repr(C)]` 纯位域 POD，
     // bindgen 不派生 `Default`；全零位模式合法，随后由 setter 逐位打开
     let mut pic_flags = unsafe { std::mem::zeroed::<StdVideoEncodeH265PictureInfoFlags>() };
@@ -492,7 +501,7 @@ pub fn build<'a>(parts: &'a HevcFrameParts, is_idr: bool, poc: i32) -> HevcFrame
         TemporalId: 0,
     };
 
-    HevcFrameStd {
+    H265FrameStd {
         pic_info,
         slice_header,
         ref_info,
@@ -612,7 +621,7 @@ impl VideoSessionParameters {
 
 impl FrameEncoder {
     /// H.265 一帧：构造 std 结构、DPB 槽与码控，然后走公共提交
-    pub(super) fn encode_prepared_h265(
+    pub(in crate::encode::hardware::vulkan) fn encode_prepared_h265(
         &mut self,
         force_idr: bool,
     ) -> Result<(Vec<u8>, bool), String> {
@@ -624,7 +633,7 @@ impl FrameEncoder {
         let extent = self.image.extent();
 
         // std 结构：先让被指向的子结构落位，再构造帧头（借用约束见模块文档）
-        let parts = HevcFrameParts::new(if is_idr { None } else { Some(ref_idx as u8) });
+        let parts = H265FrameParts::new(if is_idr { None } else { Some(ref_idx as u8) });
         let frame = build(&parts, is_idr, poc);
 
         // CBR 下 constantQp 必须为 0（VUID-vkCmdEncodeVideoKHR-constantQp-08272），
@@ -647,7 +656,7 @@ impl FrameEncoder {
 
         // 参考槽（仅 P 帧用）：指向上一帧所在的 DPB 槽。类型取上一帧自己的
         let prev_frame_num = frame_num.saturating_sub(1);
-        let ref_ref_info = reference_info(prev_frame_num as i32, self.last_was_idr);
+        let ref_ref_info = reference_info(prev_frame_num as i32, self.codec_state.last_was_idr());
         let mut ref_dpb =
             vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&ref_ref_info);
         let ref_resource = picture_resource(self.dpb.view(), extent, ref_idx as u32);
@@ -677,7 +686,7 @@ impl FrameEncoder {
 
         // CBR 码控：H.265 同样必须给出 QP 范围与 GOP 结构，缺了驱动判非法。
         // 地板取 `MIN_QP_H265`，再钳进驱动声明的 `minQp..maxQp`
-        let (min_qp_value, max_qp_value) = self.qp_range(MIN_QP_H265);
+        let (min_qp_value, max_qp_value) = self.coding().qp_range(MIN_QP_H265);
         let min_qp = vk::VideoEncodeH265QpKHR::default()
             .qp_i(min_qp_value)
             .qp_p(min_qp_value)
@@ -710,7 +719,7 @@ impl FrameEncoder {
             .sub_layer_count(1);
         let scope = begin_scope(if is_idr { None } else { Some(&ref_slots[0]) }, &setup_slot);
         // 驱动要求/偏好时，把本帧在 GOP 内的剩余 I/P 帧数一并交给码控
-        let gop_remaining = self.gop_remaining(VideoCodec::H265, frame_num, is_idr);
+        let gop_remaining = self.gop_remaining(frame_num, is_idr);
         let bytes_written = self.submit_encode(
             &encode_info,
             &scope,
@@ -830,7 +839,7 @@ mod tests {
     /// IDR：IRAP 标志置位、I slice、无参考列表
     #[test]
     fn test_idr_frame_std() {
-        let parts = HevcFrameParts::new(None);
+        let parts = H265FrameParts::new(None);
         let frame = build(&parts, true, 0);
         assert_eq!(frame.pic_info.pic_type, PICTURE_TYPE_IDR);
         assert_eq!(frame.pic_info.flags.IrapPicFlag(), 1, "IDR 必须是 IRAP");
@@ -857,7 +866,7 @@ mod tests {
     /// P 帧：非 IRAP、P slice、参考列表第一项指向给定槽位
     #[test]
     fn test_p_frame_std() {
-        let parts = HevcFrameParts::new(Some(1));
+        let parts = H265FrameParts::new(Some(1));
         let frame = build(&parts, false, 7);
         assert_eq!(frame.pic_info.pic_type, PICTURE_TYPE_P);
         assert_eq!(frame.pic_info.flags.IrapPicFlag(), 0, "P 帧不是 IRAP");
@@ -888,7 +897,7 @@ mod tests {
     /// 两个指针都要真的指向传进来的 `parts`
     #[test]
     fn test_pointers_target_parts() {
-        let parts = HevcFrameParts::new(Some(0));
+        let parts = H265FrameParts::new(Some(0));
         let frame = build(&parts, false, 3);
 
         assert_eq!(
@@ -942,7 +951,7 @@ mod tests {
             }
         };
         // 与生产路径同源：按内容推导 level，而不是驱动声明的最高 level
-        let level = u32::from(crate::encode::hevc_level_idc(1920, 1080, 60, 8_000));
+        let level = crate::encode::profile_level(VideoCodec::H265, 1920, 1080, 60, 8_000);
         let sequence = SequenceConfig::H265(H265SequenceConfig {
             level_idc: level,
             frame_num_bits: 9,

@@ -39,20 +39,27 @@ use ash::vk::native::{
 };
 use ash::vk::{self, TaggedStructure};
 
-use super::{CodecRateControl, FrameEncoder, begin_scope, intra_refresh_info, picture_resource};
+#[cfg(test)]
 use crate::encode::VideoCodec;
-use crate::encode::hardware::vulkan::config::Av1SequenceConfig;
+use crate::encode::hardware::vulkan::codec::Av1SequenceConfig;
+use crate::encode::hardware::vulkan::codec::CodecRateControl;
+use crate::encode::hardware::vulkan::codec::VideoSessionParameters;
 use crate::encode::hardware::vulkan::device::VideoDevice;
-use crate::encode::hardware::vulkan::session::{VideoSession, VideoSessionParameters};
+use crate::encode::hardware::vulkan::frame_encoder::{
+    FrameEncoder, begin_scope, intra_refresh_info, picture_resource,
+};
+use crate::encode::hardware::vulkan::session::VideoSession;
 
 #[cfg(test)]
-use super::{make_noisy_frame, test_frame_encoder, test_session_config, test_session_config_with};
-#[cfg(test)]
-use crate::encode::hardware::vulkan::config::EncodePolicy;
+use crate::encode::hardware::vulkan::codec::config::EncodePolicy;
 #[cfg(test)]
 use crate::encode::hardware::vulkan::context::VulkanInstance;
 #[cfg(test)]
-use crate::encode::hardware::vulkan::{caps, test_support};
+use crate::encode::hardware::vulkan::frame_encoder::{
+    make_noisy_frame, test_frame_encoder, test_session_config, test_session_config_with,
+};
+#[cfg(test)]
+use crate::encode::hardware::vulkan::{codec::caps, test_support};
 
 /// `STD_VIDEO_AV1_REFS_PER_FRAME`
 const AV1_REFS_PER_FRAME: usize = 7;
@@ -570,7 +577,7 @@ impl FrameEncoder {
     ///    `pReferenceSlots` 索引物理 DPB 槽。本实现让两套编号**完全一致**（VBI 槽号 == DPB 槽号），
     ///    理由见 `build` 的文档。
     /// 3. **没有 frame_num 位宽**：序列头由驱动生成，参考管理靠 VBI 槽掩码而不是帧号回绕。
-    pub(super) fn encode_prepared_av1(
+    pub(in crate::encode::hardware::vulkan) fn encode_prepared_av1(
         &mut self,
         force_idr: bool,
     ) -> Result<(Vec<u8>, bool), String> {
@@ -587,7 +594,8 @@ impl FrameEncoder {
         // render_size 传**显示尺寸**：AV1 没有 cropping 语法，这是它唯一能表达「显示区域」
         // 的字段；画面本身按编码尺寸编码（补齐边在采集侧就已就位）。1080p 下差 8 行 =
         // 0.7%，且硬件解码器对「render 小于 frame」的支持并无保证，所以只作声明、不改
-        // 编码几何。H.264 / HEVC 用裁剪窗口达到同样效果，见 `h264.rs` / `hevc.rs`。
+        // 编码几何。H.264 / H.265 用裁剪窗口达到同样效果，见 `codec/h264/encoder.rs` /
+        // `codec/h265/encoder.rs`。
         let frame = build(
             &parts,
             is_key,
@@ -595,7 +603,7 @@ impl FrameEncoder {
             setup_idx as u8,
             ref_idx as u8,
             extent,
-            self.display,
+            self.display_extent(),
         );
 
         // 参考名 → DPB 槽的映射。
@@ -682,7 +690,7 @@ impl FrameEncoder {
         // CBR 码控：量化索引范围来自能力查询。CBR 下驱动自己算量化步长，缺省范围
         // 会让算出的 Q 越界（INVALID_VIDEO_STD_PARAMETERS）；地板还不能超过
         // `maxQIndex`（VUID 10300 / 10304）。
-        let (min_q_index, max_q_index) = self.q_index_range();
+        let (min_q_index, max_q_index) = self.coding().q_index_range();
         let max_q_index = max_q_index.max(min_q_index);
         let floor = min_q_index.max(MIN_Q_INDEX_AV1).min(max_q_index);
         let min_q = vk::VideoEncodeAV1QIndexKHR::default()
@@ -729,7 +737,7 @@ impl FrameEncoder {
             .temporal_layer_count(1);
         let scope = begin_scope(if is_key { None } else { Some(&ref_slots[0]) }, &setup_slot);
         // 驱动要求/偏好时，把本帧在 GOP 内的剩余 Intra/Predictive 帧数交给码控
-        let gop_remaining = self.gop_remaining(VideoCodec::Av1, frame_num, is_key);
+        let gop_remaining = self.gop_remaining(frame_num, is_key);
         let bytes_written = self.submit_encode(
             &encode_info,
             &scope,

@@ -474,7 +474,7 @@ fn import_semaphore(
 mod tests {
     use super::*;
     use crate::encode::VideoCodec;
-    use crate::encode::hardware::vulkan::caps;
+    use crate::encode::hardware::vulkan::codec::caps;
     use crate::encode::hardware::vulkan::context::VulkanInstance;
 
     fn descriptor(mem_handle: i64, sem_handle: i64) -> VramSlotDescriptor {

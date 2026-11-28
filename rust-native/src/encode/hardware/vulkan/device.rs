@@ -14,7 +14,7 @@ use std::sync::Arc;
 // `push` 是 `TaggedStructure` trait 的方法，不导入就无法链 pNext
 use ash::vk::{self, TaggedStructure};
 
-use super::caps::{codec_encode_extension, codec_encode_operation};
+use super::codec::{DeviceFeatures, codec_encode_extension, codec_encode_operation};
 use super::context::VulkanInstance;
 use crate::encode::VideoCodec;
 
@@ -278,16 +278,8 @@ impl VideoDevice {
         let mut vk12_features = vk::PhysicalDeviceVulkan12Features::default();
         let mut vk13_features = vk::PhysicalDeviceVulkan13Features::default();
         let mut intra_features = vk::PhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR::default();
-        // **AV1 编码的 device feature 位。**
-        //
-        // 只声明 `videoCodecOperation = ENCODE_AV1` 而不开 `videoEncodeAV1`，驱动对这条
-        // 路径的行为是**未定义的**（VUID-VkVideoSessionCreateInfoKHR-pVideoProfile-10269，
-        // 以及 VkBufferCreateInfo / VkImageCreateInfo / VkQueryPoolCreateInfo 上同族三条）。
-        //
-        // **只处理 AV1**：H.264 / H.265 实测在缺该位时可用，而它们的 feature 结构体在本
-        // ash rev 里没有生成（1.3 核心化后的命名与 1.4 的 `...AV1FeaturesKHR` 不一致），
-        // 先把坏的那条修好，不顺手动能跑的两条。
-        let mut av1_features = vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR::default();
+        // codec 专属 feature（目前只有 AV1 需要显式开启），查询与启用都封装在 codec 模块
+        let mut codec_features = DeviceFeatures::new(codec);
         // 扩展没声明就绝不去查它的 feature 结构体：未支持的扩展在 pNext 里属于未知 sType
         let probe_intra = extensions.contains(&INTRA_REFRESH_EXTENSION);
         {
@@ -298,10 +290,7 @@ impl VideoDevice {
             if probe_intra {
                 features2 = features2.push(&mut intra_features);
             }
-            // 只对 AV1 查：其它 codec 的 feature 结构体不链（见上）
-            if matches!(codec, VideoCodec::Av1) {
-                features2 = features2.push(&mut av1_features);
-            }
+            features2 = codec_features.push_query(features2);
             // SAFETY: 纯查询，features2 及其 pNext 链在调用期间存活
             unsafe {
                 instance
@@ -328,19 +317,8 @@ impl VideoDevice {
             intra_features.video_encode_intra_refresh = vk::TRUE;
         }
 
-        // 驱动声明支持才启用
-        let av1_supported =
-            matches!(codec, VideoCodec::Av1) && av1_features.video_encode_av1 == vk::TRUE;
-        if matches!(codec, VideoCodec::Av1) && !av1_supported {
-            // 不 fail-closed：让上层看到这条 warn 后自行决定是否降级到 NVENC。
-            // 但必须说出来 —— 静默继续就是「已知的未知行为」。
-            log::warn!("设备未声明 AV1 编码 feature 位，Vulkan AV1 编码行为未定义");
-        }
-        // 查询会把结构体填成驱动实际支持，清零后只开需要的那一位
-        av1_features = vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR::default();
-        if av1_supported {
-            av1_features.video_encode_av1 = vk::TRUE;
-        }
+        // 驱动声明支持才启用；缺失时只告警，由上层决定是否降级
+        codec_features.finish();
 
         // 3. 每个用到的队列族各取一条队列
         let mut families = vec![video_family];
@@ -380,12 +358,10 @@ impl VideoDevice {
         if intra_refresh_supported {
             create_info = create_info.push(&mut intra_features);
         }
-        // AV1 编码 feature 位：不链进去 = 没启用，会话 / 图像 / 缓冲 / 查询池全会被判非法
-        // （VUID 10248 / 10249 / 10250 / 10269）。
-        // SAFETY: av1_features 声明在 create_info 之前，生命周期覆盖 create_device
-        if av1_supported {
-            create_info = create_info.push(&mut av1_features);
-        }
+        // codec 专属 feature 位：不链进去 = 没启用，会话 / 图像 / 缓冲 / 查询池全会被判非法
+        // （AV1 为 VUID 10248 / 10249 / 10250 / 10269）。
+        // SAFETY: codec_features 声明在 create_info 之前，生命周期覆盖 create_device
+        create_info = codec_features.push_enable(create_info);
 
         // SAFETY: queue_infos / ext_ptrs 及其引用的 CString 在调用期间均存活；
         // 出参 device 交由 DeviceInner 持有并在其 Drop 中销毁一次

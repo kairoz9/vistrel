@@ -12,7 +12,7 @@
 //! **帧头的自引用已拆开**：`StdVideoEncodeH264PictureInfo::pRefLists` 指向兄弟结构
 //! `ReferenceListsInfo`。被指向的部分单独成 [`H264FrameParts`]，[`build`] 借用它并返回
 //! `H264FrameStd<'a>`——帧头活着期间 `parts` 被借走、移不动，约束交给借用检查器
-//! （与 hevc / av1 同一套模式）。
+//! （与 h265 / av1 同一套模式）。
 
 use std::marker::PhantomData;
 
@@ -25,27 +25,36 @@ use ash::vk::native::{
 };
 use ash::vk::{self, TaggedStructure};
 
-use super::{CodecRateControl, FrameEncoder, begin_scope, intra_refresh_info, picture_resource};
+#[cfg(test)]
 use crate::encode::VideoCodec;
+use crate::encode::hardware::vulkan::codec::CodecRateControl;
+use crate::encode::hardware::vulkan::codec::VideoSessionParameters;
 use crate::encode::hardware::vulkan::device::VideoDevice;
-use crate::encode::hardware::vulkan::session::{VideoSession, VideoSessionParameters};
+use crate::encode::hardware::vulkan::frame_encoder::{
+    FrameEncoder, begin_scope, intra_refresh_info, picture_resource,
+};
+use crate::encode::hardware::vulkan::session::VideoSession;
 
 /// CBR 的 QP 地板：只约束「画质过好」的一侧，不参与码率上限。
 /// H.264 的 QP 范围是标准固定值 0..51
 const MIN_QP_H264: i32 = 18;
 
 #[cfg(test)]
-use super::test_session_config_with;
-#[cfg(test)]
-use super::{make_noisy_frame, test_frame_encoder, test_profile, test_session_config};
-#[cfg(test)]
-use crate::encode::hardware::vulkan::config::{
-    EncodePolicy, GopPolicy, H264SequenceConfig, IntraRefreshPolicy, SequenceConfig, SessionConfig,
+use crate::encode::hardware::vulkan::codec::config::{
+    EncodePolicy, GopPolicy, IntraRefreshPolicy, SessionConfig,
 };
+#[cfg(test)]
+use crate::encode::hardware::vulkan::codec::{H264SequenceConfig, SequenceConfig};
 #[cfg(test)]
 use crate::encode::hardware::vulkan::context::VulkanInstance;
 #[cfg(test)]
-use crate::encode::hardware::vulkan::{caps, test_support};
+use crate::encode::hardware::vulkan::frame_encoder::test_session_config_with;
+#[cfg(test)]
+use crate::encode::hardware::vulkan::frame_encoder::{
+    make_noisy_frame, test_frame_encoder, test_profile, test_session_config,
+};
+#[cfg(test)]
+use crate::encode::hardware::vulkan::{codec::caps, test_support};
 
 // ---- 会话级：SPS / PPS / VUI ----
 
@@ -62,7 +71,7 @@ const MAX_NUM_REF_FRAMES: u8 = 1;
 ///
 /// 两者数值域不同（语法 4.2 = 42，枚举 4.2 = 12）；直接填语法值会被驱动按越界
 /// 枚举序列化。SDP 的 `profile-level-id` 仍用语法值，转换只发生在 std 边界。
-pub(super) fn level_to_vk(raw: u32) -> Result<u32, String> {
+pub(in crate::encode::hardware::vulkan) fn level_to_vk(raw: u32) -> Result<u32, String> {
     match raw {
         10 => Ok(0),
         11 => Ok(1),
@@ -154,7 +163,7 @@ pub(super) fn sps(
     vui: &StdVideoH264SequenceParameterSetVui,
 ) -> StdVideoH264SequenceParameterSet {
     // 位宽上限 12：`log2_max_frame_num_minus4` 语法元素取值 0..=12 虽允许 16 位，
-    // 但 16 位 `frame_num` 在解码器侧兼容性差，见 `frame_encoder::frame_num_bits`
+    // 但 16 位 `frame_num` 在解码器侧兼容性差，见 `codec::sequence::frame_num_bits`
     let bits = frame_num_bits.clamp(4, 12);
     // SAFETY: `StdVideoH264SpsFlags` 是 `#[repr(C)]` 的纯位域 POD，bindgen 不派生
     // `Default`；全零位模式合法（所有标志位为 0），随后由 setter 逐位打开需要的项
@@ -475,7 +484,7 @@ impl VideoSessionParameters {
 
 impl FrameEncoder {
     /// H.264 一帧
-    pub(super) fn encode_prepared_h264(
+    pub(in crate::encode::hardware::vulkan) fn encode_prepared_h264(
         &mut self,
         force_idr: bool,
     ) -> Result<(Vec<u8>, bool), String> {
@@ -484,12 +493,9 @@ impl FrameEncoder {
         let setup_idx = self.next_slot;
         let ref_idx = 1 - setup_idx;
         let frame_num = if is_idr { 0 } else { self.frame_num };
-        // 相邻 IDR 的 `idr_pic_id` 必须不同（H.264 7.4.3）。固定为 0 时第二个及之后的
-        // IDR 会被解码器当成重复帧丢弃，于是「该恢复的时候恢复不了」——这是花屏
-        // 长期不消失的直接原因，与 GOP 取多大无关
+        // P 帧不携带 `idr_pic_id`；只有 IDR 推进交替值
         let idr_pic_id = if is_idr {
-            self.idr_pic_id ^= 1;
-            self.idr_pic_id
+            self.codec_state.next_h264_idr_pic_id()
         } else {
             0
         };
@@ -522,7 +528,7 @@ impl FrameEncoder {
 
         // 参考槽（仅 P 帧用）：指向上一帧写入的那个 DPB 槽。类型取上一帧自己的
         let prev_frame_num = frame_num.saturating_sub(1);
-        let ref_ref_info = reference_info(prev_frame_num, self.last_was_idr);
+        let ref_ref_info = reference_info(prev_frame_num, self.codec_state.last_was_idr());
         let mut ref_dpb =
             vk::VideoEncodeH264DpbSlotInfoKHR::default().std_reference_info(&ref_ref_info);
         let ref_resource = picture_resource(self.dpb.view(), extent, ref_idx as u32);
@@ -555,7 +561,7 @@ impl FrameEncoder {
         // CBR 码控：首帧带 RESET 建立初始状态，之后只在码率变更时重发
         // CBR 下驱动要自己算 QP，缺省 0..0 会越界（INVALID_VIDEO_STD_PARAMETERS）；
         // 地板取 `MIN_QP_H264`，再钳进驱动的 `minQp..maxQp`。
-        let (min_qp_value, max_qp_value) = self.qp_range(MIN_QP_H264);
+        let (min_qp_value, max_qp_value) = self.coding().qp_range(MIN_QP_H264);
         let min_qp = vk::VideoEncodeH264QpKHR::default()
             .qp_i(min_qp_value)
             .qp_p(min_qp_value)
@@ -590,7 +596,7 @@ impl FrameEncoder {
             .temporal_layer_count(1);
         let scope = begin_scope(if is_idr { None } else { Some(&ref_slots[0]) }, &setup_slot);
         // 驱动要求/偏好时，把本帧在 GOP 内的剩余 I/P 帧数一并交给码控
-        let gop_remaining = self.gop_remaining(VideoCodec::H264, frame_num, is_idr);
+        let gop_remaining = self.gop_remaining(frame_num, is_idr);
         let bytes_written = self.submit_encode(
             &encode_info,
             &scope,
@@ -992,7 +998,7 @@ mod tests {
                 return;
             }
         };
-        if let crate::encode::hardware::vulkan::caps::CodecSpecific::H264(specific) =
+        if let crate::encode::hardware::vulkan::codec::CodecSpecific::H264(specific) =
             &mut caps.specific
         {
             specific.prefers_gop_remaining_frames = true;

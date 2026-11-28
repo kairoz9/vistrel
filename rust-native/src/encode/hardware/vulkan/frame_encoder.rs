@@ -3,35 +3,35 @@
 //! 把「一条编码命令」需要的全部东西装在一起：码流缓冲、feedback 查询池、命令缓冲，
 //! 以及 begin/encode/end 三条视频命令。
 //!
-//! 三个 codec 的「std 结构 + 会话参数装配 + 编码命令装配」各自收在子模块
-//! `h264` / `hevc` / `av1`；本模块持有全部 codec 共享的机器（结构体、构造、公开入口、
-//! 逐帧状态与码控、分派），一帧的执行管线在 [`execute`]。
+//! 三个 codec 的「std 结构 + 会话参数装配 + 编码命令装配」各自收在 `codec/` 下的
+//! `h264` / `h265` / `av1`；本模块持有 codec 共享的机器（结构体、构造、公开入口、
+//! 提交管线），一帧的执行管线在 [`execute`]。
 //!
 //! 码流缓冲是主机可见的：构造时映射一次，逐帧只做 memcpy 读取，省掉一次拷贝。
 
 // `push` 是 `TaggedStructure` trait 的方法，不导入就无法链 pNext
 use ash::vk::{self, TaggedStructure};
 
-use super::caps::{ProfilePart, base_profile};
-use super::config::{CodingControl, SessionConfig};
+use super::codec::CodecGopRemaining;
+use super::codec::VideoSessionParameters;
+use super::codec::config::SessionConfig;
+use super::codec::rate_control::CodingControl;
+use super::codec::{ProfilePart, base_profile};
 use super::csc::ColorConverter;
 use super::device::{HostBuffer, VideoDevice};
 use super::image::{DpbImages, Nv12Image};
-use super::session::{VideoSession, VideoSessionParameters};
+use super::session::VideoSession;
 use super::vram_slot::VramSlot;
 use crate::encode::VideoCodec;
 
 #[cfg(test)]
-use super::caps::CodecCaps;
+use super::codec::caps::CodecCaps;
 #[cfg(test)]
-use super::config::{EncodePolicy, GopPolicy};
+use super::codec::config::{EncodePolicy, GopPolicy};
 #[cfg(test)]
 use crate::encode::StreamingProfile;
 
-mod av1;
 mod execute;
-mod h264;
-mod hevc;
 
 #[cfg(test)]
 use self::execute::TS_COUNT;
@@ -40,7 +40,7 @@ use self::execute::TS_COUNT;
 ///
 /// `base_array_layer` 是 DPB 槽位在数组图里的层号；输入图是单层图，传 0。
 /// 只填句柄与尺寸，不借用任何外部数据，因此生命周期可以取 `'static`
-fn picture_resource(
+pub(in crate::encode::hardware::vulkan) fn picture_resource(
     view: vk::ImageView,
     extent: vk::Extent2D,
     base_array_layer: u32,
@@ -52,20 +52,12 @@ fn picture_resource(
         .image_view_binding(view)
 }
 
-/// 让一个 GOP 内的 `frame_num` 不重复所需的最小位宽（`log2(MaxFrameNum)`）
-pub(super) fn frame_num_bits(gop_length: u32) -> u32 {
-    let needed = gop_length.saturating_add(1).max(16);
-    // ceil_log2：needed 不是 2 的幂时也要装得下
-    let bits = 32 - needed.saturating_sub(1).leading_zeros();
-    bits.clamp(4, 12)
-}
-
 /// 本帧的 intra-refresh 参数；`None` 表示未启用
 ///
 /// KEY / IDR 帧全帧内，索引固定为 0；其余帧按周期推进（见 `finish_frame`）。
 /// 周期必须与建会话时选定的一致，否则驱动按它切分条带、我们按另一个周期推进，
 /// 会有区域永远轮不到刷新。
-fn intra_refresh_info<'a>(
+pub(in crate::encode::hardware::vulkan) fn intra_refresh_info<'a>(
     cycle: Option<u32>,
     index: u32,
 ) -> Option<vk::VideoEncodeIntraRefreshInfoKHR<'a>> {
@@ -91,7 +83,7 @@ fn intra_refresh_info<'a>(
 ///
 /// ash 的 `Extends` 只接受连续切片，「数组 + 有效长度」这个表示无法消灭；关进 `slots()`
 /// 之后，调用点不必再各自写一遍 `&scope.0[..scope.1]`。
-struct Scope<'a> {
+pub(in crate::encode::hardware::vulkan) struct Scope<'a> {
     storage: [vk::VideoReferenceSlotInfoKHR<'a>; 2],
     len: usize,
 }
@@ -102,7 +94,7 @@ impl<'a> Scope<'a> {
     }
 }
 
-fn begin_scope<'a>(
+pub(in crate::encode::hardware::vulkan) fn begin_scope<'a>(
     reference: Option<&vk::VideoReferenceSlotInfoKHR<'a>>,
     setup_slot: &vk::VideoReferenceSlotInfoKHR<'a>,
 ) -> Scope<'a> {
@@ -141,49 +133,40 @@ pub struct FrameEncoder {
     /// 必须先于 `session` 销毁：参数对象依赖会话存活
     params: VideoSessionParameters,
     session: VideoSession,
-    image: Nv12Image,
+    pub(in crate::encode::hardware::vulkan) image: Nv12Image,
     /// 本帧待录制的上传；`None` 表示直接复用图像现有内容
     pending_upload: Option<PendingUpload>,
     /// RGBA → NV12 的 GPU 转换器；设备不支持所需 storage image 格式时为 `Err`，
     /// 原因随之保留，供 NV12 主机帧与显存槽位两条路径报错
     csc: Result<ColorConverter, String>,
     /// 码流缓冲：主机可见 + 一致，构造时映射一次，逐帧直接 memcpy 读取
-    bitstream: HostBuffer,
+    pub(in crate::encode::hardware::vulkan) bitstream: HostBuffer,
     /// SPS + PPS 的 Annex-B 字节，IDR 时拼在码流最前面
     parameter_sets: Vec<u8>,
     /// DPB：一张多层数组图，槽位用数组层区分（当前帧写一层，参考另一层）
-    dpb: DpbImages,
+    pub(in crate::encode::hardware::vulkan) dpb: DpbImages,
     /// 下一帧写入哪个 DPB 槽
-    next_slot: usize,
+    pub(in crate::encode::hardware::vulkan) next_slot: usize,
     /// 已编码帧数（IDR 时归零）
-    frame_num: u32,
-    /// 下一个 IDR 要用的 `idr_pic_id`
-    ///
-    /// H.264 7.4.3 要求**相邻两个 IDR 的 `idr_pic_id` 必须不同**。固定为 0 会让解码器
-    /// 把第二个及之后的 IDR 当成「同一张图」丢掉。只有两个连续值需要互异，交替 0/1 就够。
-    idr_pic_id: u16,
-    /// 上一帧是否为 IDR
-    ///
-    /// 参考槽里装的是**上一帧**，它的 `primary_pic_type` 必须反映那一帧的实际类型。
-    /// 用当前帧的 `is_idr` 去填是错的：IDR 之后的第一帧参考的是 IDR，填成 P 会让驱动
-    /// 按 P 帧去管理这个参考槽（H.264 里 IDR 会清空 DPB 并重置 POC，与 P 帧行为不同）。
-    last_was_idr: bool,
+    pub(in crate::encode::hardware::vulkan) frame_num: u32,
+    /// codec 专属的逐帧状态
+    pub(in crate::encode::hardware::vulkan) codec_state: super::codec::CodecState,
     /// 运行期码控状态：当前码率/帧率、上次下发值、是否需要重发
     coding: CodingControl,
     /// GOP 长度（帧）：`frame_num` 到达它就强制重出 IDR，也是码控里的 `idrPeriod`
     ///
     /// intra-refresh 打开时取大值，靠渐进刷新代替周期性 IDR。
-    gop_length: u32,
+    pub(in crate::encode::hardware::vulkan) gop_length: u32,
     /// 驱动要求/偏好 begin 时给出 GOP 剩余帧数（`requires || prefers`）
-    gop_remaining_frames: bool,
+    pub(in crate::encode::hardware::vulkan) gop_remaining_frames: bool,
     /// 反馈查询是否包含 `HAS_OVERRIDES`（驱动支持时）
-    feedback_has_overrides: bool,
+    pub(in crate::encode::hardware::vulkan) feedback_has_overrides: bool,
     /// 是否已经报告过逐帧覆写，避免每帧刷日志
     overrides_seen: bool,
     /// 已启用的 intra-refresh 周期；`None` 表示关闭
-    intra_refresh_cycle: Option<u32>,
+    pub(in crate::encode::hardware::vulkan) intra_refresh_cycle: Option<u32>,
     /// 下一帧的 intra-refresh 索引，按周期循环
-    intra_refresh_index: u32,
+    pub(in crate::encode::hardware::vulkan) intra_refresh_index: u32,
     query_pool: vk::QueryPool,
     /// GPU 时间戳查询池；队列族不支持时间戳或非测试构建时为 `None`
     #[cfg(test)]
@@ -194,9 +177,6 @@ pub struct FrameEncoder {
     timeline_value: u64,
     /// 等待超时的永久毒化标记（毒化后的行为约束与拆构风险见 `execute` 模块文档）
     poisoned: bool,
-    /// 显示尺寸（=协商档位）：只用于 AV1 的 `render_size` 声明显示区域；
-    /// 主机帧本身按编码尺寸交付
-    display: vk::Extent2D,
     #[cfg(test)]
     last_timings: FrameProfileTimings,
 }
@@ -291,61 +271,6 @@ struct EncoderParts {
     timeline_sem: vk::Semaphore,
 }
 
-/// begin / coding control 的 pNext 上要挂的 codec 专属码控结构
-///
-/// **它是 `VkVideoEncodeRateControlInfoKHR` 的兄弟，不是子节点。** ash 的 `Extends`
-/// 实现由 vk.xml 的 pNext 合法列表生成，只为它生成了 `VideoBeginCodingInfoKHR` /
-/// `VideoCodingControlInfoKHR` 两个父类型。
-///
-/// 存**按值**的副本而不是 `&mut`：begin 与 coding control 两处都要挂它，而 ash 的 `push`
-/// 要 `&mut`；按值存一份就能各拷一份，避开同一结构被两处同时可变借用。三个变体类型不同，
-/// 只能用枚举统一。
-#[derive(Clone, Copy)]
-enum CodecRateControl<'a> {
-    H264(vk::VideoEncodeH264RateControlInfoKHR<'a>),
-    H265(vk::VideoEncodeH265RateControlInfoKHR<'a>),
-    Av1(vk::VideoEncodeAV1RateControlInfoKHR<'a>),
-}
-
-/// begin 时告诉码控「当前 GOP 还剩多少 I/P/B 帧」
-///
-/// `requiresGopRemainingFrames` 时必须在 begin 的 pNext 里带上（VUID 08256 / 10282），
-/// `prefersGopRemainingFrames` 时能让 CBR 分配更准。三个结构都是
-/// `VideoBeginCodingInfoKHR` 的直接扩展，与码控结构是兄弟。
-///
-/// 按值保存：三处 begin 各拷一份，避开同一结构被同时可变借用。
-#[derive(Clone, Copy)]
-enum CodecGopRemaining<'a> {
-    H264(vk::VideoEncodeH264GopRemainingFrameInfoKHR<'a>),
-    H265(vk::VideoEncodeH265GopRemainingFrameInfoKHR<'a>),
-    Av1(vk::VideoEncodeAV1GopRemainingFrameInfoKHR<'a>),
-}
-
-/// 本帧在 GOP 内的剩余帧数（含当前帧，IDR 为 0）
-///
-/// `gopRemainingI/P/B` 表示「执行本次编码前码控应假设 GOP 还剩多少帧」。本实现
-/// 是 IPPP：IDR 占 I，其余全是 P，B 恒 0；`frame_num` 在 IDR 上为 0，其余落在
-/// 1..=gop_length-1。
-fn gop_remaining_counts(gop_length: u32, frame_num: u32, is_key: bool) -> (u32, u32) {
-    let remaining_i = u32::from(is_key);
-    let remaining_p = gop_length
-        .saturating_sub(frame_num)
-        .saturating_sub(u32::from(is_key));
-    (remaining_i, remaining_p)
-}
-
-/// 把推导出的 level 换算成与 `CodecCaps::max_level` 相同的枚举域
-///
-/// H.264/H.265 的 std 字段是枚举，AV1 的 `maxLevel` 与 `seq_level_idx` 同域；
-/// 三个映射在这里收口，`SessionConfig::build` 不必按 codec 分支。
-pub(super) fn level_enum(codec: VideoCodec, level: u32) -> Result<u32, String> {
-    match codec {
-        VideoCodec::H264 => h264::level_to_vk(level),
-        VideoCodec::H265 => hevc::level_enum(level),
-        VideoCodec::Av1 => Ok(level),
-    }
-}
-
 impl FrameEncoder {
     /// 按静态会话配置建会话、参数对象、输入图、DPB 与码流缓冲，并接管运行期码控。
     /// 能力钳制与 level 门禁已在 `SessionConfig::build` 完成，这里只做资源分配。
@@ -362,7 +287,6 @@ impl FrameEncoder {
         // 驱动只写 slice NAL，参数集要拼到 IDR 前面（字节由驱动序列化，见 session）
         let parameter_sets = params.parameter_sets().to_vec();
         let extent = session.coded_extent();
-        let display = session.display_extent();
         let image_extent = config.image_extent();
 
         // 码流缓冲、编码输入图、DPB 图**都必须声明所属视频 profile**，否则驱动不把它们
@@ -508,10 +432,7 @@ impl FrameEncoder {
             dpb,
             next_slot: 0,
             frame_num: 0,
-            // 首帧 IDR 会先 `^= 1` 变成 1，与「初始 0」也不同，两个方向都安全
-            idr_pic_id: 0,
-            // 首帧一定是 IDR，但它不挂参考槽，这个初值只会影响「首帧之后」的判断
-            last_was_idr: false,
+            codec_state: super::codec::CodecState::new(codec),
             coding,
             gop_length: config.gop_length(),
             gop_remaining_frames: config.gop_remaining_frames(),
@@ -527,7 +448,6 @@ impl FrameEncoder {
             timeline_sem: res.timeline_sem,
             timeline_value: 0,
             poisoned: false,
-            display,
             #[cfg(test)]
             last_timings: FrameProfileTimings::default(),
         })
@@ -537,56 +457,13 @@ impl FrameEncoder {
         self.image.extent()
     }
 
-    /// 把配置的 QP 地板钳进驱动声明的 `min_qp..=max_qp`，上限再夹到 H.26x 的 51
-    ///
-    /// 只由 H.264/H.265 路径调用：码控分派按 `self.codec` 走，AV1 不进这里。
-    /// 返回的 `(min, max)` 保证 `min <= max`；写死范围在窄范围驱动上会违反
-    /// `useMinQp` / `useMaxQp` 的 VUID。
-    fn qp_range(&self, floor: i32) -> (i32, i32) {
-        self.coding.qp_range(floor)
-    }
-
-    /// AV1 码控的量化索引范围；只由 AV1 路径调用
-    fn q_index_range(&self) -> (u32, u32) {
-        self.coding.q_index_range()
-    }
-
     /// 本帧要挂进 begin 的 GOP 剩余帧数结构；驱动既不强求也不偏好时返回 `None`
-    ///
-    /// 三个 codec 结构语义相同、只有类型不同，构造集中在这里。
-    fn gop_remaining<'a>(
+    pub(in crate::encode::hardware::vulkan) fn gop_remaining<'a>(
         &self,
-        codec: VideoCodec,
         frame_num: u32,
         is_key: bool,
     ) -> Option<CodecGopRemaining<'a>> {
-        if !self.gop_remaining_frames {
-            return None;
-        }
-        let (remaining_i, remaining_p) = gop_remaining_counts(self.gop_length, frame_num, is_key);
-        Some(match codec {
-            VideoCodec::H264 => CodecGopRemaining::H264(
-                vk::VideoEncodeH264GopRemainingFrameInfoKHR::default()
-                    .use_gop_remaining_frames(true)
-                    .gop_remaining_i(remaining_i)
-                    .gop_remaining_p(remaining_p)
-                    .gop_remaining_b(0),
-            ),
-            VideoCodec::H265 => CodecGopRemaining::H265(
-                vk::VideoEncodeH265GopRemainingFrameInfoKHR::default()
-                    .use_gop_remaining_frames(true)
-                    .gop_remaining_i(remaining_i)
-                    .gop_remaining_p(remaining_p)
-                    .gop_remaining_b(0),
-            ),
-            VideoCodec::Av1 => CodecGopRemaining::Av1(
-                vk::VideoEncodeAV1GopRemainingFrameInfoKHR::default()
-                    .use_gop_remaining_frames(true)
-                    .gop_remaining_intra(remaining_i)
-                    .gop_remaining_predictive(remaining_p)
-                    .gop_remaining_bipredictive(0),
-            ),
-        })
+        super::codec::gop_remaining(self, frame_num, is_key)
     }
 
     /// GPU 色彩转换是否可用
@@ -603,12 +480,26 @@ impl FrameEncoder {
     }
 
     /// 目标帧率（帧/秒）
-    fn fps(&self) -> u32 {
+    pub(in crate::encode::hardware::vulkan) fn codec(&self) -> VideoCodec {
+        self.codec
+    }
+
+    /// 运行期码控状态：码率/帧率、已下发快照与量化范围
+    pub(in crate::encode::hardware::vulkan) fn coding(&self) -> &CodingControl {
+        &self.coding
+    }
+
+    /// 显示尺寸（= 协商档位）；只有 AV1 序列头与显存槽位几何校验需要
+    pub(in crate::encode::hardware::vulkan) fn display_extent(&self) -> vk::Extent2D {
+        self.session.display_extent()
+    }
+
+    pub(in crate::encode::hardware::vulkan) fn fps(&self) -> u32 {
         self.coding.fps()
     }
 
     /// 目标码率（bps）
-    fn bitrate_bps(&self) -> u64 {
+    pub(in crate::encode::hardware::vulkan) fn bitrate_bps(&self) -> u64 {
         self.coding.bitrate_bps()
     }
 
@@ -710,10 +601,7 @@ impl FrameEncoder {
             width: slot.width,
             height: slot.height,
         };
-        let display = vk::Extent2D {
-            width: self.display.width,
-            height: self.display.height,
-        };
+        let display = self.session.display_extent();
         if slot_extent != extent && slot_extent != display {
             return Err(format!(
                 "槽位 {} 尺寸 {}x{} 既不是编码尺寸 {}x{} 也不是采集尺寸 {}x{}：\
@@ -747,11 +635,7 @@ impl FrameEncoder {
     ///
     /// 返回（NALU 数据, 是否关键帧）。码流长度由 feedback 查询给出，不靠猜。
     fn encode_prepared(&mut self, force_idr: bool) -> Result<(Vec<u8>, bool), String> {
-        match self.codec {
-            VideoCodec::H264 => self.encode_prepared_h264(force_idr),
-            VideoCodec::H265 => self.encode_prepared_h265(force_idr),
-            VideoCodec::Av1 => self.encode_prepared_av1(force_idr),
-        }
+        super::codec::encode_prepared(self, force_idr)
     }
 }
 
@@ -777,13 +661,13 @@ impl Drop for FrameEncoder {
 /// 测试档位：1080p60，显式 8 Mbps（绕开动态码率公式，让断言的输入确定）。
 /// codec 不在档位里，由各用例按能力快照单独构造会话配置
 #[cfg(test)]
-pub(super) fn test_profile() -> StreamingProfile {
+pub(in crate::encode::hardware::vulkan) fn test_profile() -> StreamingProfile {
     StreamingProfile::new(1920, 1080, 60, 8_000_000)
 }
 
 /// 测试用静态会话配置：策略可指定，档位固定为 [`test_profile`]
 #[cfg(test)]
-pub(super) fn test_session_config_with(
+pub(in crate::encode::hardware::vulkan) fn test_session_config_with(
     caps: &CodecCaps,
     policy: &EncodePolicy,
     device_supports_intra_refresh: bool,
@@ -793,12 +677,15 @@ pub(super) fn test_session_config_with(
 
 /// 测试用静态会话配置：固定 GOP，关闭 intra-refresh，保持断言按显式 GOP 进行
 #[cfg(test)]
-pub(super) fn test_session_config(caps: &CodecCaps, gop: u32) -> Result<SessionConfig, String> {
+pub(in crate::encode::hardware::vulkan) fn test_session_config(
+    caps: &CodecCaps,
+    gop: u32,
+) -> Result<SessionConfig, String> {
     test_session_config_with(
         caps,
         &EncodePolicy {
             gop: GopPolicy::Fixed(gop),
-            intra_refresh: super::config::IntraRefreshPolicy::Disable,
+            intra_refresh: super::codec::config::IntraRefreshPolicy::Disable,
             ..Default::default()
         },
         false,
@@ -807,7 +694,7 @@ pub(super) fn test_session_config(caps: &CodecCaps, gop: u32) -> Result<SessionC
 
 /// 测试用帧编码器：从静态配置派生默认码控
 #[cfg(test)]
-pub(super) fn test_frame_encoder(
+pub(in crate::encode::hardware::vulkan) fn test_frame_encoder(
     device: &VideoDevice,
     caps: &CodecCaps,
     gop: u32,
@@ -832,7 +719,10 @@ pub(super) fn test_frame_encoder(
 /// 而色块边界清晰，解出来偏色 / 串块 / 边界错位都能一眼判定。
 /// NV12 的 UV 是交错的 `U0 V0 U1 V1 ...`，一个 UV 对覆盖 2×2 像素。
 #[cfg(test)]
-pub(super) fn make_noisy_frame(extent: vk::Extent2D, seed: u32) -> Vec<u8> {
+pub(in crate::encode::hardware::vulkan) fn make_noisy_frame(
+    extent: vk::Extent2D,
+    seed: u32,
+) -> Vec<u8> {
     let w = extent.width as usize;
     let h = extent.height as usize;
     let pixels = w * h;
@@ -877,55 +767,4 @@ pub(super) fn make_noisy_frame(extent: vk::Extent2D, seed: u32) -> Vec<u8> {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 推导 level 必须换算到与 `CodecCaps::max_level` 相同的枚举域
-    #[test]
-    fn test_level_enum_domains() {
-        // H.264 语法值 42（4.2）在 std 里是枚举 12
-        assert_eq!(level_enum(VideoCodec::H264, 42), Ok(12));
-        // H.265 语法值 123（4.1 × 30）是枚举 6
-        assert_eq!(level_enum(VideoCodec::H265, 123), Ok(6));
-        // AV1 的 seq_level_idx 与 StdVideoAV1Level 同域
-        assert_eq!(level_enum(VideoCodec::Av1, 9), Ok(9));
-        assert!(
-            level_enum(VideoCodec::H264, 43).is_err(),
-            "非法语法值必须拒绝"
-        );
-    }
-
-    /// GOP 剩余帧数：含当前帧，IDR 占 I，其余全是 P，B 恒 0
-    #[test]
-    fn test_gop_remaining_counts() {
-        // 30 帧 GOP：IDR + 29 个 P
-        assert_eq!(gop_remaining_counts(30, 0, true), (1, 29));
-        assert_eq!(gop_remaining_counts(30, 1, false), (0, 29));
-        assert_eq!(gop_remaining_counts(30, 2, false), (0, 28));
-        assert_eq!(gop_remaining_counts(30, 29, false), (0, 1));
-        // 最短 GOP：IDR + 1 个 P
-        assert_eq!(gop_remaining_counts(2, 0, true), (1, 1));
-        assert_eq!(gop_remaining_counts(2, 1, false), (0, 1));
-    }
-
-    /// `frame_num` 位宽换算：装得下 `gop_length + 1` 个不重复值
-    ///
-    /// 这条不需要 GPU，纯算术，放在这里是因为它决定 SPS 的合法性——
-    /// 位宽算小了，参考链会在 GOP 中途断掉，而且不报错。
-    #[test]
-    fn test_frame_num_bits() {
-        assert_eq!(frame_num_bits(2), 4, "MaxFrameNum 至少 16");
-        assert_eq!(frame_num_bits(15), 4, "16 个值正好 4 位");
-        assert_eq!(frame_num_bits(16), 5, "17 个值需要 32");
-        assert_eq!(frame_num_bits(300), 9, "301 个值需要 512");
-        assert_eq!(frame_num_bits(4095), 12, "4096 个值正好 12 位");
-        // 12 位是上限：更长的 GOP 会截断到 12，`MaxFrameNum` 仍是 4096，
-        // 由 `is_idr` 的 `frame_num >= gop_length` 分支保证到点出 IDR
-        assert_eq!(frame_num_bits(65_535), 12, "超过 12 位一律截断");
-        assert_eq!(frame_num_bits(65_536), 12, "超出一位也截断到 12");
-        assert_eq!(frame_num_bits(u32::MAX), 12, "上限截断，不溢出");
-    }
 }

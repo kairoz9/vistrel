@@ -773,7 +773,7 @@ impl Drop for ColorConverter {
 mod tests {
     use super::*;
     use crate::encode::VideoCodec;
-    use crate::encode::hardware::vulkan::caps;
+    use crate::encode::hardware::vulkan::codec::caps;
     use crate::encode::hardware::vulkan::context::VulkanInstance;
     use crate::encode::hardware::vulkan::image::Nv12Image;
     use crate::encode::hardware::vulkan::rgba_to_nv12;

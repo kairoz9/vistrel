@@ -739,7 +739,7 @@ fn plane_copy_regions(extent: vk::Extent2D) -> [vk::BufferImageCopy; 2] {
 mod tests {
     use super::*;
     use crate::encode::VideoCodec;
-    use crate::encode::hardware::vulkan::caps;
+    use crate::encode::hardware::vulkan::codec::caps;
     use crate::encode::hardware::vulkan::context::VulkanInstance;
 
     /// NV12 整帧上传后原样读回，布局在 `VIDEO_ENCODE_SRC_KHR` 与 `TRANSFER_SRC` 之间往返

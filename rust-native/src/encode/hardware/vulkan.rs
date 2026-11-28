@@ -7,8 +7,7 @@
 //! 应用只填 `StdVideo*` 结构体 —— 驱动可以覆盖参数，只有它自己序列化出来的那份
 //! 才与它写出的 slice NAL 同源。
 
-pub(crate) mod caps;
-mod config;
+mod codec;
 pub(crate) mod context;
 mod csc;
 mod device;
@@ -33,11 +32,16 @@ use std::sync::Arc;
 use ash::vk;
 use bytes::Bytes;
 
-use caps::CodecCaps;
-use config::{EncodePolicy, SessionConfig};
+use codec::caps::CodecCaps;
+use codec::config::{EncodePolicy, SessionConfig};
 use context::VulkanInstance;
 use frame_encoder::FrameEncoder;
 use vram_slot::VramSlot;
+
+/// 探测单个 codec 的能力；供 `hardware` 汇总各后端时调用
+pub(crate) fn probe_codec(ctx: &VulkanInstance, codec: VideoCodec) -> Result<CodecCaps, String> {
+    codec::caps::probe_codec(ctx, codec)
+}
 
 /// 主机帧池的 Vulkan 块类型（`frame.rs` 经此引用，不开放整个 device 模块）
 pub(crate) use device::{HostBuffer, VideoDevice};
@@ -190,7 +194,7 @@ impl VulkanVideoBackend {
         // 1. instance → 能力快照 → 设备。顺序是硬性的：设备要按 codec 选队列族，
         //    会话要该 codec 的能力快照。
         let instance = VulkanInstance::new("Vistrel")?;
-        let caps: CodecCaps = caps::probe_codec(&instance, codec)?;
+        let caps: CodecCaps = codec::caps::probe_codec(&instance, codec)?;
         let device = VideoDevice::new(&instance, codec)?;
 
         // 2. 把能力、档位与策略煮成静态会话配置；intra-refresh 还需设备 feature 位，
