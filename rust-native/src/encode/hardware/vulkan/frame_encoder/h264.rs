@@ -553,16 +553,17 @@ impl FrameEncoder {
         }
 
         // CBR 码控：首帧带 RESET 建立初始状态，之后只在码率变更时重发
-        // CBR 下驱动要自己算 QP，必须给出合法的 QP 范围；缺省 0..0 会让算出的 QP 越界，
-        // 表现为 INVALID_VIDEO_STD_PARAMETERS。H.264 的 QP 范围是 0..51（标准固定值）
+        // CBR 下驱动要自己算 QP，缺省 0..0 会越界（INVALID_VIDEO_STD_PARAMETERS）；
+        // 地板取 `MIN_QP_H264`，再钳进驱动的 `minQp..maxQp`。
+        let (min_qp_value, max_qp_value) = self.qp_range(MIN_QP_H264);
         let min_qp = vk::VideoEncodeH264QpKHR::default()
-            .qp_i(MIN_QP_H264)
-            .qp_p(MIN_QP_H264)
-            .qp_b(MIN_QP_H264);
+            .qp_i(min_qp_value)
+            .qp_p(min_qp_value)
+            .qp_b(min_qp_value);
         let max_qp = vk::VideoEncodeH264QpKHR::default()
-            .qp_i(51)
-            .qp_p(51)
-            .qp_b(51);
+            .qp_i(max_qp_value)
+            .qp_p(max_qp_value)
+            .qp_b(max_qp_value);
         let mut h264_layer = vk::VideoEncodeH264RateControlLayerInfoKHR::default()
             .use_min_qp(true)
             .min_qp(min_qp)
@@ -579,6 +580,10 @@ impl FrameEncoder {
         // 它与 `VkVideoEncodeRateControlInfoKHR` 是**兄弟**，两者都直接挂在 begin 上
         // （ash 的 `Extends` 只允许这样挂，见 `CodecRateControl` 的说明）。
         let h264_rate_control = vk::VideoEncodeH264RateControlInfoKHR::default()
+            .flags(
+                vk::VideoEncodeH264RateControlFlagsKHR::REGULAR_GOP
+                    | vk::VideoEncodeH264RateControlFlagsKHR::REFERENCE_PATTERN_FLAT,
+            )
             .gop_frame_count(self.gop_length)
             .idr_period(self.gop_length)
             .consecutive_b_frame_count(0)

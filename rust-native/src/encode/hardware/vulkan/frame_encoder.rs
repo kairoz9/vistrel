@@ -170,9 +170,12 @@ pub struct FrameEncoder {
     ///
     /// intra-refresh 打开时取大值，靠渐进刷新代替周期性 IDR。
     gop_length: u32,
-    /// AV1 码控的量化索引上下限（来自 `CodecCaps`）；H.26x 用标准固定的 QP 范围，不读这里
+    /// AV1 码控的量化索引上下限（来自 `CodecCaps`）；H.26x 用 `min_qp` / `max_qp`
     min_q_index: u32,
     max_q_index: u32,
+    /// H.264/H.265 的 QP 范围（来自 `CodecCaps`）；AV1 不读
+    min_qp: i32,
+    max_qp: i32,
     /// 反馈查询是否包含 `HAS_OVERRIDES`（驱动支持时）
     feedback_has_overrides: bool,
     /// 是否已经报告过逐帧覆写，避免每帧刷日志
@@ -611,9 +614,11 @@ impl FrameEncoder {
             profile,
             max_bitrate: caps.max_bitrate,
             gop_length,
-            // AV1 的量化索引范围来自能力查询；H.26x 不读这两个字段
+            // AV1 的量化索引范围与 H.26x 的 QP 范围都来自能力查询
             min_q_index: caps.min_q_index,
             max_q_index: caps.max_q_index,
+            min_qp: caps.min_qp,
+            max_qp: caps.max_qp,
             feedback_has_overrides,
             overrides_seen: false,
             // 准入条件必须两条同时成立：能力查询说支持（模式非空、周期 >= 2）**且**
@@ -650,6 +655,18 @@ impl FrameEncoder {
 
     pub fn extent(&self) -> vk::Extent2D {
         self.image.extent()
+    }
+
+    /// 把配置的 QP 地板钳进驱动声明的 `min_qp..=max_qp`，上限再夹到 H.26x 的 51
+    ///
+    /// 返回的 `(min, max)` 保证 `min <= max`；写死范围在窄范围驱动上会违反
+    /// `useMinQp` / `useMaxQp` 的 VUID。
+    fn qp_range(&self, floor: i32) -> (i32, i32) {
+        let lo = self.min_qp.min(self.max_qp);
+        let hi = self.min_qp.max(self.max_qp);
+        let min = floor.clamp(lo, hi);
+        let max = 51.min(hi).max(min);
+        (min, max)
     }
 
     /// GPU 色彩转换是否可用

@@ -674,18 +674,19 @@ impl FrameEncoder {
             encode_info = encode_info.push(info);
         }
 
-        // CBR 码控：量化索引范围来自能力查询。
-        // H.264 那次缺 QP 范围导致驱动算出的 QP 越界、报 INVALID_VIDEO_STD_PARAMETERS，
-        // 这里提前给出范围而不是等驱动报错。
-        let floor = self.min_q_index.max(MIN_Q_INDEX_AV1);
+        // CBR 码控：量化索引范围来自能力查询。CBR 下驱动自己算量化步长，缺省范围
+        // 会让算出的 Q 越界（INVALID_VIDEO_STD_PARAMETERS）；地板还不能超过
+        // `maxQIndex`（VUID 10300 / 10304）。
+        let max_q_index = self.max_q_index.max(self.min_q_index);
+        let floor = self.min_q_index.max(MIN_Q_INDEX_AV1).min(max_q_index);
         let min_q = vk::VideoEncodeAV1QIndexKHR::default()
             .intra_q_index(floor)
             .predictive_q_index(floor)
             .bipredictive_q_index(floor);
         let max_q = vk::VideoEncodeAV1QIndexKHR::default()
-            .intra_q_index(self.max_q_index)
-            .predictive_q_index(self.max_q_index)
-            .bipredictive_q_index(self.max_q_index);
+            .intra_q_index(max_q_index)
+            .predictive_q_index(max_q_index)
+            .bipredictive_q_index(max_q_index);
         let mut av1_layer = vk::VideoEncodeAV1RateControlLayerInfoKHR::default()
             .use_min_q_index(true)
             .min_q_index(min_q)

@@ -57,7 +57,7 @@ use crate::encode::hardware::vulkan::context::VulkanInstance;
 use crate::encode::hardware::vulkan::{caps, test_support};
 
 /// CBR 的 QP 地板：只约束「画质过好」的一侧，不参与码率上限。
-/// H.265 的 QP 范围是标准固定值 0..51
+/// 最终取值会钳进驱动声明的 `minQp..maxQp`（`FrameEncoder::qp_range`）。
 const MIN_QP_H265: i32 = 22;
 
 // ---- 会话级：VPS / SPS / PPS ----
@@ -678,15 +678,17 @@ impl FrameEncoder {
             encode_info = encode_info.push(info);
         }
 
-        // CBR 码控：H.265 同样必须给出 QP 范围与 GOP 结构，缺了驱动判非法
+        // CBR 码控：H.265 同样必须给出 QP 范围与 GOP 结构，缺了驱动判非法。
+        // 地板取 `MIN_QP_H265`，再钳进驱动声明的 `minQp..maxQp`
+        let (min_qp_value, max_qp_value) = self.qp_range(MIN_QP_H265);
         let min_qp = vk::VideoEncodeH265QpKHR::default()
-            .qp_i(MIN_QP_H265)
-            .qp_p(MIN_QP_H265)
-            .qp_b(MIN_QP_H265);
+            .qp_i(min_qp_value)
+            .qp_p(min_qp_value)
+            .qp_b(min_qp_value);
         let max_qp = vk::VideoEncodeH265QpKHR::default()
-            .qp_i(51)
-            .qp_p(51)
-            .qp_b(51);
+            .qp_i(max_qp_value)
+            .qp_p(max_qp_value)
+            .qp_b(max_qp_value);
         let mut h265_layer = vk::VideoEncodeH265RateControlLayerInfoKHR::default()
             .use_min_qp(true)
             .min_qp(min_qp)
@@ -701,6 +703,10 @@ impl FrameEncoder {
         let layers = [layer];
         // codec 专属码控信息与 `VkVideoEncodeRateControlInfoKHR` 是兄弟，都挂在 begin 上
         let h265_rate_control = vk::VideoEncodeH265RateControlInfoKHR::default()
+            .flags(
+                vk::VideoEncodeH265RateControlFlagsKHR::REGULAR_GOP
+                    | vk::VideoEncodeH265RateControlFlagsKHR::REFERENCE_PATTERN_FLAT,
+            )
             .gop_frame_count(self.gop_length)
             .idr_period(self.gop_length)
             .consecutive_b_frame_count(0)
