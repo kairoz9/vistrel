@@ -51,7 +51,7 @@ jobs:
             echo "::notice::RELEASE_PUBLISH_ENABLED 未设为 true，只构建不发布"
           else
             echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::发布已启用，将创建 Release 并上传 CurseForge"
+            echo "::notice::发布已启用，将创建 Release 并同步到已配置的平台（CurseForge / Modrinth / BBSMC）"
           fi
 
       - name: Resolve and validate tag
@@ -154,76 +154,31 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
 
+  # 三个平台各自一个可复用工作流，互不连累：任一平台失败不会影响其它平台，
+  # 也便于单独重跑。凭据缺失时整组跳过。
   publish-cf:
-    name: Publish to CurseForge (${{ matrix.loader }} ${{ matrix.mc }})
+    name: CurseForge
     needs: [guard, build]
-    # CF 项目未建 / 未配置凭据 / 发布未启用时整组跳过，GitHub Release 链路不受影响
     if: vars.CURSEFORGE_PROJECT_ID != '' && needs.guard.outputs.publish == 'true'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      # game-versions 用 Maven 区间语法，逐字对应 stonecutter.properties.toml 各线 minecraft.version_range
-      # （mc-publish 运行时对 CF 官方版本列表展开，默认 game-version-filter 只收稳定正式版，
-      #   排除快照/beta/RC——jar 依赖区间内存在哪些正式版就打哪些，无需随 CF 补丁版本手动维护）
-      # glob 以 -<MC>- 锚定版本号边界，防止前缀重合的版本互相误配
-      matrix:
-        include:
-          - { mc: '1.20',   loader: fabric,   file: 'vistrel-fabric-1.20-*.jar',     game-versions: '[1.20,1.20.2)',   java: 17 }
-          - { mc: '1.20',   loader: forge,    file: 'vistrel-forge-1.20-*.jar',      game-versions: '[1.20,1.20.2)',   java: 17 }
-          - { mc: '1.21',   loader: fabric,   file: 'vistrel-fabric-1.21-*.jar',     game-versions: '[1.21,1.21.12)',  java: 21 }
-          - { mc: '1.21',   loader: neoforge, file: 'vistrel-neoforge-1.21-*.jar',   game-versions: '[1.21,1.21.12)',  java: 21 }
-          - { mc: '26.1',   loader: fabric,   file: 'vistrel-fabric-26.1-*.jar',     game-versions: '[26.1,26.2)',     java: 25 }
-          - { mc: '26.1',   loader: neoforge, file: 'vistrel-neoforge-26.1-*.jar',   game-versions: '[26.1,26.2)',     java: 25 }
-          - { mc: '26.2',   loader: fabric,   file: 'vistrel-fabric-26.2-*.jar',     game-versions: '[26.2,26.3)',     java: 25 }
-          - { mc: '26.2',   loader: neoforge, file: 'vistrel-neoforge-26.2-*.jar',   game-versions: '[26.2,26.3)',     java: 25 }
-          - { mc: '26.3',   loader: fabric,   file: 'vistrel-fabric-26.3-*.jar',     game-versions: '[26.3,26.4)',     java: 25 }
-          - { mc: '26.3',   loader: neoforge, file: 'vistrel-neoforge-26.3-*.jar',   game-versions: '[26.3,26.4)',     java: 25 }
-    steps:
-      - name: Download distributable jars
-        uses: actions/download-artifact@v8
-        with:
-          name: distributable-jars
-          path: dist
+    uses: ./.github/workflows/publish-curseforge.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.guard.outputs.version }}
 
-      - name: Download release metadata
-        uses: actions/download-artifact@v8
-        with:
-          name: release-meta
-          path: meta
+  publish-modrinth:
+    name: Modrinth
+    needs: [guard, build]
+    if: vars.MODRINTH_PROJECT_ID != '' && needs.guard.outputs.publish == 'true'
+    uses: ./.github/workflows/publish-modrinth.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.guard.outputs.version }}
 
-      - name: Compose per-file changelog
-        env:
-          VERSION: ${{ needs.guard.outputs.version }}
-          MC: ${{ matrix.mc }}
-          LOADER: ${{ matrix.loader }}
-        run: |
-          out="changelog-$MC-$LOADER.md"
-          {
-            if [ "$VERSION" = "0.1.0" ]; then
-              # 首版说明紧接标题：首行是 `## Vistrel <version>`，其下空行分隔正文
-              head -1 meta/release-body.md
-              echo
-              echo "Initial release."
-              tail -n +2 meta/release-body.md
-            else
-              cat meta/release-body.md
-            fi
-          } > "$out"
-          echo "changelog: $out"
-          head -5 "$out"
-
-      - name: Publish to CurseForge
-        # environment 显式 client
-        # name 必须显式置空而非省略：省略时 program.ts 回落到「触发 release 的标题」，
-        uses: Kira-NT/mc-publish@v3
-        with:
-          curseforge-id: ${{ vars.CURSEFORGE_PROJECT_ID }}
-          curseforge-token: ${{ secrets.CURSEFORGE_TOKEN }}
-          files: dist/${{ matrix.file }}
-          name: ''
-          version-type: release
-          game-versions: ${{ matrix.game-versions }}
-          loaders: ${{ matrix.loader }}
-          environment: client
-          java: ${{ matrix.java }}
-          changelog-file: changelog-${{ matrix.mc }}-${{ matrix.loader }}.md
+  publish-bbsmc:
+    name: BBSMC
+    needs: [guard, build]
+    if: vars.BBSMC_PROJECT_ID != '' && needs.guard.outputs.publish == 'true'
+    uses: ./.github/workflows/publish-bbsmc.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.guard.outputs.version }}

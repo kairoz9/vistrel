@@ -1,0 +1,73 @@
+name: Publish to Modrinth
+
+# 由 release.yml 以 workflow_call 调用。
+# 重跑单个失败腿前先 GET /v2/project/{id}/version 查重——Modrinth 不按版本号去重，
+# 整组重跑会静默产生 10 个重复 version。
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 发布版本号（不含 v 前缀）
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: ${{ matrix.loader }} ${{ matrix.mc }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # game-versions 的 Maven 区间由 mc-publish 经 Mojang manifest 展开后
+      # 与 Modrinth 精确 tag 匹配；26.1 NeoForge 因 jar 内依赖下限 [26.1.2.71,) 只打 26.1.2
+      matrix:
+        include:
+          - { mc: '1.20',   loader: fabric,   file: 'vistrel-fabric-1.20-*.jar',     game-versions: '[1.20,1.20.2)' }
+          - { mc: '1.20',   loader: forge,    file: 'vistrel-forge-1.20-*.jar',      game-versions: '[1.20,1.20.2)' }
+          - { mc: '1.21',   loader: fabric,   file: 'vistrel-fabric-1.21-*.jar',     game-versions: '[1.21,1.21.12)' }
+          - { mc: '1.21',   loader: neoforge, file: 'vistrel-neoforge-1.21-*.jar',   game-versions: '[1.21,1.21.12)' }
+          - { mc: '26.1',   loader: fabric,   file: 'vistrel-fabric-26.1-*.jar',     game-versions: '[26.1,26.2)' }
+          - { mc: '26.1',   loader: neoforge, file: 'vistrel-neoforge-26.1-*.jar',   game-versions: '26.1.2' }
+          - { mc: '26.2',   loader: fabric,   file: 'vistrel-fabric-26.2-*.jar',     game-versions: '[26.2,26.3)' }
+          - { mc: '26.2',   loader: neoforge, file: 'vistrel-neoforge-26.2-*.jar',   game-versions: '[26.2,26.3)' }
+          - { mc: '26.3',   loader: fabric,   file: 'vistrel-fabric-26.3-*.jar',     game-versions: '[26.3,26.4)' }
+          - { mc: '26.3',   loader: neoforge, file: 'vistrel-neoforge-26.3-*.jar',   game-versions: '[26.3,26.4)' }
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download distributable jars
+        uses: actions/download-artifact@v8
+        with:
+          name: distributable-jars
+          path: dist
+
+      - name: Download release metadata
+        uses: actions/download-artifact@v8
+        with:
+          name: release-meta
+          path: meta
+
+      - name: Compose per-file changelog
+        run: |
+          bash .github/scripts/compose-changelog.sh \
+            "${{ inputs.version }}" \
+            meta/release-body.md \
+            "changelog-${{ matrix.mc }}-${{ matrix.loader }}.md"
+
+      - name: Publish to Modrinth
+        uses: Kira-NT/mc-publish@v3
+        with:
+          modrinth-id: ${{ vars.MODRINTH_PROJECT_ID }}
+          modrinth-token: ${{ secrets.MODRINTH_TOKEN }}
+          files: dist/${{ matrix.file }}
+          name: 'Vistrel ${{ inputs.version }} (${{ matrix.loader }} ${{ matrix.mc }})'
+          version: ${{ inputs.version }}
+          version-type: release
+          game-versions: ${{ matrix.game-versions }}
+          loaders: ${{ matrix.loader }}
+          environment: client
+          changelog-file: changelog-${{ matrix.mc }}-${{ matrix.loader }}.md
+          modrinth-featured: false
