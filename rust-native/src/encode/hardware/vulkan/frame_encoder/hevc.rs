@@ -712,11 +712,14 @@ impl FrameEncoder {
             .consecutive_b_frame_count(0)
             .sub_layer_count(1);
         let scope = begin_scope(if is_idr { None } else { Some(&ref_slots[0]) }, &setup_slot);
+        // 驱动要求/偏好时，把本帧在 GOP 内的剩余 I/P 帧数一并交给码控
+        let gop_remaining = self.gop_remaining(VideoCodec::H265, frame_num, is_idr);
         let bytes_written = self.submit_encode(
             &encode_info,
             &scope,
             &layers,
             Some(CodecRateControl::H265(h265_rate_control)),
+            gop_remaining,
         )?;
         self.finish_frame(bytes_written, is_idr)
     }

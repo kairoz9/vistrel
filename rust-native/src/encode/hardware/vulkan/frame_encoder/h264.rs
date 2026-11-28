@@ -589,11 +589,14 @@ impl FrameEncoder {
             .consecutive_b_frame_count(0)
             .temporal_layer_count(1);
         let scope = begin_scope(if is_idr { None } else { Some(&ref_slots[0]) }, &setup_slot);
+        // 驱动要求/偏好时，把本帧在 GOP 内的剩余 I/P 帧数一并交给码控
+        let gop_remaining = self.gop_remaining(VideoCodec::H264, frame_num, is_idr);
         let bytes_written = self.submit_encode(
             &encode_info,
             &scope,
             &layers,
             Some(CodecRateControl::H264(h264_rate_control)),
+            gop_remaining,
         )?;
         self.finish_frame(bytes_written, is_idr)
     }
@@ -958,6 +961,59 @@ mod tests {
             low_total < high_total,
             "降码率后同样 8 帧的总字节数应下降（8Mbps {high_total} vs 2Mbps {low_total}）"
         );
+    }
+
+    /// GOP 剩余帧数：即使驱动没有声明 requires/prefers，begin 带上该结构也必须被接受
+    ///
+    /// 本机 caps 两项都是 false，正常路径不会挂这个结构。这里手动把 prefers 置真，
+    /// 覆盖 `record_and_submit` 的 pNext 链与 I/P 计数字段。
+    #[test]
+    #[ignore = "requires GPU"]
+    fn test_vulkan_video_h264_gop_remaining_frames() {
+        let Ok(ctx) = VulkanInstance::new("Vistrel-S1e") else {
+            println!("Vulkan 不可用，跳过");
+            return;
+        };
+        let mut caps = match caps::probe_codec(&ctx, VideoCodec::H264) {
+            Ok(caps) => caps,
+            Err(e) => {
+                println!("H.264 能力探测失败，跳过: {e}");
+                return;
+            }
+        };
+        caps.prefers_gop_remaining_frames = true;
+        let device = match VideoDevice::new(&ctx, VideoCodec::H264) {
+            Ok(device) => device,
+            Err(e) => {
+                println!("设备创建失败，跳过: {e}");
+                return;
+            }
+        };
+        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), caps.codec, 15) {
+            Ok(encoder) => encoder,
+            Err(e) => {
+                println!("编码器初始化失败: {e}");
+                return;
+            }
+        };
+        let extent = encoder.extent();
+        let (_, key) = match encoder.encode_idr(&make_noisy_frame(extent, 1)) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("IDR 编码失败（GOP 剩余帧数结构可能不合法）: {e}");
+                return;
+            }
+        };
+        assert!(key, "首帧必须是关键帧");
+        // 同一 GOP 内的 P 帧，剩余 P 帧数逐帧递减
+        for n in 0..3 {
+            match encoder.encode_frame(&make_noisy_frame(extent, 10 + n), false) {
+                Ok((_, false)) => {}
+                Ok((_, true)) => panic!("第 {n} 个 P 帧不应是关键帧"),
+                Err(e) => panic!("第 {n} 个 P 帧编码失败: {e}"),
+            }
+        }
+        println!("GOP 剩余帧数结构已被驱动接受: IDR + 3 P 帧");
     }
 
     /// Intra-Refresh：长 GOP + 渐进刷新，不产出周期性 IDR

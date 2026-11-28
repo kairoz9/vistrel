@@ -176,6 +176,8 @@ pub struct FrameEncoder {
     /// H.264/H.265 的 QP 范围（来自 `CodecCaps`）；AV1 不读
     min_qp: i32,
     max_qp: i32,
+    /// 驱动要求/偏好 begin 时给出 GOP 剩余帧数（`requires || prefers`）
+    gop_remaining_frames: bool,
     /// 反馈查询是否包含 `HAS_OVERRIDES`（驱动支持时）
     feedback_has_overrides: bool,
     /// 是否已经报告过逐帧覆写，避免每帧刷日志
@@ -320,6 +322,32 @@ enum CodecRateControl<'a> {
     Av1(vk::VideoEncodeAV1RateControlInfoKHR<'a>),
 }
 
+/// begin 时告诉码控「当前 GOP 还剩多少 I/P/B 帧」
+///
+/// `requiresGopRemainingFrames` 时必须在 begin 的 pNext 里带上（VUID 08256 / 10282），
+/// `prefersGopRemainingFrames` 时能让 CBR 分配更准。三个结构都是
+/// `VideoBeginCodingInfoKHR` 的直接扩展，与码控结构是兄弟。
+///
+/// 按值保存：三处 begin 各拷一份，避开同一结构被同时可变借用。
+#[derive(Clone, Copy)]
+enum CodecGopRemaining<'a> {
+    H264(vk::VideoEncodeH264GopRemainingFrameInfoKHR<'a>),
+    H265(vk::VideoEncodeH265GopRemainingFrameInfoKHR<'a>),
+    Av1(vk::VideoEncodeAV1GopRemainingFrameInfoKHR<'a>),
+}
+
+/// 本帧在 GOP 内的剩余帧数（含当前帧，IDR 为 0）
+///
+/// `gopRemainingI/P/B` 表示「执行本次编码前码控应假设 GOP 还剩多少帧」。本实现
+/// 是 IPPP：IDR 占 I，其余全是 P，B 恒 0；`frame_num` 在 IDR 上为 0，其余落在
+/// 1..=gop_length-1。
+fn gop_remaining_counts(gop_length: u32, frame_num: u32, is_key: bool) -> (u32, u32) {
+    let remaining_i = u32::from(is_key);
+    let remaining_p = gop_length
+        .saturating_sub(frame_num)
+        .saturating_sub(u32::from(is_key));
+    (remaining_i, remaining_p)
+}
 
 /// 把推导出的 level 换算成与 `max_level_idc` 相同的枚举域
 ///
@@ -619,6 +647,8 @@ impl FrameEncoder {
             max_q_index: caps.max_q_index,
             min_qp: caps.min_qp,
             max_qp: caps.max_qp,
+            gop_remaining_frames: caps.requires_gop_remaining_frames
+                || caps.prefers_gop_remaining_frames,
             feedback_has_overrides,
             overrides_seen: false,
             // 准入条件必须两条同时成立：能力查询说支持（模式非空、周期 >= 2）**且**
@@ -667,6 +697,44 @@ impl FrameEncoder {
         let min = floor.clamp(lo, hi);
         let max = 51.min(hi).max(min);
         (min, max)
+    }
+
+    /// 本帧要挂进 begin 的 GOP 剩余帧数结构；驱动既不强求也不偏好时返回 `None`
+    ///
+    /// 三个 codec 结构语义相同、只有类型不同，构造集中在这里。
+    fn gop_remaining<'a>(
+        &self,
+        codec: VideoCodec,
+        frame_num: u32,
+        is_key: bool,
+    ) -> Option<CodecGopRemaining<'a>> {
+        if !self.gop_remaining_frames {
+            return None;
+        }
+        let (remaining_i, remaining_p) = gop_remaining_counts(self.gop_length, frame_num, is_key);
+        Some(match codec {
+            VideoCodec::H264 => CodecGopRemaining::H264(
+                vk::VideoEncodeH264GopRemainingFrameInfoKHR::default()
+                    .use_gop_remaining_frames(true)
+                    .gop_remaining_i(remaining_i)
+                    .gop_remaining_p(remaining_p)
+                    .gop_remaining_b(0),
+            ),
+            VideoCodec::H265 => CodecGopRemaining::H265(
+                vk::VideoEncodeH265GopRemainingFrameInfoKHR::default()
+                    .use_gop_remaining_frames(true)
+                    .gop_remaining_i(remaining_i)
+                    .gop_remaining_p(remaining_p)
+                    .gop_remaining_b(0),
+            ),
+            VideoCodec::Av1 => CodecGopRemaining::Av1(
+                vk::VideoEncodeAV1GopRemainingFrameInfoKHR::default()
+                    .use_gop_remaining_frames(true)
+                    .gop_remaining_intra(remaining_i)
+                    .gop_remaining_predictive(remaining_p)
+                    .gop_remaining_bipredictive(0),
+            ),
+        })
     }
 
     /// GPU 色彩转换是否可用
@@ -986,6 +1054,19 @@ mod tests {
             level_enum(VideoCodec::H264, 43).is_err(),
             "非法语法值必须拒绝"
         );
+    }
+
+    /// GOP 剩余帧数：含当前帧，IDR 占 I，其余全是 P，B 恒 0
+    #[test]
+    fn test_gop_remaining_counts() {
+        // 30 帧 GOP：IDR + 29 个 P
+        assert_eq!(gop_remaining_counts(30, 0, true), (1, 29));
+        assert_eq!(gop_remaining_counts(30, 1, false), (0, 29));
+        assert_eq!(gop_remaining_counts(30, 2, false), (0, 28));
+        assert_eq!(gop_remaining_counts(30, 29, false), (0, 1));
+        // 最短 GOP：IDR + 1 个 P
+        assert_eq!(gop_remaining_counts(2, 0, true), (1, 1));
+        assert_eq!(gop_remaining_counts(2, 1, false), (0, 1));
     }
 
     /// `frame_num` 位宽换算：装得下 `gop_length + 1` 个不重复值

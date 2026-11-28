@@ -722,11 +722,14 @@ impl FrameEncoder {
             // 未声明 `TEMPORAL_LAYER_PATTERN_DYADIC`，规范要求此时该值必须为 1
             .temporal_layer_count(1);
         let scope = begin_scope(if is_key { None } else { Some(&ref_slots[0]) }, &setup_slot);
+        // 驱动要求/偏好时，把本帧在 GOP 内的剩余 Intra/Predictive 帧数交给码控
+        let gop_remaining = self.gop_remaining(VideoCodec::Av1, frame_num, is_key);
         let bytes_written = self.submit_encode(
             &encode_info,
             &scope,
             &layers,
             Some(CodecRateControl::Av1(av1_rate_control)),
+            gop_remaining,
         )?;
         // 没有需要逐帧维护的跨帧状态：`order_hint` 已在序列头里关掉，
         // VBI 槽的刷新与参考选择完全由 `refresh_frame_flags` / `ref_frame_idx` 表达。

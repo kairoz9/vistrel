@@ -15,7 +15,7 @@
 
 use ash::vk::{self, TaggedStructure};
 
-use super::{CodecRateControl, FrameEncoder, PendingUpload, Scope};
+use super::{CodecGopRemaining, CodecRateControl, FrameEncoder, PendingUpload, Scope};
 use crate::encode::VideoCodec;
 
 /// CBR 虚拟缓冲长度（毫秒）
@@ -194,14 +194,15 @@ impl FrameEncoder {
     /// 录制并提交一次编码，返回驱动写入的码流字节数
     ///
     /// 与 codec 无关的部分全在这里：begin/end coding、feedback query、提交等待、回读。
-    /// `rate_control` 由各 codec 构造（码控结构体是 codec 专属的），会被挂进
-    /// `vkCmdBeginVideoCodingKHR` 的 pNext —— 见 [`Self::record_and_submit`] 里的说明。
+    /// `codec_rate_control` 与 `gop_remaining` 都由各 codec 构造（结构体是 codec 专属的），
+    /// 会被挂进 `vkCmdBeginVideoCodingKHR` 的 pNext —— 见 [`Self::record_and_submit`] 里的说明。
     pub(super) fn submit_encode(
         &mut self,
         encode_info: &vk::VideoEncodeInfoKHR<'_>,
         scope: &Scope<'_>,
         layers: &[vk::VideoEncodeRateControlLayerInfoKHR<'_>],
         codec_rate_control: Option<CodecRateControl<'_>>,
+        gop_remaining: Option<CodecGopRemaining<'_>>,
     ) -> Result<u64, String> {
         // 永久毒化短路：等待超时过的编码器带着可能在途的命令缓冲，任何后续录制
         // 都必须先 reset 命令缓冲——对在途命令缓冲 reset 是规范违规
@@ -211,7 +212,13 @@ impl FrameEncoder {
 
         // 录制 + 提交 + 等待。两类失败的善后完全不同：提交未落地才能回滚布局；
         // 在途超时绝不能回滚，并就此毒化编码器
-        match self.record_and_submit(encode_info, scope, layers, codec_rate_control) {
+        match self.record_and_submit(
+            encode_info,
+            scope,
+            layers,
+            codec_rate_control,
+            gop_remaining,
+        ) {
             Ok(()) => {}
             Err(SubmitFailure::NotSubmitted(e)) => {
                 self.pending_upload = None;
@@ -378,6 +385,7 @@ impl FrameEncoder {
         scope: &Scope<'_>,
         layers: &[vk::VideoEncodeRateControlLayerInfoKHR<'_>],
         codec_rate_control: Option<CodecRateControl<'_>>,
+        gop_remaining: Option<CodecGopRemaining<'_>>,
     ) -> Result<(), SubmitFailure> {
         // **begin 作用域必须声明本帧用到的全部槽位，含当前帧的输出槽**——排布规则与
         // 07239 / 08215 两条 VU 的推导见 `begin_scope`：只在 encode 作用域里给槽位会
@@ -435,6 +443,16 @@ impl FrameEncoder {
                 };
             }
         }
+        // `requiresGopRemainingFrames` 时每次 begin 都必须带（VUID 08256 / 10282），
+        // 与码控是否重发无关。按值存进局部，begin 只持有它的地址。
+        let mut gop_for_begin = gop_remaining;
+        if let Some(ref mut gop) = gop_for_begin {
+            begin_info = match gop {
+                CodecGopRemaining::H264(x) => begin_info.push(x),
+                CodecGopRemaining::H265(x) => begin_info.push(x),
+                CodecGopRemaining::Av1(x) => begin_info.push(x),
+            };
+        }
         let end_info = vk::VideoEndCodingInfoKHR::default();
         // 唯一的等待来源：计算队列上的 CSC 产物。主机 NV12 路径没有
         let csc_wait = self.csc.as_ref().ok().and_then(|c| c.pending_semaphore());
@@ -451,8 +469,8 @@ impl FrameEncoder {
         let device = self.device.device();
         // SAFETY: 命令缓冲来自本结构独占的命令池，上一次提交已完成（时间线已等到；
         // 等待超时的帧会毒化编码器，毒化后在 `submit_encode` 顶部短路，绝不会带着
-        // 在途命令缓冲走到这里）；encode_info 及其 pNext 链、begin_info 的码控子链
-        // 由调用方持有，在录制期间均存活
+        // 在途命令缓冲走到这里）；encode_info 及其 pNext 链、begin_info 的 pNext 链
+        // （码控 / GOP 剩余帧数）由调用方与本函数局部持有，在录制期间均存活
         unsafe {
             device
                 .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
