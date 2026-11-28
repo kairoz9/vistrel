@@ -12,13 +12,21 @@
 // `push` 是 `TaggedStructure` trait 的方法，不导入就无法链 pNext
 use ash::vk::{self, TaggedStructure};
 
-use super::caps::{CodecCaps, CodecSpecific, ProfilePart, base_profile};
+use super::caps::{ProfilePart, base_profile};
+use super::config::{CodingControl, SessionConfig};
 use super::csc::ColorConverter;
 use super::device::{HostBuffer, VideoDevice};
 use super::image::{DpbImages, Nv12Image};
 use super::session::{VideoSession, VideoSessionParameters};
 use super::vram_slot::VramSlot;
-use crate::encode::{StreamingProfile, VideoCodec, nv12_len};
+use crate::encode::VideoCodec;
+
+#[cfg(test)]
+use super::caps::CodecCaps;
+#[cfg(test)]
+use super::config::{EncodePolicy, GopPolicy};
+#[cfg(test)]
+use crate::encode::StreamingProfile;
 
 mod av1;
 mod execute;
@@ -45,19 +53,18 @@ fn picture_resource(
 }
 
 /// 让一个 GOP 内的 `frame_num` 不重复所需的最小位宽（`log2(MaxFrameNum)`）
-fn frame_num_bits(gop_length: u32) -> u32 {
+pub(super) fn frame_num_bits(gop_length: u32) -> u32 {
     let needed = gop_length.saturating_add(1).max(16);
     // ceil_log2：needed 不是 2 的幂时也要装得下
     let bits = 32 - needed.saturating_sub(1).leading_zeros();
     bits.clamp(4, 12)
 }
 
-/// 本帧的 intra-refresh 参数；`None` 表示本轮未启用
+/// 本帧的 intra-refresh 参数；`None` 表示未启用
 ///
-/// KEY / IDR 帧本身全帧内，索引无意义，用 0 表示从头开始；其余帧按周期推进（索引在
-/// `finish_frame` 里推进）。`intra_refresh_cycle_duration` 必须与 `set_intra_refresh`
-/// 设的值一致，否则驱动按它切分条带、我们按另一个周期推进，会有区域永远轮不到刷新
-/// ——表现是误差只增不减。
+/// KEY / IDR 帧全帧内，索引固定为 0；其余帧按周期推进（见 `finish_frame`）。
+/// 周期必须与建会话时选定的一致，否则驱动按它切分条带、我们按另一个周期推进，
+/// 会有区域永远轮不到刷新。
 fn intra_refresh_info<'a>(
     cycle: Option<u32>,
     index: u32,
@@ -126,29 +133,6 @@ enum PendingUpload {
     Planes { y: vk::Image, uv: vk::Image },
 }
 
-/// 码控的量化范围：H.26x 用 QP，AV1 用量化索引，两者数值域不同
-#[derive(Debug, Clone, Copy)]
-enum QuantCaps {
-    Qp { min: i32, max: i32 },
-    QIndex { min: u32, max: u32 },
-}
-
-impl QuantCaps {
-    /// 从能力快照取出当前 codec 的量化范围
-    fn from_caps(caps: &CodecCaps) -> Self {
-        match &caps.specific {
-            CodecSpecific::H264(specific) | CodecSpecific::H265(specific) => Self::Qp {
-                min: specific.min_qp,
-                max: specific.max_qp,
-            },
-            CodecSpecific::Av1(specific) => Self::QIndex {
-                min: specific.min_q_index,
-                max: specific.max_q_index,
-            },
-        }
-    }
-}
-
 /// 一帧编码所需的全部常驻资源
 pub struct FrameEncoder {
     device: VideoDevice,
@@ -184,40 +168,22 @@ pub struct FrameEncoder {
     /// 用当前帧的 `is_idr` 去填是错的：IDR 之后的第一帧参考的是 IDR，填成 P 会让驱动
     /// 按 P 帧去管理这个参考槽（H.264 里 IDR 会清空 DPB 并重置 POC，与 P 帧行为不同）。
     last_was_idr: bool,
-    /// 协商档位：帧率与码率的唯一事实源，运行期 `set_bitrate` / `set_fps` 直改它
-    profile: StreamingProfile,
-    /// 驱动声明的码率上限（`caps.max_bitrate`）；0 表示未设上限。请求超出属于非法用法
-    /// （码控层的 averageBitrate / maxBitrate 不得超过它），运行期改码率时按它钳制
-    max_bitrate: u64,
+    /// 运行期码控状态：当前码率/帧率、上次下发值、是否需要重发
+    coding: CodingControl,
     /// GOP 长度（帧）：`frame_num` 到达它就强制重出 IDR，也是码控里的 `idrPeriod`
     ///
     /// intra-refresh 打开时取大值，靠渐进刷新代替周期性 IDR。
     gop_length: u32,
-    /// AV1 码控的量化索引范围 / H.26x 的 QP 范围（来自能力快照）
-    quant: QuantCaps,
     /// 驱动要求/偏好 begin 时给出 GOP 剩余帧数（`requires || prefers`）
     gop_remaining_frames: bool,
     /// 反馈查询是否包含 `HAS_OVERRIDES`（驱动支持时）
     feedback_has_overrides: bool,
     /// 是否已经报告过逐帧覆写，避免每帧刷日志
     overrides_seen: bool,
-    /// 驱动声明的最大 intra-refresh 周期；0 表示不支持
-    max_intra_refresh_cycle: u32,
     /// 已启用的 intra-refresh 周期；`None` 表示关闭
     intra_refresh_cycle: Option<u32>,
     /// 下一帧的 intra-refresh 索引，按周期循环
     intra_refresh_index: u32,
-    /// 是否已下发过首次 RESET
-    rate_control_initialized: bool,
-    /// 码控是否需要重新下发（首帧或码率/帧率变更后）
-    rate_control_dirty: bool,
-    /// 上次**真正配置进会话**的码率与帧率
-    ///
-    /// begin 的 `VkVideoEncodeRateControlInfoKHR` 必须与已配置状态逐字段一致（08254），
-    /// 而 `averageBitrate` / `maxBitrate` 也在比较范围内、码率又每帧跟着带宽估计变。
-    /// 所以 begin 声明这一组「上次配置值」，当前值在作用域内再配进去（差一帧，永远一致）。
-    configured_bitrate_bps: u64,
-    configured_fps: u32,
     query_pool: vk::QueryPool,
     /// GPU 时间戳查询池；队列族不支持时间戳或非测试构建时为 `None`
     #[cfg(test)]
@@ -371,8 +337,8 @@ fn gop_remaining_counts(gop_length: u32, frame_num: u32, is_key: bool) -> (u32, 
 /// 把推导出的 level 换算成与 `CodecCaps::max_level` 相同的枚举域
 ///
 /// H.264/H.265 的 std 字段是枚举，AV1 的 `maxLevel` 与 `seq_level_idx` 同域；
-/// 三个映射在这里收口，`FrameEncoder::new` 不必按 codec 分支。
-fn level_enum(codec: VideoCodec, level: u32) -> Result<u32, String> {
+/// 三个映射在这里收口，`SessionConfig::build` 不必按 codec 分支。
+pub(super) fn level_enum(codec: VideoCodec, level: u32) -> Result<u32, String> {
     match codec {
         VideoCodec::H264 => h264::level_to_vk(level),
         VideoCodec::H265 => hevc::level_enum(level),
@@ -381,94 +347,23 @@ fn level_enum(codec: VideoCodec, level: u32) -> Result<u32, String> {
 }
 
 impl FrameEncoder {
-    /// 帧编码器构造：请求码率钳进驱动声明上限（钳制写回档位，0 视为无上限）、建视频
-    /// 会话与参数对象（level 与 frame_num 位宽按档位与 GOP 推导）、NV12 输入图、
-    /// DPB 图与码流缓冲。codec 由能力快照决定。
+    /// 按静态会话配置建会话、参数对象、输入图、DPB 与码流缓冲，并接管运行期码控。
+    /// 能力钳制与 level 门禁已在 `SessionConfig::build` 完成，这里只做资源分配。
     ///
-    /// 全成全败，任一环节失败即 `Err`；GOP 长度必须 ≥ 2。CSC 是可选能力，其构造
-    /// 失败原样保留为 `Err`，主机帧与显存槽位两条路径据此报错，CPU 上传路径照常工作
+    /// 全成全败。CSC 是可选能力：构造失败保留为 `Err`，只影响主机帧与显存槽位路径。
     pub fn new(
         device: &VideoDevice,
-        caps: &CodecCaps,
-        profile: StreamingProfile,
-        gop_length: u32,
+        config: SessionConfig,
+        coding: CodingControl,
     ) -> Result<Self, String> {
-        let codec = caps.codec();
-        if gop_length < 2 {
-            return Err(format!("GOP 长度必须 ≥ 2，收到 {gop_length}"));
-        }
-        // 请求码率钳到驱动声明上限之内：超出属于非法用法，驱动可能直接判参数错。
-        // 钳制而不是报错——低能力驱动上「降码率继续播」好过「整个后端起不来」。
-        // maxBitrate 为 0 视为驱动未设上限。钳完写回档位，后续读的是同一份值
-        let mut profile = profile;
-        let bitrate_bps = profile.bitrate() as u64;
-        let bitrate_bps = if caps.max_bitrate > 0 && bitrate_bps > caps.max_bitrate {
-            log::warn!(
-                "请求码率 {bitrate_bps} bps 超过驱动上限 {} bps，已钳制",
-                caps.max_bitrate
-            );
-            caps.max_bitrate
-        } else {
-            bitrate_bps
-        };
-        profile.set_bitrate(bitrate_bps as usize);
-        let session = VideoSession::new(
-            device,
-            caps,
-            profile.width() as u32,
-            profile.height() as u32,
-        )?;
-        // 码流的 level 一律按**当前档位**推导 —— 与 NVENC 同一个函数、同一组输入。
-        let level = crate::encode::profile_level(
-            codec,
-            profile.width(),
-            profile.height(),
-            profile.fps(),
-            (bitrate_bps / 1000) as u32,
-        );
-        // 推导 level 不能超过驱动上限：低端编码器可能只到 4.1，而 1080p60 + 8 Mbps
-        // 就是 4.2。超限时声明该 level 不合法，明确报错胜过静默降级，由上层换后端
-        // 或降档；SDP 的 level 仍按内容推导，不受这里影响。
-        let level_vk = level_enum(codec, level)?;
-        if level_vk > caps.max_level() {
-            return Err(format!(
-                "{:?} 档位 {}x{}@{} 需要 level 枚举 {}（码流值 {}），超过驱动声明的上限 {}",
-                codec,
-                profile.width(),
-                profile.height(),
-                profile.fps(),
-                level_vk,
-                level,
-                caps.max_level()
-            ));
-        }
-        // SPS 的 frame_num 位宽必须装得下整个 GOP，否则参考链会错乱
-        let params = match codec {
-            VideoCodec::H264 => VideoSessionParameters::new_h264(
-                device,
-                &session,
-                level,
-                frame_num_bits(gop_length),
-            )?,
-            VideoCodec::H265 => VideoSessionParameters::new_h265(
-                device,
-                &session,
-                level,
-                frame_num_bits(gop_length),
-            )?,
-            // AV1 没有 frame_num 位宽这回事：序列头由驱动生成，参数集里没有可调的位宽字段。
-            // codec 由 `caps.codec()` 推出，此分支的变体必然是 `Av1`
-            VideoCodec::Av1 => match &caps.specific {
-                CodecSpecific::Av1(specific) => {
-                    VideoSessionParameters::new_av1(device, &session, specific, level)?
-                }
-                _ => unreachable!("codec 与能力快照变体不一致"),
-            },
-        };
+        let codec = config.codec();
+        let session = VideoSession::new(device, &config)?;
+        let params = VideoSessionParameters::new(device, &session, config.sequence())?;
         // 驱动只写 slice NAL，参数集要拼到 IDR 前面（字节由驱动序列化，见 session）
         let parameter_sets = params.parameter_sets().to_vec();
         let extent = session.coded_extent();
         let display = session.display_extent();
+        let image_extent = config.image_extent();
 
         // 码流缓冲、编码输入图、DPB 图**都必须声明所属视频 profile**，否则驱动不把它们
         // 当成编码资源（VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08201 / -08206 /
@@ -481,28 +376,6 @@ impl FrameEncoder {
         let mut profile_part = ProfilePart::new(codec);
         let mut video_profile = profile_part.attach(base_profile(codec));
 
-        // 输入图 padding 由 `CodecCaps::input_pad` 决定；编码尺寸仍是 `extent`。
-        let pad = caps.input_pad(extent);
-        let image_extent = pad.extent;
-        if pad.dropped {
-            log::warn!(
-                "{:?} 输入 padding 超出图像上限 maxImageDimension2D={}，\
-                 超限轴退回 coded extent；实际分配 {}x{}",
-                codec,
-                caps.max_image_dimension,
-                pad.extent.width,
-                pad.extent.height
-            );
-        } else if image_extent != extent {
-            log::debug!(
-                "{:?} 输入图按 encodeInputPictureGranularity 补齐: coded {}x{} → 分配 {}x{}",
-                codec,
-                extent.width,
-                extent.height,
-                image_extent.width,
-                image_extent.height
-            );
-        }
         // 设备级 `maxImageDimension2D` 不保证等于该格式的 `maxExtent`：padding 尺寸
         // 建图失败时退回 coded extent，避免 advisory 字段把整个后端拒掉。
         let image = match Nv12Image::new_video(device, extent, image_extent, &video_profile) {
@@ -528,7 +401,7 @@ impl FrameEncoder {
         // DPB 槽位必须由同一张图的**不同数组层**提供，除非驱动声明了
         // VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR。本实现统一走数组层：
         // 少一次图像/显存/视图创建，也不依赖那个可选能力位。
-        let dpb_slots = session.dpb_slots();
+        let dpb_slots = config.dpb_slots();
         if dpb_slots < 2 {
             return Err(format!(
                 "驱动只提供 {dpb_slots} 个 DPB 槽，本实现需要 2 个（当前帧 + 1 参考帧）"
@@ -536,34 +409,18 @@ impl FrameEncoder {
         }
         let dpb = DpbImages::new(device, extent, dpb_slots, &video_profile)?;
 
-        // 1. 码流缓冲：按驱动要求的大小对齐向上取整，宁可多给。
-        //    主机可见 + 一致，GPU 写、CPU 读回；映射在构造时做一次，逐帧不再往返
-        //
-        // 容量取「一帧 NV12 大小」与「2 秒目标码率」的较大者：
-        // - AV1 的关键帧可以接近一帧 NV12 的量级（1080p 约 3.1 MB），这是下限；
-        // - 高码率档位（1440p @ 40 Mbps）下 2 秒就是 10 MB，只按帧大小分配会把
-        //   关键帧截断在缓冲末尾 —— 而 `bytes_written == size` 不触发校验，
-        //   截断的码流语法上仍可能合法，表现为画面错乱而不是报错。
-        let frame_bytes = nv12_len(extent.width as usize, extent.height as usize) as u64;
-        let two_seconds = bitrate_bps / 8 * 2;
-        let raw_size = frame_bytes.max(two_seconds);
-        let bitstream_size = raw_size.next_multiple_of(caps.min_bitstream_size_alignment.max(1));
+        // 码流缓冲：容量与对齐已由 `SessionConfig::build` 算好。
+        // 主机可见 + 一致，GPU 写、CPU 读回；映射在构造时做一次，逐帧不再往返
         let bitstream = device.host_buffer_video(
-            bitstream_size,
+            config.bitstream_size(),
             vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR,
             "码流缓冲",
             &video_profile,
         )?;
 
-        // 2. feedback 查询池：pNext 必须同时带 profile 与 feedback 创建信息
-        //
-        // profile 必须与本次编码的 codec 一致：查询池是按视频 profile 创建的，声明成别的
-        // codec 属于参数不符。这里复用上面那份 —— 它已经是本 codec 的 profile。
-        //
-        // `HAS_OVERRIDES` 是可选能力：支持时一并打开，逐帧判断驱动是否改写了帧头参数。
-        let feedback_has_overrides = caps
-            .feedback_flags
-            .contains(vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_HAS_OVERRIDES);
+        // feedback 查询池：pNext 必须同时带 profile 与 feedback 创建信息。
+        // profile 必须与本次编码的 codec 一致；`HAS_OVERRIDES` 支持时一并打开。
+        let feedback_has_overrides = config.feedback_has_overrides();
         let mut feedback_flags = vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN;
         if feedback_has_overrides {
             feedback_flags |= vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_HAS_OVERRIDES;
@@ -655,32 +512,13 @@ impl FrameEncoder {
             idr_pic_id: 0,
             // 首帧一定是 IDR，但它不挂参考槽，这个初值只会影响「首帧之后」的判断
             last_was_idr: false,
-            profile,
-            max_bitrate: caps.max_bitrate,
-            gop_length,
-            quant: QuantCaps::from_caps(caps),
-            gop_remaining_frames: caps.requires_gop_remaining_frames
-                || caps.prefers_gop_remaining_frames,
+            coding,
+            gop_length: config.gop_length(),
+            gop_remaining_frames: config.gop_remaining_frames(),
             feedback_has_overrides,
             overrides_seen: false,
-            // 准入条件必须两条同时成立：能力查询说支持（模式非空、周期 >= 2）**且**
-            // 逻辑设备真的开启了该 feature 位。只看前者会在 feature 未链进 create_info
-            // 的机器上下发非法参数
-            max_intra_refresh_cycle: if caps.supports_intra_refresh()
-                && device.supports_intra_refresh()
-            {
-                caps.max_intra_refresh_cycle_duration
-            } else {
-                0
-            },
-            intra_refresh_cycle: None,
+            intra_refresh_cycle: config.intra_refresh_cycle(),
             intra_refresh_index: 0,
-            // 首帧必须下发一次码控，否则会话跑的是驱动默认状态
-            rate_control_initialized: false,
-            rate_control_dirty: true,
-            // 首帧还没配置过任何码控状态
-            configured_bitrate_bps: 0,
-            configured_fps: 0,
             query_pool: res.query_pool,
             #[cfg(test)]
             ts_pool: res.ts_pool,
@@ -705,22 +543,12 @@ impl FrameEncoder {
     /// 返回的 `(min, max)` 保证 `min <= max`；写死范围在窄范围驱动上会违反
     /// `useMinQp` / `useMaxQp` 的 VUID。
     fn qp_range(&self, floor: i32) -> (i32, i32) {
-        let QuantCaps::Qp { min, max } = self.quant else {
-            unreachable!("AV1 的量化索引范围不适用 QP 门禁");
-        };
-        let lo = min.min(max);
-        let hi = min.max(max);
-        let min = floor.clamp(lo, hi);
-        let max = 51.min(hi).max(min);
-        (min, max)
+        self.coding.qp_range(floor)
     }
 
     /// AV1 码控的量化索引范围；只由 AV1 路径调用
     fn q_index_range(&self) -> (u32, u32) {
-        let QuantCaps::QIndex { min, max } = self.quant else {
-            unreachable!("H.26x 的 QP 范围不适用 AV1 量化索引");
-        };
-        (min, max)
+        self.coding.q_index_range()
     }
 
     /// 本帧要挂进 begin 的 GOP 剩余帧数结构；驱动既不强求也不偏好时返回 `None`
@@ -774,32 +602,21 @@ impl FrameEncoder {
         self.poisoned
     }
 
-    /// 目标帧率（帧/秒）；唯一来源是协商档位
+    /// 目标帧率（帧/秒）
     fn fps(&self) -> u32 {
-        self.profile.fps() as u32
+        self.coding.fps()
     }
 
-    /// 目标码率（bps）；唯一来源是协商档位
+    /// 目标码率（bps）
     fn bitrate_bps(&self) -> u64 {
-        self.profile.bitrate() as u64
+        self.coding.bitrate_bps()
     }
 
     /// 运行期改码率：下一帧随码控命令重发，不需要重建会话
     ///
-    /// 这是自研路径的关键收益——码控参数本来就每帧随 `VkVideoCodingControlInfoKHR` 下发，
-    /// 只差一个对外入口。
+    /// 钳制与脏标记由 [`CodingControl`] 负责。
     pub fn set_bitrate(&mut self, bps: u64) {
-        if bps == 0 || bps == self.bitrate_bps() {
-            return;
-        }
-        // 钳到驱动上限（理由见 `new` 里的说明）。带宽估计逐帧变化，这里用 debug 不刷屏
-        let bps = if self.max_bitrate > 0 && bps > self.max_bitrate {
-            self.max_bitrate
-        } else {
-            bps
-        };
-        self.profile.set_bitrate(bps as usize);
-        self.rate_control_dirty = true;
+        self.coding.set_bitrate(bps);
     }
 
     #[cfg(test)]
@@ -818,42 +635,7 @@ impl FrameEncoder {
     /// 帧率变化时 IDR 的**时间**间隔随之改变（60fps 下 1 秒 → 120fps 下 0.5 秒），
     /// 这是可接受的：码率尖峰更密，但不会出错。
     pub fn set_fps(&mut self, fps: u32) {
-        if fps == 0 || fps == self.fps() {
-            return;
-        }
-        self.profile.set_fps(fps as usize);
-        self.rate_control_dirty = true;
-    }
-
-    /// 启用 intra-refresh：用渐进刷新替代周期性 IDR
-    ///
-    /// `cycle_duration` 是刷完整帧所需的帧数，必须落在 `2..=max_intra_refresh_cycle`。
-    /// 超出上限直接报错而不是截断——静默截断会让调用方以为按自己的周期在刷。
-    ///
-    /// **行为**：渐进刷新不产出 IDR，因此这些帧一律按「非关键帧」上报（见 `encode_prepared`
-    /// 的返回值），新观众仍要靠 `force_keyframe` 产真 IDR。这一点不能含糊：把渐进刷新
-    /// 谎报成关键帧，会让接收端的 `waiting_for_keyframe` 门提前打开，然后花屏。
-    pub fn set_intra_refresh(&mut self, cycle_duration: u32) -> Result<(), String> {
-        if self.max_intra_refresh_cycle == 0 {
-            return Err(
-                "驱动未提供 intra-refresh（能力查询或设备 feature 位不成立），不能启用".to_string(),
-            );
-        }
-        if cycle_duration < 2 || cycle_duration > self.max_intra_refresh_cycle {
-            return Err(format!(
-                "intra-refresh 周期必须在 2..={} 之间，收到 {}",
-                self.max_intra_refresh_cycle, cycle_duration
-            ));
-        }
-        self.intra_refresh_cycle = Some(cycle_duration);
-        self.intra_refresh_index = 0;
-        Ok(())
-    }
-
-    /// 当前 intra-refresh 周期；`None` 表示关闭
-    #[cfg(test)]
-    pub fn intra_refresh_cycle(&self) -> Option<u32> {
-        self.intra_refresh_cycle
+        self.coding.set_fps(fps);
     }
 
     /// 上传一帧 NV12 并编码出一个 IDR
@@ -993,10 +775,46 @@ impl Drop for FrameEncoder {
 }
 
 /// 测试档位：1080p60，显式 8 Mbps（绕开动态码率公式，让断言的输入确定）。
-/// codec 不在档位里，由各用例按能力快照单独传给 `FrameEncoder::new`
+/// codec 不在档位里，由各用例按能力快照单独构造会话配置
 #[cfg(test)]
 pub(super) fn test_profile() -> StreamingProfile {
     StreamingProfile::new(1920, 1080, 60, 8_000_000)
+}
+
+/// 测试用静态会话配置：策略可指定，档位固定为 [`test_profile`]
+#[cfg(test)]
+pub(super) fn test_session_config_with(
+    caps: &CodecCaps,
+    policy: &EncodePolicy,
+    device_supports_intra_refresh: bool,
+) -> Result<SessionConfig, String> {
+    SessionConfig::build(caps, &test_profile(), policy, device_supports_intra_refresh)
+}
+
+/// 测试用静态会话配置：固定 GOP，关闭 intra-refresh，保持断言按显式 GOP 进行
+#[cfg(test)]
+pub(super) fn test_session_config(caps: &CodecCaps, gop: u32) -> Result<SessionConfig, String> {
+    test_session_config_with(
+        caps,
+        &EncodePolicy {
+            gop: GopPolicy::Fixed(gop),
+            intra_refresh: super::config::IntraRefreshPolicy::Disable,
+            ..Default::default()
+        },
+        false,
+    )
+}
+
+/// 测试用帧编码器：从静态配置派生默认码控
+#[cfg(test)]
+pub(super) fn test_frame_encoder(
+    device: &VideoDevice,
+    caps: &CodecCaps,
+    gop: u32,
+) -> Result<FrameEncoder, String> {
+    let config = test_session_config(caps, gop)?;
+    let coding = config.coding_control(60);
+    FrameEncoder::new(device, config, coding)
 }
 
 /// 造一帧 NV12：亮度低频渐变、色度四色块

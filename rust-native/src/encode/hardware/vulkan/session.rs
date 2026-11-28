@@ -1,9 +1,8 @@
 //! Vulkan Video 编码会话与其参数对象 (Video Session & Session Parameters)
 //!
-//! **[`VideoSession`]** 只负责「把会话建起来并绑好内存」：几何对齐、DPB 槽位、std 头
-//! 版本全部从 `CodecCaps` 取，任何一项都不写死。本阶段不含编码命令。内存绑定按全成全败
-//! 处理：任一块分配或绑定失败，`SessionGuard` 逆序销毁会话并释放已分配的内存块，
-//! 绝不留下半就绪的会话。
+//! **[`VideoSession`]** 只负责把会话建起来并绑好内存：几何、DPB 与 std 头版本
+//! 全部由 [`SessionConfig`] 给定。内存绑定全成全败，`SessionGuard` 在失败时逆序
+//! 销毁会话并释放已分配内存。
 //!
 //! **[`VideoSessionParameters`]**：编码会话建好之后、发出第一条编码命令之前，必须先把
 //! 参数集交给驱动：Vulkan Video 不做码流语法解析，序列/图像参数集的每个字段都得由应用
@@ -23,11 +22,8 @@ use std::ptr;
 
 use ash::vk;
 
-use super::caps::CodecCaps;
+use super::config::{SequenceConfig, SessionConfig};
 use super::device::VideoDevice;
-
-/// 编码输入图格式：NV12（两平面 4:2:0）
-const PICTURE_FORMAT: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
 
 /// 已创建并完成内存绑定的编码会话
 pub struct VideoSession {
@@ -38,25 +34,15 @@ pub struct VideoSession {
     coded_extent: vk::Extent2D,
     /// 显示尺寸（裁剪窗口内的可见区域）；等于 `coded_extent` 表示不需要裁剪
     display_extent: vk::Extent2D,
-    dpb_slots: u32,
 }
 
 impl VideoSession {
-    /// 按请求几何建会话
+    /// 按静态会话配置建会话
     ///
-    /// 几何会向上对齐到该 codec 的 `pictureAccessGranularity`，对齐结果同时是后续
-    /// 输入图的尺寸依据。**粒度是设备属性，不是常量**：多数驱动报 16（1080→1088），
-    /// NVIDIA 在 1440p 上报 64（1440→1472）。采集侧必须用同一个粒度算尺寸
-    /// （`hardware::coded_align`），否则纹理比编码器要的小，两条采集路径会同时失效。
-    pub fn new(
-        device: &VideoDevice,
-        caps: &CodecCaps,
-        width: u32,
-        height: u32,
-    ) -> Result<Self, String> {
-        caps.validate()?;
+    /// 几何、DPB 与活跃参考数已在 [`SessionConfig::build`] 算好。
+    pub fn new(device: &VideoDevice, config: &SessionConfig) -> Result<Self, String> {
         // 能力探测用的队列族必须与实际建设备用的那一个一致，否则会话会绑到错的队列上
-        if let Some(family) = caps.queue_family
+        if let Some(family) = config.queue_family()
             && family != device.video_queue_family()
         {
             return Err(format!(
@@ -65,40 +51,29 @@ impl VideoSession {
             ));
         }
 
-        let coded_extent = caps.align_extent(width, height)?;
-        // 显示尺寸就是请求的几何；它小于等于编码尺寸，差值由码流里的裁剪窗口抹掉
-        let display_extent = vk::Extent2D { width, height };
-        // AV1 有 8 个逻辑参考槽（`NUM_REF_FRAMES`，KEY 帧 `refresh_frame_flags =
-        // 0xFF`），本实现每帧只写 0/1 两个物理 DPB 槽；逻辑槽由
-        // `referenceNameSlotIndices` / `refresh_frame_flags` 对齐。
-        // 声明值取 min(驱动上限, 8)，下限由 `caps.validate()` 拒绝；代价是最多
-        // 多占 6 层显存（1080p 约 19 MB）。
-        let is_av1 = matches!(caps.codec(), crate::encode::VideoCodec::Av1);
-        let dpb_slots = caps.max_dpb_slots.min(if is_av1 { 8 } else { 2 });
-        let active_references =
-            caps.max_active_reference_pictures
-                .min(if is_av1 { dpb_slots } else { 1 });
+        let coded_extent = config.coded_extent();
+        let display_extent = config.display_extent();
+        let dpb_slots = config.dpb_slots();
+        let active_references = config.active_references();
         log::info!(
-            "视频会话 {:?}: DPB 槽={dpb_slots}（驱动上限 {}）活跃参考={active_references}（驱动上限 {}）",
-            caps.codec(),
-            caps.max_dpb_slots,
-            caps.max_active_reference_pictures,
+            "视频会话 {:?}: DPB 槽={dpb_slots} 活跃参考={active_references}",
+            config.codec(),
         );
 
         // codec 专属的 profile 子结构先落位，再把它的地址挂进 profile 链。
         // `profile_part` 必须先于 `video_profile` 声明：后者只存前者的地址，不拥有它。
-        let mut profile_part = super::caps::ProfilePart::new(caps.codec());
-        let video_profile = profile_part.attach(super::caps::base_profile(caps.codec()));
+        let mut profile_part = super::caps::ProfilePart::new(config.codec());
+        let video_profile = profile_part.attach(super::caps::base_profile(config.codec()));
 
         let create_info = vk::VideoSessionCreateInfoKHR::default()
             .queue_family_index(device.video_queue_family())
             .video_profile(&video_profile)
-            .picture_format(PICTURE_FORMAT)
+            .picture_format(config.picture_format())
             .max_coded_extent(coded_extent)
-            .reference_picture_format(PICTURE_FORMAT)
+            .reference_picture_format(config.picture_format())
             .max_dpb_slots(dpb_slots)
             .max_active_reference_pictures(active_references)
-            .std_header_version(&caps.std_header_version);
+            .std_header_version(config.std_header_version());
 
         // SAFETY: create_info 及其引用的 profile 链、std 头版本在调用期间均存活；
         // 返回的 session 由 guard 接管，失败路径不会泄漏
@@ -197,7 +172,7 @@ impl VideoSession {
         }
         .map_err(|e| format!("绑定会话内存失败: {e:?}"))?;
 
-        Ok(guard.finish(coded_extent, display_extent, dpb_slots))
+        Ok(guard.finish(coded_extent, display_extent))
     }
 
     pub fn session(&self) -> vk::VideoSessionKHR {
@@ -212,10 +187,6 @@ impl VideoSession {
     /// 显示尺寸：编码尺寸可能更大，多出来的部分由裁剪窗口裁掉
     pub fn display_extent(&self) -> vk::Extent2D {
         self.display_extent
-    }
-
-    pub fn dpb_slots(&self) -> u32 {
-        self.dpb_slots
     }
 
     #[cfg(test)]
@@ -250,12 +221,7 @@ struct SessionGuard {
 }
 
 impl SessionGuard {
-    fn finish(
-        mut self,
-        coded_extent: vk::Extent2D,
-        display_extent: vk::Extent2D,
-        dpb_slots: u32,
-    ) -> VideoSession {
+    fn finish(mut self, coded_extent: vk::Extent2D, display_extent: vk::Extent2D) -> VideoSession {
         let session = self.session.take().expect("finish 只调用一次");
         let memory = std::mem::take(&mut self.memory);
         // 字段已腾空，随后 self 的 Drop 不会重复释放
@@ -265,7 +231,6 @@ impl SessionGuard {
             memory,
             coded_extent,
             display_extent,
-            dpb_slots,
         }
     }
 }
@@ -297,6 +262,25 @@ pub struct VideoSessionParameters {
 }
 
 impl VideoSessionParameters {
+    /// 按静态序列头配置构造参数对象
+    ///
+    /// 唯一的 codec 分派点：调用方只传 [`SequenceConfig`]，不按 codec 选方法。
+    pub(super) fn new(
+        device: &VideoDevice,
+        session: &VideoSession,
+        sequence: &SequenceConfig,
+    ) -> Result<Self, String> {
+        match sequence {
+            SequenceConfig::H264(config) => {
+                Self::new_h264(device, session, config.level_idc, config.frame_num_bits)
+            }
+            SequenceConfig::H265(config) => {
+                Self::new_h265(device, session, config.level_idc, config.frame_num_bits)
+            }
+            SequenceConfig::Av1(config) => Self::new_av1(device, session, config),
+        }
+    }
+
     pub fn params(&self) -> vk::VideoSessionParametersKHR {
         self.params
     }
@@ -445,20 +429,28 @@ mod tests {
                 return;
             }
         };
-        match VideoSession::new(&device, &caps, 1920, 1080) {
+        let config =
+            match crate::encode::hardware::vulkan::frame_encoder::test_session_config(&caps, 60) {
+                Ok(config) => config,
+                Err(e) => {
+                    println!("会话配置构造失败，跳过: {e}");
+                    return;
+                }
+            };
+        match VideoSession::new(&device, &config) {
             Ok(session) => {
                 println!(
                     "会话创建成功: 编码尺寸 {}x{} / DPB {} / 会话内存块 {}",
                     session.coded_extent().width,
                     session.coded_extent().height,
-                    session.dpb_slots(),
+                    config.dpb_slots(),
                     session.memory_count()
                 );
                 // 1080p 在 16 粒度下的编码尺寸是文档明确的 1920x1088；DPB 与内存块
                 // 必须已就位，否则会话是「建出来但用不了」的半成品
                 assert_eq!(session.coded_extent().width, 1920);
                 assert_eq!(session.coded_extent().height, 1088);
-                assert!(session.dpb_slots() > 0, "DPB 槽位必须已分配");
+                assert!(config.dpb_slots() > 0, "DPB 槽位必须已分配");
                 assert!(session.memory_count() > 0, "会话内存块必须已绑定");
             }
             Err(e) => println!("会话创建失败: {e}"),
