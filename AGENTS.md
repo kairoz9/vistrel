@@ -118,9 +118,21 @@ cd rust-native && cargo build --release
 
 ### 4.3 发布
 
-推 `v*` tag 触发 `release.yml`。tag 必须与 `gradle.properties` / `rust-native/Cargo.toml` / `web/package.json` 三处版本一致（workflow 自动校验）。产物为 GitHub Release（10 个 jar + SHA256SUMS）；CurseForge 上传在配置 `vars.CURSEFORGE_PROJECT_ID` 与 `secrets.CURSEFORGE_TOKEN` 后自动生效，未配置则跳过。
+推 `v*` tag 触发 `release.yml`。tag 必须与 `gradle.properties` / `rust-native/Cargo.toml` / `web/package.json` 三处版本一致（workflow 自动校验）。产物为 GitHub Release（10 个 jar + SHA256SUMS）。
 
-**必须打 annotated tag 并写明变更要点**：该 annotation 同时是 GitHub Release 正文和 10 个 CurseForge 文件 changelog 的正文。lightweight tag 无 annotation，会回落到只含链接的默认正文，不满足 CF Fair Play「Files must include a change log describing the changes from the previous version」。首次发布（0.1.0）自动附加 `Initial release.`。`--cleanup=whitespace` 不可省，否则默认清理会剥掉 `#` 开头的 Markdown 标题。
+三个分发平台各有独立 job，凭据缺省即整组跳过，互不连累：
+
+| 平台 | 仓库变量 | Secret | 实现 |
+| --- | --- | --- | --- |
+| CurseForge | `CURSEFORGE_PROJECT_ID` | `CURSEFORGE_TOKEN` | `publish-curseforge.yml` |
+| Modrinth | `MODRINTH_PROJECT_ID` | `MODRINTH_TOKEN` | `publish-modrinth.yml` |
+| BBSMC | `BBSMC_PROJECT_ID` | `BBSMC_TOKEN` | `publish-bbsmc.yml`（`POST /v3/version` multipart，无 action 支持） |
+
+每个平台的工作流只声明 `workflow_call`，由 `release.yml` 调用（与 `build.yml` 同一模式），不单独监听 tag，避免绕过构建链路重复发布。三者共用 `.github/scripts/compose-changelog.sh` 生成 per-version changelog。
+
+Modrinth 与 BBSMC 都**不按版本号去重**：同一 tag 整组重跑会产生重复 version，重跑前先查已有版本，或只重跑失败的矩阵腿。BBSMC 的 `game-versions` 必须写精确版本数组，不能用 Maven 区间。
+
+**必须打 annotated tag 并写明变更要点**：该 annotation 同时是 GitHub Release 正文和各平台每个 jar 的 changelog 正文（由 `.github/scripts/compose-changelog.sh` 统一生成）。lightweight tag 无 annotation，会回落到只含链接的默认正文，不满足 CF Fair Play「Files must include a change log describing the changes from the previous version」。首次发布（0.1.0）自动附加 `Initial release.`。`--cleanup=whitespace` 不可省，否则默认清理会剥掉 `#` 开头的 Markdown 标题。
 
 ```bash
 git tag -a v0.1.0 --cleanup=whitespace -m "## Vistrel 0.1.0
@@ -130,7 +142,7 @@ git tag -a v0.1.0 --cleanup=whitespace -m "## Vistrel 0.1.0
 " && git push origin v0.1.0
 ```
 
-**发布闸门**：默认只构建不发布。真实发布需仓库变量 `RELEASE_PUBLISH_ENABLED=true`，否则推 tag 只产出 artifact 与 SHA256SUMS，跳过 Release 与 CurseForge 上传。
+**发布闸门**：默认只构建不发布。真实发布需仓库变量 `RELEASE_PUBLISH_ENABLED=true`，否则推 tag 只产出 artifact 与 SHA256SUMS，跳过 Release 与三个平台的上传。
 
 ```bash
 gh variable set RELEASE_PUBLISH_ENABLED --body true   # 开启真实发布

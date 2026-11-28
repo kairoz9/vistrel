@@ -1,0 +1,129 @@
+name: Publish to BBSMC
+
+# 由 release.yml 以 workflow_call 调用。
+# BBSMC 是 Modrinth 的社区分叉，版本创建端点同为 multipart：data(JSON) 必须
+# 排在文件字段之前；文件字段名要与 file_parts 里的条目一致。
+# 它没有 mc-publish 支持，game-versions 必须显式列出精确版本，不能写 Maven 区间。
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 发布版本号（不含 v 前缀）
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: ${{ matrix.loader }} ${{ matrix.mc }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { mc: '1.20',   loader: fabric,   file: 'vistrel-fabric-1.20-*.jar',     game-versions: '["1.20","1.20.1"]' }
+          - { mc: '1.20',   loader: forge,    file: 'vistrel-forge-1.20-*.jar',      game-versions: '["1.20","1.20.1"]' }
+          - { mc: '1.21',   loader: fabric,   file: 'vistrel-fabric-1.21-*.jar',     game-versions: '["1.21","1.21.1","1.21.2","1.21.3","1.21.4","1.21.5","1.21.6","1.21.7","1.21.8","1.21.9","1.21.10","1.21.11"]' }
+          - { mc: '1.21',   loader: neoforge, file: 'vistrel-neoforge-1.21-*.jar',   game-versions: '["1.21","1.21.1","1.21.2","1.21.3","1.21.4","1.21.5","1.21.6","1.21.7","1.21.8","1.21.9","1.21.10","1.21.11"]' }
+          - { mc: '26.1',   loader: fabric,   file: 'vistrel-fabric-26.1-*.jar',     game-versions: '["26.1","26.1.1","26.1.2"]' }
+          - { mc: '26.1',   loader: neoforge, file: 'vistrel-neoforge-26.1-*.jar',   game-versions: '["26.1.2"]' }
+          - { mc: '26.2',   loader: fabric,   file: 'vistrel-fabric-26.2-*.jar',     game-versions: '["26.2"]' }
+          - { mc: '26.2',   loader: neoforge, file: 'vistrel-neoforge-26.2-*.jar',   game-versions: '["26.2"]' }
+          - { mc: '26.3',   loader: fabric,   file: 'vistrel-fabric-26.3-*.jar',     game-versions: '["26.3"]' }
+          - { mc: '26.3',   loader: neoforge, file: 'vistrel-neoforge-26.3-*.jar',   game-versions: '["26.3"]' }
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download distributable jars
+        uses: actions/download-artifact@v8
+        with:
+          name: distributable-jars
+          path: dist
+
+      - name: Download release metadata
+        uses: actions/download-artifact@v8
+        with:
+          name: release-meta
+          path: meta
+
+      - name: Compose per-file changelog
+        run: |
+          bash .github/scripts/compose-changelog.sh \
+            "${{ inputs.version }}" \
+            meta/release-body.md \
+            "changelog-${{ matrix.mc }}-${{ matrix.loader }}.md"
+
+      - name: Publish to BBSMC
+        env:
+          BBSMC_API: https://api.bbsmc.net/v3/version
+          BBSMC_TOKEN: ${{ secrets.BBSMC_TOKEN }}
+          BBSMC_PROJECT_ID: ${{ vars.BBSMC_PROJECT_ID }}
+          VERSION: ${{ inputs.version }}
+          MC: ${{ matrix.mc }}
+          LOADER: ${{ matrix.loader }}
+          FILE_PATTERN: ${{ matrix.file }}
+          GAME_VERSIONS: ${{ matrix.game-versions }}
+          CHANGELOG: changelog-${{ matrix.mc }}-${{ matrix.loader }}.md
+        run: |
+          set -euo pipefail
+          cd dist
+          # 匹配必须唯一：多匹配说明 dist/ 里混进了别的构建，宁可失败也不要传错文件
+          set -- $FILE_PATTERN
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::dist/ 中匹配 $FILE_PATTERN 的文件应为 1 个，实际 $# 个"
+            exit 1
+          fi
+          file="$1"
+
+          case "$LOADER" in
+            fabric) label=Fabric ;;
+            neoforge) label=NeoForge ;;
+            forge) label=Forge ;;
+            *) label="$LOADER" ;;
+          esac
+
+          # Fabric 版本在 fabric.mod.json 里声明了 Fabric API 依赖，上传时同步挂上。
+          # 这里必须用 BBSMC 的项目 ID（csKbPOGD），不能复用 Modrinth 的 P7dR8mSH。
+          if [ "$LOADER" = "fabric" ]; then
+            deps='[{"project_id":"csKbPOGD","version_id":null,"file_name":null,"dependency_type":"required"}]'
+          else
+            deps='[]'
+          fi
+
+          data=$(jq -c -n \
+            --arg project "$BBSMC_PROJECT_ID" \
+            --arg file "$file" \
+            --arg number "$VERSION" \
+            --arg title "Vistrel $VERSION ($label $MC)" \
+            --arg changelog "$(cat "../$CHANGELOG")" \
+            --arg loader "$LOADER" \
+            --argjson versions "$GAME_VERSIONS" \
+            --argjson deps "$deps" \
+            '{
+              project_id: $project,
+              file_parts: [$file],
+              version_number: $number,
+              version_title: $title,
+              version_body: $changelog,
+              dependencies: $deps,
+              release_channel: "release",
+              loaders: [$loader],
+              game_versions: $versions,
+              environment: "client_only",
+              featured: false,
+              primary_file: $file,
+              status: "listed",
+              disk_only: false
+            }')
+
+          response=$(curl --fail-with-body -sS -X POST "$BBSMC_API" \
+            -H "Authorization: Bearer $BBSMC_TOKEN" \
+            -F "data=$data;type=application/json" \
+            -F "$file=@$file;type=application/java-archive")
+
+          echo "$response" | jq -e '.id' > /dev/null \
+            || { echo "::error::BBSMC 未返回 version id"; echo "$response"; exit 1; }
+          echo "uploaded $file -> $(echo "$response" | jq -r '.id')"

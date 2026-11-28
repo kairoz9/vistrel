@@ -1,0 +1,77 @@
+name: Publish to CurseForge
+
+# 由 release.yml 以 workflow_call 调用；不单独监听 tag，避免与构建链路脱钩后重复发布。
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 发布版本号（不含 v 前缀）
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: ${{ matrix.loader }} ${{ matrix.mc }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # game-versions 用 Maven 区间语法，逐字对应 stonecutter.properties.toml 各线 minecraft.version_range
+      # （mc-publish 运行时对 CF 官方版本列表展开，默认 game-version-filter 只收稳定正式版，
+      #   排除快照/beta/RC——jar 依赖区间内存在哪些正式版就打哪些，无需随 CF 补丁版本手动维护）
+      # glob 以 -<MC>- 锚定版本号边界，防止前缀重合的版本互相误配
+      matrix:
+        include:
+          - { mc: '1.20',   loader: fabric,   file: 'vistrel-fabric-1.20-*.jar',     game-versions: '[1.20,1.20.2)',   java: 17 }
+          - { mc: '1.20',   loader: forge,    file: 'vistrel-forge-1.20-*.jar',      game-versions: '[1.20,1.20.2)',   java: 17 }
+          - { mc: '1.21',   loader: fabric,   file: 'vistrel-fabric-1.21-*.jar',     game-versions: '[1.21,1.21.12)',  java: 21 }
+          - { mc: '1.21',   loader: neoforge, file: 'vistrel-neoforge-1.21-*.jar',   game-versions: '[1.21,1.21.12)',  java: 21 }
+          - { mc: '26.1',   loader: fabric,   file: 'vistrel-fabric-26.1-*.jar',     game-versions: '[26.1,26.2)',     java: 25 }
+          # NeoForge 26.1 线的稳定版从 26.1.2.71 起；26.1 / 26.1.1 只有 alpha/beta 构建，
+          # 因此该 jar 的依赖下限 [26.1.2.71,) 只能覆盖 26.1.2
+          - { mc: '26.1',   loader: neoforge, file: 'vistrel-neoforge-26.1-*.jar',   game-versions: '26.1.2',          java: 25 }
+          - { mc: '26.2',   loader: fabric,   file: 'vistrel-fabric-26.2-*.jar',     game-versions: '[26.2,26.3)',     java: 25 }
+          - { mc: '26.2',   loader: neoforge, file: 'vistrel-neoforge-26.2-*.jar',   game-versions: '[26.2,26.3)',     java: 25 }
+          - { mc: '26.3',   loader: fabric,   file: 'vistrel-fabric-26.3-*.jar',     game-versions: '[26.3,26.4)',     java: 25 }
+          - { mc: '26.3',   loader: neoforge, file: 'vistrel-neoforge-26.3-*.jar',   game-versions: '[26.3,26.4)',     java: 25 }
+    steps:
+      # 复用仓库内的 changelog 脚本；不 checkout 时 workspace 只有下载下来的 artifact
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download distributable jars
+        uses: actions/download-artifact@v8
+        with:
+          name: distributable-jars
+          path: dist
+
+      - name: Download release metadata
+        uses: actions/download-artifact@v8
+        with:
+          name: release-meta
+          path: meta
+
+      - name: Compose per-file changelog
+        run: |
+          bash .github/scripts/compose-changelog.sh \
+            "${{ inputs.version }}" \
+            meta/release-body.md \
+            "changelog-${{ matrix.mc }}-${{ matrix.loader }}.md"
+
+      - name: Publish to CurseForge
+        # environment 显式 client
+        # name 必须显式置空而非省略：省略时 program.ts 回落到「触发 release 的标题」
+        uses: Kira-NT/mc-publish@v3
+        with:
+          curseforge-id: ${{ vars.CURSEFORGE_PROJECT_ID }}
+          curseforge-token: ${{ secrets.CURSEFORGE_TOKEN }}
+          files: dist/${{ matrix.file }}
+          name: ''
+          version-type: release
+          game-versions: ${{ matrix.game-versions }}
+          loaders: ${{ matrix.loader }}
+          environment: client
+          java: ${{ matrix.java }}
+          changelog-file: changelog-${{ matrix.mc }}-${{ matrix.loader }}.md
