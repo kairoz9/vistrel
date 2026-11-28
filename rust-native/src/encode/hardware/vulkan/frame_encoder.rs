@@ -401,7 +401,47 @@ impl FrameEncoder {
         let mut profile_part = ProfilePart::new(caps.codec);
         let mut video_profile = profile_part.attach(base_profile(caps.codec));
 
-        let image = Nv12Image::new_video(device, extent, &video_profile)?;
+        // 输入图 padding 由 `CodecCaps::input_pad` 决定；编码尺寸仍是 `extent`。
+        let pad = caps.input_pad(extent);
+        let image_extent = pad.extent;
+        if pad.dropped {
+            log::warn!(
+                "{:?} 输入 padding 超出图像上限 maxImageDimension2D={}，\
+                 超限轴退回 coded extent；实际分配 {}x{}",
+                caps.codec,
+                caps.max_image_dimension,
+                pad.extent.width,
+                pad.extent.height
+            );
+        } else if image_extent != extent {
+            log::debug!(
+                "{:?} 输入图按 encodeInputPictureGranularity 补齐: coded {}x{} → 分配 {}x{}",
+                caps.codec,
+                extent.width,
+                extent.height,
+                image_extent.width,
+                image_extent.height
+            );
+        }
+        // 设备级 `maxImageDimension2D` 不保证等于该格式的 `maxExtent`：padding 尺寸
+        // 建图失败时退回 coded extent，避免 advisory 字段把整个后端拒掉。
+        let image = match Nv12Image::new_video(device, extent, image_extent, &video_profile) {
+            Ok(image) => image,
+            Err(first) if image_extent != extent => {
+                log::warn!(
+                    "{:?} padding 尺寸 {}x{} 创建输入图失败（{first}），退回 coded extent {}x{}",
+                    caps.codec,
+                    image_extent.width,
+                    image_extent.height,
+                    extent.width,
+                    extent.height
+                );
+                Nv12Image::new_video(device, extent, extent, &video_profile).map_err(|second| {
+                    format!("输入图创建失败（padding 尺寸: {first}；coded 尺寸仍失败: {second}）")
+                })?
+            }
+            Err(e) => return Err(e),
+        };
         // CSC 是可选能力：不支持 storage image 的机器仍然能走 CPU 上传路径，
         // 因此这里不把构造失败当成整体失败，Err 原样保留
         let csc = ColorConverter::new(device, extent);
