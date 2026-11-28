@@ -27,7 +27,6 @@ use ash::vk::{self, TaggedStructure};
 
 use super::{CodecRateControl, FrameEncoder, begin_scope, intra_refresh_info, picture_resource};
 use crate::encode::VideoCodec;
-use crate::encode::hardware::vulkan::caps::CodecCaps;
 use crate::encode::hardware::vulkan::device::VideoDevice;
 use crate::encode::hardware::vulkan::session::{VideoSession, VideoSessionParameters};
 
@@ -130,7 +129,7 @@ pub(super) fn vui() -> StdVideoH264SequenceParameterSetVui {
 /// 序列参数集
 ///
 /// `level_idc` 是 `StdVideoH264LevelIdc` 枚举值，必须先经 [`level_to_vk`] 转换；
-/// 不用 `CodecCaps::max_level_idc`：那是驱动能力上限，比内容实际需要的高。
+/// 不用 `H26xCaps::max_level_idc`：那是驱动能力上限，比内容实际需要的高。
 ///
 /// `frame_num_bits` 是 `log2(MaxFrameNum)`，取值 4..=12。它由 GOP 长度决定：
 /// 一个 GOP 内的 `frame_num` 必须不重复，否则参考链会错乱。intra-refresh 需要长 GOP，
@@ -383,14 +382,9 @@ impl VideoSessionParameters {
     pub(super) fn new_h264(
         device: &VideoDevice,
         session: &VideoSession,
-        caps: &CodecCaps,
         level_idc: u32,
         frame_num_bits: u32,
     ) -> Result<Self, String> {
-        if caps.codec != VideoCodec::H264 {
-            return Err(format!("H.264 会话参数收到 {:?}", caps.codec));
-        }
-
         let extent = session.coded_extent();
         if !extent.width.is_multiple_of(MB_SIZE) || !extent.height.is_multiple_of(MB_SIZE) {
             return Err(format!(
@@ -773,7 +767,7 @@ mod tests {
         // 与生产路径同源：按内容推导 level，而不是驱动声明的最高 level
         let level = u32::from(crate::encode::h264_level_idc(1920, 1080, 60, 8_000));
         let level_vk = level_to_vk(level).expect("推导出的 level 必须能映射到枚举");
-        match VideoSessionParameters::new_h264(&device, &session, &caps, level, 4) {
+        match VideoSessionParameters::new_h264(&device, &session, level, 4) {
             Ok(params) => {
                 let sets = params.parameter_sets();
                 println!(
@@ -782,7 +776,7 @@ mod tests {
                     session.coded_extent().height,
                     level,
                     level_vk,
-                    caps.max_level_idc,
+                    caps.max_level(),
                     sets.len(),
                     params.params()
                 );
@@ -857,7 +851,7 @@ mod tests {
                 return;
             }
         };
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), caps.codec, 15) {
+        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), 15) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("编码器初始化失败: {e}");
@@ -989,7 +983,7 @@ mod tests {
                 return;
             }
         };
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), caps.codec, 15) {
+        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), 15) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("编码器初始化失败: {e}");
@@ -1055,7 +1049,7 @@ mod tests {
         }
 
         // GOP 取 300 帧：frame_num 位宽应升到 9，否则参考链会在 GOP 中途断掉
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), caps.codec, 300) {
+        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), 300) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("编码器初始化失败: {e}");

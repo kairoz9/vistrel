@@ -222,7 +222,7 @@ impl VulkanVideoBackend {
             Some(_) => INTRA_REFRESH_GOP,
             None => fps.max(2),
         };
-        let mut encoder = FrameEncoder::new(&device, &caps, profile, codec, gop)?;
+        let mut encoder = FrameEncoder::new(&device, &caps, profile, gop)?;
         if let Some(cycle) = intra_cycle {
             encoder.set_intra_refresh(cycle)?;
         }
@@ -230,7 +230,7 @@ impl VulkanVideoBackend {
         log::info!(
             "Vulkan {:?} {width}x{height}@{fps}: intra-refresh 模式 [{}] present={} \
                      max_cycle={} 驱动 active_ref={} 设备 feature={} ⇒ 会话 cycle={:?} gop={gop}",
-            caps.codec,
+            caps.codec(),
             caps.intra_refresh_modes,
             caps.intra_refresh_modes_present,
             caps.max_intra_refresh_cycle_duration,

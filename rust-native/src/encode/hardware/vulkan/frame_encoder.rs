@@ -12,7 +12,7 @@
 // `push` 是 `TaggedStructure` trait 的方法，不导入就无法链 pNext
 use ash::vk::{self, TaggedStructure};
 
-use super::caps::{CodecCaps, ProfilePart, base_profile};
+use super::caps::{CodecCaps, CodecSpecific, ProfilePart, base_profile};
 use super::csc::ColorConverter;
 use super::device::{HostBuffer, VideoDevice};
 use super::image::{DpbImages, Nv12Image};
@@ -170,10 +170,10 @@ pub struct FrameEncoder {
     ///
     /// intra-refresh 打开时取大值，靠渐进刷新代替周期性 IDR。
     gop_length: u32,
-    /// AV1 码控的量化索引上下限（来自 `CodecCaps`）；H.26x 用 `min_qp` / `max_qp`
+    /// AV1 码控的量化索引上下限（来自能力快照）；H.26x 用 `min_qp` / `max_qp`
     min_q_index: u32,
     max_q_index: u32,
-    /// H.264/H.265 的 QP 范围（来自 `CodecCaps`）；AV1 不读
+    /// H.264/H.265 的 QP 范围（来自能力快照）；AV1 不读
     min_qp: i32,
     max_qp: i32,
     /// 驱动要求/偏好 begin 时给出 GOP 剩余帧数（`requires || prefers`）
@@ -349,7 +349,7 @@ fn gop_remaining_counts(gop_length: u32, frame_num: u32, is_key: bool) -> (u32, 
     (remaining_i, remaining_p)
 }
 
-/// 把推导出的 level 换算成与 `max_level_idc` 相同的枚举域
+/// 把推导出的 level 换算成与 `CodecCaps::max_level` 相同的枚举域
 ///
 /// H.264/H.265 的 std 字段是枚举，AV1 的 `maxLevel` 与 `seq_level_idx` 同域；
 /// 三个映射在这里收口，`FrameEncoder::new` 不必按 codec 分支。
@@ -362,9 +362,9 @@ fn level_enum(codec: VideoCodec, level: u32) -> Result<u32, String> {
 }
 
 impl FrameEncoder {
-    /// 帧编码器构造：校验档位与能力快照一致（codec 错位即报错）、请求码率钳进驱动
-    /// 声明上限（钳制写回档位，0 视为无上限）、建视频会话与参数对象（level 与
-    /// frame_num 位宽按档位与 GOP 推导）、NV12 输入图、DPB 图与码流缓冲
+    /// 帧编码器构造：请求码率钳进驱动声明上限（钳制写回档位，0 视为无上限）、建视频
+    /// 会话与参数对象（level 与 frame_num 位宽按档位与 GOP 推导）、NV12 输入图、
+    /// DPB 图与码流缓冲。codec 由能力快照决定。
     ///
     /// 全成全败，任一环节失败即 `Err`；GOP 长度必须 ≥ 2。CSC 是可选能力，其构造
     /// 失败原样保留为 `Err`，主机帧与显存槽位两条路径据此报错，CPU 上传路径照常工作
@@ -372,16 +372,9 @@ impl FrameEncoder {
         device: &VideoDevice,
         caps: &CodecCaps,
         profile: StreamingProfile,
-        codec: VideoCodec,
         gop_length: u32,
     ) -> Result<Self, String> {
-        // 请求的 codec 必须与能力快照一致：快照按 codec 探测，错位的会话直接判非法
-        if codec != caps.codec {
-            return Err(format!(
-                "协商 codec 是 {:?}，能力快照是 {:?}，两者必须一致",
-                codec, caps.codec
-            ));
-        }
+        let codec = caps.codec();
         if gop_length < 2 {
             return Err(format!("GOP 长度必须 ≥ 2，收到 {gop_length}"));
         }
@@ -408,7 +401,7 @@ impl FrameEncoder {
         )?;
         // 码流的 level 一律按**当前档位**推导 —— 与 NVENC 同一个函数、同一组输入。
         let level = crate::encode::profile_level(
-            caps.codec,
+            codec,
             profile.width(),
             profile.height(),
             profile.fps(),
@@ -417,37 +410,41 @@ impl FrameEncoder {
         // 推导 level 不能超过驱动上限：低端编码器可能只到 4.1，而 1080p60 + 8 Mbps
         // 就是 4.2。超限时声明该 level 不合法，明确报错胜过静默降级，由上层换后端
         // 或降档；SDP 的 level 仍按内容推导，不受这里影响。
-        let level_vk = level_enum(caps.codec, level)?;
-        if level_vk > caps.max_level_idc {
+        let level_vk = level_enum(codec, level)?;
+        if level_vk > caps.max_level() {
             return Err(format!(
                 "{:?} 档位 {}x{}@{} 需要 level 枚举 {}（码流值 {}），超过驱动声明的上限 {}",
-                caps.codec,
+                codec,
                 profile.width(),
                 profile.height(),
                 profile.fps(),
                 level_vk,
                 level,
-                caps.max_level_idc
+                caps.max_level()
             ));
         }
         // SPS 的 frame_num 位宽必须装得下整个 GOP，否则参考链会错乱
-        let params = match caps.codec {
+        let params = match codec {
             VideoCodec::H264 => VideoSessionParameters::new_h264(
                 device,
                 &session,
-                caps,
                 level,
                 frame_num_bits(gop_length),
             )?,
             VideoCodec::H265 => VideoSessionParameters::new_h265(
                 device,
                 &session,
-                caps,
                 level,
                 frame_num_bits(gop_length),
             )?,
-            // AV1 没有 frame_num 位宽这回事：序列头由驱动生成，参数集里没有可调的位宽字段
-            VideoCodec::Av1 => VideoSessionParameters::new_av1(device, &session, caps, level)?,
+            // AV1 没有 frame_num 位宽这回事：序列头由驱动生成，参数集里没有可调的位宽字段。
+            // codec 由 `caps.codec()` 推出，此分支的变体必然是 `Av1`
+            VideoCodec::Av1 => match &caps.specific {
+                CodecSpecific::Av1(specific) => {
+                    VideoSessionParameters::new_av1(device, &session, specific, level)?
+                }
+                _ => unreachable!("codec 与能力快照变体不一致"),
+            },
         };
         // 驱动只写 slice NAL，参数集要拼到 IDR 前面（字节由驱动序列化，见 session）
         let parameter_sets = params.parameter_sets().to_vec();
@@ -462,8 +459,8 @@ impl FrameEncoder {
         // profile 只存指针链（顶层 → codec 专属子结构），必须活过这三处 create 调用，
         // 所以建在这里；下面的 feedback 查询池复用同一份。
         // `profile_part` 先于 `video_profile` 声明：后者只存前者的地址。
-        let mut profile_part = ProfilePart::new(caps.codec);
-        let mut video_profile = profile_part.attach(base_profile(caps.codec));
+        let mut profile_part = ProfilePart::new(codec);
+        let mut video_profile = profile_part.attach(base_profile(codec));
 
         // 输入图 padding 由 `CodecCaps::input_pad` 决定；编码尺寸仍是 `extent`。
         let pad = caps.input_pad(extent);
@@ -472,7 +469,7 @@ impl FrameEncoder {
             log::warn!(
                 "{:?} 输入 padding 超出图像上限 maxImageDimension2D={}，\
                  超限轴退回 coded extent；实际分配 {}x{}",
-                caps.codec,
+                codec,
                 caps.max_image_dimension,
                 pad.extent.width,
                 pad.extent.height
@@ -480,7 +477,7 @@ impl FrameEncoder {
         } else if image_extent != extent {
             log::debug!(
                 "{:?} 输入图按 encodeInputPictureGranularity 补齐: coded {}x{} → 分配 {}x{}",
-                caps.codec,
+                codec,
                 extent.width,
                 extent.height,
                 image_extent.width,
@@ -494,7 +491,7 @@ impl FrameEncoder {
             Err(first) if image_extent != extent => {
                 log::warn!(
                     "{:?} padding 尺寸 {}x{} 创建输入图失败（{first}），退回 coded extent {}x{}",
-                    caps.codec,
+                    codec,
                     image_extent.width,
                     image_extent.height,
                     extent.width,
@@ -622,9 +619,17 @@ impl FrameEncoder {
         );
         let res = res.finish();
 
+        // AV1 的量化索引范围与 H.26x 的 QP 范围都来自能力快照；互斥字段按变体取
+        let (min_q_index, max_q_index, min_qp, max_qp) = match &caps.specific {
+            CodecSpecific::H264(specific) | CodecSpecific::H265(specific) => {
+                (0, 0, specific.min_qp, specific.max_qp)
+            }
+            CodecSpecific::Av1(specific) => (specific.min_q_index, specific.max_q_index, 0, 0),
+        };
+
         Ok(Self {
             device: device.clone(),
-            codec: caps.codec,
+            codec,
             params,
             session,
             image,
@@ -643,10 +648,10 @@ impl FrameEncoder {
             max_bitrate: caps.max_bitrate,
             gop_length,
             // AV1 的量化索引范围与 H.26x 的 QP 范围都来自能力查询
-            min_q_index: caps.min_q_index,
-            max_q_index: caps.max_q_index,
-            min_qp: caps.min_qp,
-            max_qp: caps.max_qp,
+            min_q_index,
+            max_q_index,
+            min_qp,
+            max_qp,
             gop_remaining_frames: caps.requires_gop_remaining_frames
                 || caps.prefers_gop_remaining_frames,
             feedback_has_overrides,
@@ -1041,7 +1046,7 @@ pub(super) fn make_noisy_frame(extent: vk::Extent2D, seed: u32) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// 推导 level 必须换算到与 `max_level_idc` 相同的枚举域
+    /// 推导 level 必须换算到与 `CodecCaps::max_level` 相同的枚举域
     #[test]
     fn test_level_enum_domains() {
         // H.264 语法值 42（4.2）在 std 里是枚举 12

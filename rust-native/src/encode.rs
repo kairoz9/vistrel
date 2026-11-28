@@ -571,7 +571,7 @@ pub fn av1_level_idx(width: usize, height: usize, fps: usize, bitrate_kbps: u32)
 /// 这个分工是硬约束：SDP 只有一次 offer/answer，写死之后改不了；而档位随时可能升。
 /// 反过来把码流也按上限声明则是错的（声明远高于实际，浪费且无意义）。
 ///
-/// 不要用 `CodecCaps::max_level_idc`：那是**驱动能力上限**（H.264 常报 6.2），
+/// 不要用 `CodecCaps::max_level()`：那是**驱动能力上限**（H.264 常报 6.2），
 /// 拿它当码流 level 会让码流比 SDP 声明的高，方向正好反了。
 pub fn profile_level(
     codec: VideoCodec,

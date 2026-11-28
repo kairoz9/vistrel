@@ -45,7 +45,6 @@ use ash::vk::{self, TaggedStructure};
 
 use super::{CodecRateControl, FrameEncoder, begin_scope, intra_refresh_info, picture_resource};
 use crate::encode::VideoCodec;
-use crate::encode::hardware::vulkan::caps::CodecCaps;
 use crate::encode::hardware::vulkan::device::VideoDevice;
 use crate::encode::hardware::vulkan::session::{VideoSession, VideoSessionParameters};
 
@@ -528,13 +527,9 @@ impl VideoSessionParameters {
     pub(super) fn new_h265(
         device: &VideoDevice,
         session: &VideoSession,
-        caps: &CodecCaps,
         level_idc: u32,
         frame_num_bits: u32,
     ) -> Result<Self, String> {
-        if caps.codec != VideoCodec::H265 {
-            return Err(format!("H.265 会话参数收到 {:?}", caps.codec));
-        }
         let extent = session.coded_extent();
         let dpb = dpb();
         let ptl = profile_tier_level(level_idc)?;
@@ -939,7 +934,7 @@ mod tests {
         };
         // 与生产路径同源：按内容推导 level，而不是驱动声明的最高 level
         let level = u32::from(crate::encode::hevc_level_idc(1920, 1080, 60, 8_000));
-        match VideoSessionParameters::new_h265(&device, &session, &caps, level, 9) {
+        match VideoSessionParameters::new_h265(&device, &session, level, 9) {
             Ok(params) => {
                 let sets = params.parameter_sets();
                 println!(
@@ -947,7 +942,7 @@ mod tests {
                     session.coded_extent().width,
                     session.coded_extent().height,
                     level,
-                    caps.max_level_idc,
+                    caps.max_level(),
                     sets.len(),
                     params.params()
                 );
@@ -1016,7 +1011,7 @@ mod tests {
                 return;
             }
         };
-        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), caps.codec, 15) {
+        let mut encoder = match FrameEncoder::new(&device, &caps, test_profile(), 15) {
             Ok(encoder) => encoder,
             Err(e) => {
                 println!("H.265 编码器初始化失败: {e}");
