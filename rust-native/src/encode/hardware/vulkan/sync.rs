@@ -3,8 +3,8 @@
 //! 与 sync1 的 `vkCmdPipelineBarrier` 相比，`VkImageMemoryBarrier2` 把
 //! `srcStageMask` / `dstStageMask` 收进**每个屏障自身**。由此得到两个直接好处：
 //!
-//! 1. 一次 `vkCmdPipelineBarrier2` 可以混合不同阶段的依赖，不再被迫按
-//!    「阶段对」拆成多次调用；
+//! 1. 一次 `vkCmdPipelineBarrier2` 可以混合不同阶段的依赖，不必按「阶段对」
+//!    拆成多次调用；
 //! 2. 「纯布局转换、没有访问依赖」有了明确写法 —— `VK_PIPELINE_STAGE_2_NONE`。
 //!    sync1 只能用 `TOP_OF_PIPE` 这种「不是真实阶段」的占位去凑，而且把
 //!    `srcAccessMask` 写成非空也不会报错，只会得到一个静默失效的依赖。
@@ -27,7 +27,7 @@ pub(super) struct StageAccess {
 impl StageAccess {
     /// 传输阶段读
     ///
-    /// 平面拷贝的跨队列可见性已并入信号量依赖，生产侧不再声明传输读屏障；
+    /// 平面拷贝的跨队列可见性已并入信号量依赖，生产路径不声明传输读屏障；
     /// 目前仅测试读回（`record_readback`）使用
     #[cfg(test)]
     pub(super) fn transfer_read() -> Self {

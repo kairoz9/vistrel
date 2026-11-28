@@ -20,7 +20,7 @@
 //! 由编码侧的提交等待它 —— 主机不在中间阻塞，一帧只有末尾一个同步点。
 //!
 //! **布局**：平面图常驻 `GENERAL` —— storage 读写只允许 `GENERAL`，而拷贝命令的
-//! src/dst 也接受它，布局状态机因此不存在，录制路径不再需要平面屏障。写完交给跨队列
+//! src/dst 也接受它，布局状态机因此不存在，录制路径不需要平面屏障。写完交给跨队列
 //! 读的可见性由信号量对承担（两侧都是 `ALL_COMMANDS`，构成完整内存依赖）；跨帧次序
 //! 由 `finish` 门栅承担。
 //!
@@ -488,7 +488,7 @@ impl ColorConverter {
         // 管线布局按 `PUSH_DESCRIPTOR` 标志创建，推送的绑定数与布局声明的绑定数一致。
         //
         // 走 1.4 核心命令还是 `VK_KHR_push_descriptor` 由设备决定，这里不判断——
-        // 两条通路的参数完全一致，分支只写在 `device.rs::plan_push_descriptor` 一处。
+        // 两条通路的参数完全一致，分支只写在 `device/features.rs::plan_push_descriptor` 一处。
         unsafe {
             self.device.push_descriptor_set(
                 self.cmd,
@@ -773,7 +773,7 @@ impl Drop for ColorConverter {
 mod tests {
     use super::*;
     use crate::encode::VideoCodec;
-    use crate::encode::hardware::vulkan::caps;
+    use crate::encode::hardware::vulkan::codec::caps;
     use crate::encode::hardware::vulkan::context::VulkanInstance;
     use crate::encode::hardware::vulkan::image::Nv12Image;
     use crate::encode::hardware::vulkan::rgba_to_nv12;

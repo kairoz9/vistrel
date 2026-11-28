@@ -7,12 +7,11 @@
 //! 应用只填 `StdVideo*` 结构体 —— 驱动可以覆盖参数，只有它自己序列化出来的那份
 //! 才与它写出的 slice NAL 同源。
 
-pub(crate) mod caps;
-mod config;
+mod codec;
 pub(crate) mod context;
 mod csc;
 mod device;
-mod frame_encoder;
+mod encoder;
 mod image;
 mod session;
 mod sync;
@@ -33,11 +32,19 @@ use std::sync::Arc;
 use ash::vk;
 use bytes::Bytes;
 
-use caps::CodecCaps;
-use config::{EncodePolicy, SessionConfig};
+use codec::caps::CodecCaps;
+use codec::config::{EncodePolicy, SessionConfig};
 use context::VulkanInstance;
-use frame_encoder::FrameEncoder;
+use encoder::VulkanEncoder;
 use vram_slot::VramSlot;
+
+/// 探测单个 codec 的能力；供 `hardware` 汇总各后端时调用
+pub(in crate::encode::hardware) fn probe_codec(
+    ctx: &VulkanInstance,
+    codec: VideoCodec,
+) -> Result<CodecCaps, String> {
+    codec::caps::probe_codec(ctx, codec)
+}
 
 /// 主机帧池的 Vulkan 块类型（`frame.rs` 经此引用，不开放整个 device 模块）
 pub(crate) use device::{HostBuffer, VideoDevice};
@@ -151,7 +158,7 @@ fn rgba_to_nv12(
 /// Vulkan Video 硬件编码器后端
 pub(crate) struct VulkanVideoBackend {
     device: VideoDevice,
-    encoder: FrameEncoder,
+    encoder: VulkanEncoder,
     /// 当前档位。`reconfigure` 靠它判断「几何是否真的变了」——
     /// 只有 fps / 码率变化时绝不能重建会话（会清空显存槽位表）
     profile: StreamingProfile,
@@ -190,7 +197,7 @@ impl VulkanVideoBackend {
         // 1. instance → 能力快照 → 设备。顺序是硬性的：设备要按 codec 选队列族，
         //    会话要该 codec 的能力快照。
         let instance = VulkanInstance::new("Vistrel")?;
-        let caps: CodecCaps = caps::probe_codec(&instance, codec)?;
+        let caps: CodecCaps = codec::caps::probe_codec(&instance, codec)?;
         let device = VideoDevice::new(&instance, codec)?;
 
         // 2. 把能力、档位与策略煮成静态会话配置；intra-refresh 还需设备 feature 位，
@@ -201,7 +208,7 @@ impl VulkanVideoBackend {
         let intra_cycle = config.intra_refresh_cycle();
         let gop = config.gop_length();
         let coding = config.coding_control(fps);
-        let encoder = FrameEncoder::new(&device, config, coding)?;
+        let encoder = VulkanEncoder::new(&device, config, coding)?;
 
         log::info!(
             "Vulkan {:?} {width}x{height}@{fps}: intra-refresh 模式 [{:?}] present={} \
@@ -306,7 +313,7 @@ impl VideoEncodeBackend for VulkanVideoBackend {
         Ok(())
     }
 
-    /// 排空：等待超时过的编码器仍带着在途命令缓冲（毒化机制见 `execute` 模块文档）
+    /// 排空：等待超时过的编码器仍带着在途命令缓冲（毒化机制见 `encoder::submit` 模块文档）
     ///
     /// 编码逐帧同步：`encode` 在时间线信号量上等到 2s 上限才返回码流，返回时没有在途
     /// 任务，所以正常路径下这里无须等任何东西。
@@ -455,7 +462,7 @@ mod test_support {
 
     /// 测试专用的一次性提交
     ///
-    /// 生产路径的提交全在 `FrameEncoder` 里，`Nv12Image` 不持有命令池。测试要单独验证
+    /// 生产路径的提交全在 `VulkanEncoder` 里，`Nv12Image` 不持有命令池。测试要单独验证
     /// 上传与读回，就得自己搭一套最小设施——放在 `#[cfg(test)]` 下，生产代码为零。
     ///
     /// `wait` 是跨队列依赖要等的信号量（CSC 的完成信号），没有就传 `None`。

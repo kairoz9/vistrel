@@ -1,16 +1,20 @@
-//! 编码会话的静态配置与运行期码控状态
+//! 编码会话的静态配置
 //!
 //! [`SessionConfig`] 在会话创建前一次算好：格式、对齐后的 extent、DPB、level、
-//! 序列头参数、码流缓冲、GOP 与 intra-refresh 周期。运行期会变的码率/帧率、
-//! applied 快照与重发标记归 [`CodingControl`]，静态上限来自 [`RateControlLimits`]。
+//! 序列头参数、码流缓冲、GOP 与 intra-refresh 周期。运行期码控状态在
+//! [`super::rate_control`]。
 //!
 //! 探测结果 [`CodecCaps`] 只用于构造 [`SessionConfig`]；`VideoSession` 与
-//! `FrameEncoder` 不再直接读驱动能力字段。
+//! `VulkanEncoder` 只消费配置，不读取驱动能力字段。
 
 use ash::vk;
 
-use super::caps::{CodecCaps, CodecSpecific};
-use super::frame_encoder::{frame_num_bits, level_enum};
+#[cfg(test)]
+use super::CodecSpecific;
+use super::SequenceConfig;
+use super::caps::CodecCaps;
+use super::level_to_vk;
+use super::rate_control::{CodingControl, RateControlLimits};
 use crate::encode::{StreamingProfile, VideoCodec, nv12_len};
 
 /// 编码输入图格式：NV12（两平面 4:2:0）
@@ -106,11 +110,13 @@ impl SessionConfig {
         let fps = profile.fps() as u32;
         let display_extent = vk::Extent2D { width, height };
         let coded_extent = caps.align_extent(width, height)?;
-        let dpb = DpbConfig::new(
-            codec,
-            caps.max_dpb_slots,
-            caps.max_active_reference_pictures,
-        );
+        let (slots, active_references) = caps
+            .specific
+            .dpb_limits(caps.max_dpb_slots, caps.max_active_reference_pictures);
+        let dpb = DpbConfig {
+            slots,
+            active_references,
+        };
 
         let intra_refresh_cycle = match policy.intra_refresh {
             IntraRefreshPolicy::Disable => None,
@@ -152,7 +158,8 @@ impl SessionConfig {
             }
         };
 
-        let rate_limits = RateControlLimits::from_caps(caps, policy.vbv_ms);
+        let rate_limits =
+            RateControlLimits::new(caps.max_bitrate, caps.specific.quant_range(), policy.vbv_ms);
         let requested_bitrate = profile.bitrate() as u64;
         let bitrate_bps = rate_limits.clamp_bitrate(requested_bitrate);
         if bitrate_bps != requested_bitrate {
@@ -169,7 +176,7 @@ impl SessionConfig {
             profile.fps(),
             (bitrate_bps / 1000) as u32,
         );
-        let level_vk = level_enum(codec, level)?;
+        let level_vk = level_to_vk(codec, level)?;
         if level_vk > caps.max_level() {
             return Err(format!(
                 "{codec:?} 档位 {}x{}@{} 需要 level 枚举 {}（码流值 {}），超过驱动声明的上限 {}",
@@ -182,27 +189,7 @@ impl SessionConfig {
             ));
         }
 
-        let sequence = match codec {
-            VideoCodec::H264 => SequenceConfig::H264(H264SequenceConfig {
-                level_idc: level,
-                frame_num_bits: frame_num_bits(gop_length),
-            }),
-            VideoCodec::H265 => SequenceConfig::H265(H265SequenceConfig {
-                level_idc: level,
-                frame_num_bits: frame_num_bits(gop_length),
-            }),
-            VideoCodec::Av1 => {
-                let specific = match &caps.specific {
-                    CodecSpecific::Av1(specific) => specific,
-                    _ => unreachable!("codec 与能力快照变体不一致"),
-                };
-                SequenceConfig::Av1(Av1SequenceConfig {
-                    level_idx: level,
-                    superblock_128: specific.av1_use_128x128_superblock(),
-                    operating_point_count: u32::from(specific.max_operating_points > 0),
-                })
-            }
-        };
+        let sequence = caps.specific.sequence_config(level, gop_length);
 
         let frame_bytes =
             nv12_len(coded_extent.width as usize, coded_extent.height as usize) as u64;
@@ -314,253 +301,19 @@ impl SessionConfig {
     }
 }
 
-/// DPB 槽位与活跃参考数：AV1 声明 8 个逻辑槽，H.26x 只要当前帧 + 1 参考
+/// DPB 槽位与活跃参考数（上限由各 codec 的能力实现给出）
 #[derive(Debug, Clone, Copy)]
 struct DpbConfig {
     slots: u32,
     active_references: u32,
 }
 
-impl DpbConfig {
-    /// `caps.validate()` 已保证 `max_slots >= 2`、`max_active >= 1`
-    fn new(codec: VideoCodec, max_slots: u32, max_active: u32) -> Self {
-        let slots = max_slots.min(if matches!(codec, VideoCodec::Av1) {
-            8
-        } else {
-            2
-        });
-        let active_references = max_active.min(if matches!(codec, VideoCodec::Av1) {
-            slots
-        } else {
-            1
-        });
-        Self {
-            slots,
-            active_references,
-        }
-    }
-}
-
-/// codec 专属的静态序列头参数
-#[derive(Debug, Clone, Copy)]
-pub enum SequenceConfig {
-    H264(H264SequenceConfig),
-    H265(H265SequenceConfig),
-    Av1(Av1SequenceConfig),
-}
-
-impl SequenceConfig {
-    pub fn codec(&self) -> VideoCodec {
-        match self {
-            Self::H264(_) => VideoCodec::H264,
-            Self::H265(_) => VideoCodec::H265,
-            Self::Av1(_) => VideoCodec::Av1,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct H264SequenceConfig {
-    pub(super) level_idc: u32,
-    pub(super) frame_num_bits: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct H265SequenceConfig {
-    pub(super) level_idc: u32,
-    pub(super) frame_num_bits: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Av1SequenceConfig {
-    pub(super) level_idx: u32,
-    pub(super) superblock_128: bool,
-    pub(super) operating_point_count: u32,
-}
-
-/// 码控的静态上限：驱动码率上限与量化范围
-#[derive(Debug, Clone, Copy)]
-pub struct RateControlLimits {
-    max_bitrate: u64,
-    quant: QuantRange,
-    vbv_ms: u32,
-}
-
-impl RateControlLimits {
-    fn from_caps(caps: &CodecCaps, vbv_ms: u32) -> Self {
-        Self {
-            max_bitrate: caps.max_bitrate,
-            quant: QuantRange::from_caps(caps),
-            vbv_ms,
-        }
-    }
-
-    pub fn max_bitrate(&self) -> u64 {
-        self.max_bitrate
-    }
-
-    pub fn quant(&self) -> QuantRange {
-        self.quant
-    }
-
-    pub fn vbv_ms(&self) -> u32 {
-        self.vbv_ms
-    }
-
-    /// 0 表示驱动未设上限
-    pub fn clamp_bitrate(&self, bps: u64) -> u64 {
-        if self.max_bitrate > 0 && bps > self.max_bitrate {
-            self.max_bitrate
-        } else {
-            bps
-        }
-    }
-}
-
-/// 码控的量化范围：H.26x 用 QP，AV1 用量化索引，两者数值域不同
-#[derive(Debug, Clone, Copy)]
-pub enum QuantRange {
-    Qp { min: i32, max: i32 },
-    QIndex { min: u32, max: u32 },
-}
-
-impl QuantRange {
-    fn from_caps(caps: &CodecCaps) -> Self {
-        match &caps.specific {
-            CodecSpecific::H264(specific) | CodecSpecific::H265(specific) => Self::Qp {
-                min: specific.min_qp,
-                max: specific.max_qp,
-            },
-            CodecSpecific::Av1(specific) => Self::QIndex {
-                min: specific.min_q_index,
-                max: specific.max_q_index,
-            },
-        }
-    }
-
-    /// 只由 H.264/H.265 路径调用：码控分派按 codec 走，AV1 不进这里
-    pub fn qp_range(&self, floor: i32) -> (i32, i32) {
-        let (min, max) = match self {
-            Self::Qp { min, max } => (*min, *max),
-            Self::QIndex { .. } => unreachable!("AV1 的量化索引范围不适用 QP 门禁"),
-        };
-        let lo = min.min(max);
-        let hi = min.max(max);
-        let min = floor.clamp(lo, hi);
-        let max = 51.min(hi).max(min);
-        (min, max)
-    }
-
-    /// 只由 AV1 路径调用
-    pub fn q_index_range(&self) -> (u32, u32) {
-        match self {
-            Self::QIndex { min, max } => (*min, *max),
-            Self::Qp { .. } => unreachable!("H.26x 的 QP 范围不适用 AV1 量化索引"),
-        }
-    }
-}
-
-/// 上一次真正配置进会话的码控值
-///
-/// begin 的 `VkVideoEncodeRateControlInfoKHR` 必须与已配置状态逐字段一致（08254），
-/// 因此单独留存；当前值在作用域内再配进去。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct AppliedRateControl {
-    pub bitrate_bps: u64,
-    pub fps: u32,
-}
-
-/// 运行期码控状态
-#[derive(Debug)]
-pub struct CodingControl {
-    limits: RateControlLimits,
-    bitrate_bps: u64,
-    fps: u32,
-    applied: Option<AppliedRateControl>,
-    dirty: bool,
-}
-
-impl CodingControl {
-    fn new(limits: RateControlLimits, requested_bitrate: u64, fps: u32) -> Self {
-        Self {
-            limits,
-            bitrate_bps: limits.clamp_bitrate(requested_bitrate),
-            fps,
-            applied: None,
-            dirty: true,
-        }
-    }
-
-    pub fn bitrate_bps(&self) -> u64 {
-        self.bitrate_bps
-    }
-
-    pub fn fps(&self) -> u32 {
-        self.fps
-    }
-
-    pub fn vbv_ms(&self) -> u32 {
-        self.limits.vbv_ms()
-    }
-
-    pub fn qp_range(&self, floor: i32) -> (i32, i32) {
-        self.limits.quant().qp_range(floor)
-    }
-
-    pub fn q_index_range(&self) -> (u32, u32) {
-        self.limits.quant().q_index_range()
-    }
-
-    /// 运行期改码率：下一帧随码控命令重发，不需要重建会话
-    ///
-    /// 先钳制再比较：请求超出驱动上限、但落值等于当前值时不算变更，不重发码控。
-    pub fn set_bitrate(&mut self, bps: u64) {
-        if bps == 0 {
-            return;
-        }
-        let bps = self.limits.clamp_bitrate(bps);
-        if bps == self.bitrate_bps {
-            return;
-        }
-        self.bitrate_bps = bps;
-        self.dirty = true;
-    }
-
-    /// 运行期改帧率：码控每帧都带 `frame_rate_numerator`，改字段 + 置脏即可生效
-    pub fn set_fps(&mut self, fps: u32) {
-        if fps == 0 || fps == self.fps {
-            return;
-        }
-        self.fps = fps;
-        self.dirty = true;
-    }
-
-    /// 首帧或码率/帧率变更后需要重新下发码控
-    pub fn needs_config(&self) -> bool {
-        self.dirty || self.applied.is_none()
-    }
-
-    pub fn has_applied(&self) -> bool {
-        self.applied.is_some()
-    }
-
-    pub fn applied(&self) -> Option<AppliedRateControl> {
-        self.applied
-    }
-
-    /// 编码成功后记录本次真正配置进会话的值
-    pub fn mark_applied(&mut self) {
-        self.applied = Some(AppliedRateControl {
-            bitrate_bps: self.bitrate_bps,
-            fps: self.fps,
-        });
-        self.dirty = false;
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::caps::{H26xCaps, IntraRefreshCaps};
+    use super::super::QuantRange;
+    use super::super::caps::IntraRefreshCaps;
+    use super::super::h26x::H26xCaps;
+    use super::super::rate_control::AppliedRateControl;
     use super::*;
 
     /// 最小可用的 H.264 能力快照：1080p60 → level 4.2，上限 5.2（枚举 15）

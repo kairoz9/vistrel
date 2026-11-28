@@ -181,7 +181,7 @@ fn probe_vulkan_video_internal() -> Option<BackendCapability> {
     // 顺序与 NVENC 探测一致：压缩效率从高到低
     let mut codecs = Vec::new();
     for codec in [VideoCodec::Av1, VideoCodec::H265, VideoCodec::H264] {
-        match vulkan::caps::probe_codec(&ctx, codec) {
+        match vulkan::probe_codec(&ctx, codec) {
             Ok(_) => codecs.push(codec),
             Err(e) => log::debug!("{codec:?} 编码能力探测失败: {}", e),
         }
